@@ -16,11 +16,12 @@ based on the per-server notes in `setup.md`.
 
 ## 2. Deploy Broker Script
 
-Copy the broker to the remote. Default location: `~/.distributed-cc/remote_broker.py`.
+Copy the broker and session CLI to the remote. Default location: `~/.distributed-cc/`.
 
 ```bash
 ssh {host} "mkdir -p {broker_dir}"
 scp tools/remote_broker.py {host}:{broker_dir}/remote_broker.py
+scp tools/broker_session.py {host}:{broker_dir}/broker_session.py
 ```
 
 If `setup.md` specifies a non-default `broker_dir` (e.g., on NFS), use that path instead.
@@ -58,25 +59,45 @@ source {env_file}
 
 ## 5. Launch Broker
 
-Standard launch command:
+The broker is a per-server daemon — start it once per server (no `--work-dir` needed):
 
 ```bash
-cd {work_dir}
 {broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py \
     --port 8200 \
-    --name {server_name} \
-    --work-dir {work_dir}
+    --name {server_name}
 ```
 
-### Making it persistent
+### Register Sessions
+
+After the broker is running, register sessions from each project directory:
+
+```bash
+cd /path/to/project
+{broker_dir}/.venv/bin/python3 {broker_dir}/broker_session.py start
+# Optional flags: --name custom-name --desc "Description" --port 8200
+```
+
+The broker will heartbeat to the orchestrator, which discovers sessions automatically.
+
+To unregister a session:
+```bash
+cd /path/to/project
+{broker_dir}/.venv/bin/python3 {broker_dir}/broker_session.py stop
+```
+
+To list registered sessions:
+```bash
+{broker_dir}/.venv/bin/python3 {broker_dir}/broker_session.py list
+```
+
+### Making broker persistent
 
 Option A — **tmux** (simple, good for dev):
 ```bash
 tmux new-session -d -s broker "\
     source {env_file} && \
-    cd {work_dir} && \
     {broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py \
-        --port 8200 --name {server_name} --work-dir {work_dir}"
+        --port 8200 --name {server_name}"
 ```
 
 Option B — **systemd** (robust, auto-restart):
@@ -86,8 +107,7 @@ Option B — **systemd** (robust, auto-restart):
 Description=Claude Code Broker ({server_name})
 
 [Service]
-WorkingDirectory={work_dir}
-ExecStart={broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py --port 8200 --name {server_name} --work-dir {work_dir}
+ExecStart={broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py --port 8200 --name {server_name}
 EnvironmentFile={env_file}
 Restart=always
 RestartSec=5
@@ -99,9 +119,8 @@ WantedBy=multi-user.target
 Option C — **nohup** (minimal):
 ```bash
 source {env_file}
-cd {work_dir}
 nohup {broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py \
-    --port 8200 --name {server_name} --work-dir {work_dir} \
+    --port 8200 --name {server_name} \
     > {log_dir}/{server_name}-broker.log 2>&1 &
 echo $! > {broker_dir}/{server_name}.pid
 ```
@@ -178,7 +197,6 @@ with values from `config.yaml` and `setup.md`:
 |---|---|
 | `{host}` | `config.yaml` → `servers[].host` |
 | `{server_name}` | `config.yaml` → `servers[].name` |
-| `{work_dir}` | `config.yaml` → `servers[].work_dir` |
 | `{broker_port}` | `config.yaml` → `servers[].broker_port` |
 | `{python_bin}` | `setup.md` → Python path for uv (default: auto-detected by uv) |
 | `{broker_dir}` | `setup.md` → broker install location (default: `~/.distributed-cc`) |

@@ -46,7 +46,7 @@ make run-telegram     # Telegram bot mode
 
 ### 2. Remote Nodes (broker)
 
-Three options to set up the broker on each remote server:
+Three options to install the broker on each remote server:
 
 **Option A — One-line installer** (easiest):
 ```bash
@@ -62,17 +62,25 @@ make deploy HOST=user@server-a NAME=server-a
 ```bash
 ssh user@server-a
 mkdir -p ~/.distributed-cc
-# Copy tools/remote_broker.py to ~/.distributed-cc/
+# Copy tools/remote_broker.py and tools/broker_session.py to ~/.distributed-cc/
 curl -LsSf https://astral.sh/uv/install.sh | sh  # install uv if needed
 uv venv ~/.distributed-cc/.venv
 uv pip install --python ~/.distributed-cc/.venv/bin/python3 claude-agent-sdk aiohttp
 ```
 
-Then start the broker on the remote server:
+Then start the broker daemon (once per server, e.g. in tmux):
+```bash
+~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py --port 8200 --name server-a
+```
+
+Register sessions from each project directory:
 ```bash
 cd /path/to/your/project
-~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py --port 8200 --name server-a --work-dir .
+~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/broker_session.py start
+# Optional: --name custom-name --desc "Description"
 ```
+
+The broker heartbeats to the orchestrator, so sessions are discovered automatically.
 
 ### 3. SSH Tunnels
 
@@ -96,7 +104,7 @@ Edit `tools/start_tunnels.sh` to configure your servers.
 
 See `config.example.yaml` for all options. Key sections:
 
-- **servers** — list of remote/local servers with broker ports and sessions
+- **servers** — list of remote/local servers with broker ports (sessions register dynamically)
 - **orchestrator** — model selection for routing and sessions
 - **permission** — callback HTTP server port
 - **telegram** — bot token and allowed user IDs (for Telegram mode)
@@ -127,6 +135,7 @@ src/
 
 tools/
   remote_broker.py   — broker daemon for remote servers
+  broker_session.py  — CLI to register/unregister sessions with broker
   deploy.sh          — deploy broker via SSH/SCP
   install-broker.sh  — one-line remote installer
   start_tunnels.sh   — SSH tunnel helper

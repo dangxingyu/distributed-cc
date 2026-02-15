@@ -6,8 +6,11 @@ autonomy (no turn/budget caps). When it proactively asks for permission
 or clarification, those are forwarded to the orchestrator via HTTP
 (reachable through SSH reverse tunnel).
 
+Sessions register dynamically via POST /register (from broker-session CLI).
+Each session has its own work_dir, so one broker serves multiple projects.
+
 Usage:
-  python3 remote_broker.py --port 8200 --work-dir /path/to/project
+  python3 remote_broker.py --port 8200 --name my-server
 
 Environment:
   ORCH_URL     — orchestrator callback URL (default: http://127.0.0.1:9120)
@@ -22,7 +25,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aiohttp import web, ClientSession, ClientTimeout
 
@@ -37,7 +40,8 @@ log = logging.getLogger("broker")
 
 ORCHESTRATOR_URL = os.environ.get("ORCH_URL", "http://127.0.0.1:9120")
 SERVER_NAME = os.environ.get("SERVER_NAME", "unknown")
-WORK_DIR = "."
+DEFAULT_WORK_DIR = "."
+HEARTBEAT_INTERVAL = 30  # seconds
 
 
 # ── Session tracking ───────────────────────────────────────────────────
@@ -45,6 +49,8 @@ WORK_DIR = "."
 @dataclass
 class RunningSession:
     session_id: str             # logical session name (e.g. "dev")
+    work_dir: str = ""          # per-session working directory
+    description: str = ""       # human-readable description
     sdk_session_id: str = ""    # actual Claude session ID for --resume
     started_at: float = 0
     status: str = "idle"
@@ -141,6 +147,7 @@ async def _prompt_stream(prompt: str):
 async def run_agent_task(
     session_id: str,
     prompt: str,
+    work_dir: str,
     model: str = "claude-opus-4-6",
 ) -> dict:
     """Run an Agent SDK query and return the result.
@@ -161,7 +168,7 @@ async def run_agent_task(
         options = ClaudeAgentOptions(
             can_use_tool=make_can_use_tool(session_id, http),
             model=model,
-            cwd=WORK_DIR,
+            cwd=work_dir,
         )
         if sdk_session_id:
             options.resume = sdk_session_id
@@ -190,6 +197,38 @@ async def run_agent_task(
         await http.close()
 
 
+# ── Heartbeat ─────────────────────────────────────────────────────────
+
+async def _send_heartbeat():
+    """POST current session list to orchestrator."""
+    payload = {
+        "server_name": SERVER_NAME,
+        "sessions": [
+            {
+                "session_id": s.session_id,
+                "work_dir": s.work_dir,
+                "description": s.description,
+                "status": s.status,
+            }
+            for s in sessions.values()
+        ],
+    }
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=5)) as http:
+            async with http.post(f"{ORCHESTRATOR_URL}/heartbeat", json=payload) as resp:
+                if resp.status != 200:
+                    log.warning(f"Heartbeat failed: HTTP {resp.status}")
+    except Exception as e:
+        log.debug(f"Heartbeat failed (orchestrator unreachable): {e}")
+
+
+async def _heartbeat_loop():
+    """Periodically send heartbeat to orchestrator."""
+    while True:
+        await _send_heartbeat()
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
 # ── HTTP handlers ──────────────────────────────────────────────────────
 
 async def handle_run(request: web.Request) -> web.Response:
@@ -198,13 +237,22 @@ async def handle_run(request: web.Request) -> web.Response:
     session_id = data["session_id"]
     prompt = data["prompt"]
 
-    # Track the session
-    sess = sessions.setdefault(session_id, RunningSession(session_id=session_id))
+    # Track the session (auto-create if not registered)
+    sess = sessions.get(session_id)
+    if not sess:
+        # Accept work_dir from request payload for unregistered sessions
+        work_dir = data.get("work_dir", DEFAULT_WORK_DIR)
+        sess = RunningSession(session_id=session_id, work_dir=work_dir)
+        sessions[session_id] = sess
+
     if sess.status == "running":
         return web.json_response(
             {"error": f"Session {session_id} is already running a task"},
             status=409,
         )
+
+    # Allow overriding work_dir per-request
+    work_dir = data.get("work_dir", sess.work_dir) or DEFAULT_WORK_DIR
 
     sess.status = "running"
     sess.started_at = time.time()
@@ -213,6 +261,7 @@ async def handle_run(request: web.Request) -> web.Response:
         result = await run_agent_task(
             session_id=session_id,
             prompt=prompt,
+            work_dir=work_dir,
             model=data.get("model", "claude-opus-4-6"),
         )
         result["duration_secs"] = time.time() - sess.started_at
@@ -228,12 +277,58 @@ async def handle_run(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
 
+async def handle_register(request: web.Request) -> web.Response:
+    """POST /register — register a session with work_dir."""
+    data = await request.json()
+    session_id = data.get("session_id")
+    work_dir = data.get("work_dir")
+    if not session_id or not work_dir:
+        return web.json_response(
+            {"error": "session_id and work_dir required"}, status=400
+        )
+
+    sess = sessions.get(session_id)
+    if sess:
+        # Update existing
+        sess.work_dir = work_dir
+        sess.description = data.get("description", sess.description)
+        log.info(f"Updated session {session_id}: work_dir={work_dir}")
+    else:
+        sessions[session_id] = RunningSession(
+            session_id=session_id,
+            work_dir=work_dir,
+            description=data.get("description", ""),
+        )
+        log.info(f"Registered session {session_id}: work_dir={work_dir}")
+
+    # Notify orchestrator immediately
+    asyncio.create_task(_send_heartbeat())
+    return web.json_response({"ok": True, "session_id": session_id})
+
+
+async def handle_unregister(request: web.Request) -> web.Response:
+    """POST /unregister — remove a session."""
+    data = await request.json()
+    session_id = data.get("session_id")
+    if not session_id:
+        return web.json_response({"error": "session_id required"}, status=400)
+
+    removed = sessions.pop(session_id, None)
+    if removed:
+        log.info(f"Unregistered session {session_id}")
+        asyncio.create_task(_send_heartbeat())
+        return web.json_response({"ok": True})
+    return web.json_response({"ok": False, "reason": "Session not found"})
+
+
 async def handle_sessions(request: web.Request) -> web.Response:
     """GET /sessions — list tracked sessions."""
     result = []
     for s in sessions.values():
         result.append({
             "session_id": s.session_id,
+            "work_dir": s.work_dir,
+            "description": s.description,
             "sdk_session_id": s.sdk_session_id,
             "status": s.status,
             "started_at": s.started_at,
@@ -263,23 +358,37 @@ async def handle_health(request: web.Request) -> web.Response:
 def main():
     parser = argparse.ArgumentParser(description="Claude Code remote broker")
     parser.add_argument("--port", type=int, default=8200)
-    parser.add_argument("--work-dir", default=".")
     parser.add_argument("--name", default=os.environ.get("SERVER_NAME", "unknown"))
     args = parser.parse_args()
 
-    global SERVER_NAME, WORK_DIR
+    global SERVER_NAME, DEFAULT_WORK_DIR
     SERVER_NAME = args.name
-    WORK_DIR = os.path.abspath(args.work_dir)
+    DEFAULT_WORK_DIR = os.path.abspath(".")
     os.environ["SERVER_NAME"] = args.name
 
-    os.chdir(WORK_DIR)
-    log.info(f"Broker starting: server={args.name}, work_dir={WORK_DIR}, port={args.port}")
+    log.info(f"Broker starting: server={args.name}, port={args.port}")
 
     app = web.Application()
     app.router.add_post("/run", handle_run)
+    app.router.add_post("/register", handle_register)
+    app.router.add_post("/unregister", handle_unregister)
     app.router.add_get("/sessions", handle_sessions)
     app.router.add_post("/kill", handle_kill)
     app.router.add_get("/health", handle_health)
+
+    # Start heartbeat loop as background task
+    async def start_background(app):
+        app["heartbeat"] = asyncio.create_task(_heartbeat_loop())
+
+    async def stop_background(app):
+        app["heartbeat"].cancel()
+        try:
+            await app["heartbeat"]
+        except asyncio.CancelledError:
+            pass
+
+    app.on_startup.append(start_background)
+    app.on_cleanup.append(stop_background)
 
     web.run_app(app, host="127.0.0.1", port=args.port)
 

@@ -2,6 +2,10 @@
 
 Makes HTTP calls to remote brokers (tools/remote_broker.py) which use
 the Agent SDK to run tasks. Brokers are reachable via SSH port forwarding.
+
+Sessions can be:
+  - Pre-configured in config.yaml (static)
+  - Registered dynamically via broker heartbeats (dynamic)
 """
 
 import asyncio
@@ -27,9 +31,18 @@ class SessionResult:
 class ServerConfig:
     name: str
     host: str | None          # SSH destination (null = local)
-    work_dir: str
     broker_port: int = 8200   # Local port forwarded to remote broker
     ssh_options: str = ""
+    work_dir: str = ""        # optional server-level fallback
+
+
+@dataclass
+class RemoteSession:
+    """A session registered with a remote broker."""
+    session_id: str
+    work_dir: str
+    description: str = ""
+    status: str = "idle"
 
 
 class SessionManager:
@@ -43,6 +56,9 @@ class SessionManager:
         self._servers = {s.name: s for s in servers}
         self._model = default_model
         self._http: aiohttp.ClientSession | None = None
+        # Dynamic sessions reported by broker heartbeats
+        # key: server_name → {session_id → RemoteSession}
+        self._remote_sessions: dict[str, dict[str, RemoteSession]] = {}
 
     async def init(self):
         self._http = aiohttp.ClientSession(
@@ -61,6 +77,38 @@ class SessionManager:
 
     def _broker_url(self, server: ServerConfig) -> str:
         return f"http://127.0.0.1:{server.broker_port}"
+
+    # ── Dynamic session management ────────────────────────────────────
+
+    def update_sessions(self, server_name: str, sessions: list[dict]):
+        """Update session registry from broker heartbeat."""
+        self._remote_sessions[server_name] = {
+            s["session_id"]: RemoteSession(
+                session_id=s["session_id"],
+                work_dir=s["work_dir"],
+                description=s.get("description", ""),
+                status=s.get("status", "idle"),
+            )
+            for s in sessions
+        }
+        log.info(
+            f"Updated sessions for {server_name}: "
+            f"{[s['session_id'] for s in sessions]}"
+        )
+
+    def list_sessions(self) -> dict[str, list[RemoteSession]]:
+        """All known sessions across all servers."""
+        return {
+            name: list(sess.values())
+            for name, sess in self._remote_sessions.items()
+        }
+
+    def get_session(self, server_name: str, session_id: str) -> RemoteSession | None:
+        """Look up a specific remote session."""
+        server_sessions = self._remote_sessions.get(server_name, {})
+        return server_sessions.get(session_id)
+
+    # ── Task execution ────────────────────────────────────────────────
 
     async def run_task(
         self,
@@ -84,6 +132,13 @@ class SessionManager:
             "prompt": prompt,
             "model": self._model,
         }
+
+        # Include work_dir from session registry or server config
+        remote_sess = self.get_session(server_name, session_id)
+        if remote_sess:
+            payload["work_dir"] = remote_sess.work_dir
+        elif server.work_dir:
+            payload["work_dir"] = server.work_dir
 
         log.info(f"Running task on {server_name}/{session_id}")
 

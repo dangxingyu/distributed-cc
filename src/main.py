@@ -39,9 +39,9 @@ def build_server_configs(cfg: dict) -> list[ServerConfig]:
         servers.append(ServerConfig(
             name=s["name"],
             host=s.get("host"),
-            work_dir=s["work_dir"],
             broker_port=s.get("broker_port", 8200),
             ssh_options=s.get("ssh_options", ""),
+            work_dir=s.get("work_dir", ""),
         ))
     return servers
 
@@ -70,6 +70,17 @@ async def handle_clarification(request: web.Request) -> web.Response:
     except Exception as e:
         log.exception(f"Clarification error: {e}")
         return web.json_response({"answers": None, "reason": str(e)}, status=500)
+
+
+async def handle_heartbeat(request: web.Request) -> web.Response:
+    orchestrator: Orchestrator = request.app["orchestrator"]
+    try:
+        data = await request.json()
+        orchestrator.handle_heartbeat(data)
+        return web.json_response({"ok": True})
+    except Exception as e:
+        log.exception(f"Heartbeat error: {e}")
+        return web.json_response({"ok": False, "reason": str(e)}, status=500)
 
 
 async def start_http_server(app: web.Application, port: int):
@@ -129,6 +140,7 @@ async def main():
     http_app["orchestrator"] = orchestrator
     http_app.router.add_post("/permission", handle_permission)
     http_app.router.add_post("/clarification", handle_clarification)
+    http_app.router.add_post("/heartbeat", handle_heartbeat)
     http_runner = await start_http_server(http_app, perm_cfg.get("port", 9120))
 
     # Frontend
