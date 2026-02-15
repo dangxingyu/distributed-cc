@@ -1,0 +1,24 @@
+# Local config (has machine-specific paths)
+config.yaml
+
+# Runtime data
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+
+# Scratch notes
+a.md
+
+# IDE
+.idea/
+.vscode/
+*.swp

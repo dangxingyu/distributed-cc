@@ -1,0 +1,47 @@
+telegram:
+  token: "YOUR_BOT_TOKEN"
+  # Only these Telegram user IDs can interact with the bot
+  allowed_users:
+    - 123456789
+
+# Remote and local servers with Claude Code sessions.
+# Each server runs a remote_broker.py daemon.
+# Access via SSH port forwarding (-L for broker, -R for callbacks).
+servers:
+  - name: server-a
+    host: user@server-a.example.com
+    work_dir: /home/user/project-a
+    broker_port: 8201       # Local forwarded port → remote broker :8200
+    ssh_options: "-o ConnectTimeout=10"
+    sessions:
+      - id: auth-dev
+        description: "Auth module development"
+      - id: api-dev
+        description: "API backend development"
+
+  - name: server-b
+    host: user@server-b.example.com
+    work_dir: /home/user/project-b
+    broker_port: 8202
+    ssh_options: ""
+    sessions:
+      - id: frontend
+        description: "Frontend development"
+
+  - name: local
+    host: null              # null = local machine
+    work_dir: /Users/xingyu/project
+    broker_port: 8200       # Local broker running directly
+    sessions:
+      - id: local-dev
+        description: "Local development and testing"
+
+orchestrator:
+  model: claude-opus-4-6          # Model for routing decisions
+  session_model: claude-opus-4-6  # Model for remote Claude Code sessions
+
+permission:
+  port: 9120                # HTTP server for broker callbacks
+
+db:
+  path: ./data/orchestrator.db
