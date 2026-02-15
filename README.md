@@ -63,8 +63,9 @@ make deploy HOST=user@server-a NAME=server-a
 ssh user@server-a
 mkdir -p ~/.distributed-cc
 # Copy tools/remote_broker.py to ~/.distributed-cc/
-python3 -m venv ~/.distributed-cc/.venv
-~/.distributed-cc/.venv/bin/pip install claude-agent-sdk aiohttp
+curl -LsSf https://astral.sh/uv/install.sh | sh  # install uv if needed
+uv venv ~/.distributed-cc/.venv
+uv pip install --python ~/.distributed-cc/.venv/bin/python3 claude-agent-sdk aiohttp
 ```
 
 Then start the broker on the remote server:

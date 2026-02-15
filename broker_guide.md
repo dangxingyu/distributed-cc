@@ -10,6 +10,7 @@ based on the per-server notes in `setup.md`.
 ## 1. Prerequisites on Remote Server
 
 - Python 3.11+
+- [uv](https://docs.astral.sh/uv/) (auto-installed by deploy scripts if missing)
 - Claude Code CLI installed and authenticated (the Agent SDK uses its auth)
 - SSH access from the local orchestrator machine
 
@@ -26,15 +27,15 @@ If `setup.md` specifies a non-default `broker_dir` (e.g., on NFS), use that path
 
 ## 3. Install Dependencies
 
-The broker uses a self-contained venv at `{broker_dir}/.venv` so it doesn't
-conflict with system or conda environments.
+The broker uses `uv` for fast, reliable dependency management. Install uv first
+(if not already present), then create a self-contained venv.
 
 ```bash
-ssh {host} "{python_bin} -m venv {broker_dir}/.venv && {broker_dir}/.venv/bin/pip install --upgrade pip claude-agent-sdk aiohttp"
+ssh {host} "command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh"
+ssh {host} "uv venv {broker_dir}/.venv && uv pip install --python {broker_dir}/.venv/bin/python3 claude-agent-sdk aiohttp"
 ```
 
-`{python_bin}` is only used to *create* the venv. After that, always use
-`{broker_dir}/.venv/bin/python3` to run the broker.
+Always use `{broker_dir}/.venv/bin/python3` to run the broker.
 
 ## 4. Environment Configuration
 
@@ -179,7 +180,7 @@ with values from `config.yaml` and `setup.md`:
 | `{server_name}` | `config.yaml` → `servers[].name` |
 | `{work_dir}` | `config.yaml` → `servers[].work_dir` |
 | `{broker_port}` | `config.yaml` → `servers[].broker_port` |
-| `{python_bin}` | `setup.md` → Python used to create venv (default: `python3`) |
+| `{python_bin}` | `setup.md` → Python path for uv (default: auto-detected by uv) |
 | `{broker_dir}` | `setup.md` → broker install location (default: `~/.distributed-cc`) |
 | `{env_file}` | `setup.md` → per-server env/bashrc to source |
 | `{log_dir}` | `setup.md` → log directory |

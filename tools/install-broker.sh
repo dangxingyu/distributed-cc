@@ -7,7 +7,8 @@
 # What it does:
 #   1. Creates ~/.distributed-cc/
 #   2. Downloads remote_broker.py
-#   3. Creates a self-contained venv with dependencies (claude-agent-sdk, aiohttp)
+#   3. Installs uv (if not present)
+#   4. Creates a venv with dependencies (claude-agent-sdk, aiohttp)
 #
 # After install, start the broker:
 #   cd /path/to/your/project
@@ -24,9 +25,15 @@ echo "Installing distributed-cc broker to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 curl -fsSL "$BROKER_URL" -o "$INSTALL_DIR/remote_broker.py"
 
+echo "Installing uv (if not present) ..."
+if ! command -v uv &>/dev/null; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    source "$HOME/.local/bin/env" 2>/dev/null || true
+fi
+
 echo "Setting up venv and installing dependencies ..."
-python3 -m venv "$VENV_DIR"
-"$VENV_DIR/bin/pip" install --upgrade pip claude-agent-sdk aiohttp
+uv venv "$VENV_DIR"
+uv pip install --python "$VENV_DIR/bin/python3" claude-agent-sdk aiohttp
 
 echo ""
 echo "Done! Broker installed at: $INSTALL_DIR/remote_broker.py"
