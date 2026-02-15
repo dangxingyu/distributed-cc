@@ -99,6 +99,9 @@ async def test_claude_session_resume():
 @pytest.mark.asyncio
 async def test_claude_can_read_files():
     """Claude in -p mode can use Read tool (needed for our agentic routing)."""
+    # Use absolute path — config.yaml is gitignored so Claude may not find it by relative path
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+    prompt = f"Read the file {config_path} and tell me the server name defined in it. Reply with just the name."
     proc = await asyncio.create_subprocess_exec(
         "claude", "-p",
         "--output-format", "json",
@@ -110,7 +113,7 @@ async def test_claude_can_read_files():
         env=_clean_env(),
     )
     stdout, stderr = await asyncio.wait_for(
-        proc.communicate(input=b"Read the file config.yaml and tell me the server name defined in it. Reply with just the name."),
+        proc.communicate(input=prompt.encode()),
         timeout=60,
     )
     assert proc.returncode == 0, f"Failed: {stderr.decode()}"

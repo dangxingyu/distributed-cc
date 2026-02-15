@@ -10,7 +10,6 @@ based on the per-server notes in `setup.md`.
 ## 1. Prerequisites on Remote Server
 
 - Python 3.11+
-- pip packages: `claude-agent-sdk`, `aiohttp`
 - Claude Code CLI installed and authenticated (the Agent SDK uses its auth)
 - SSH access from the local orchestrator machine
 
@@ -27,12 +26,15 @@ If `setup.md` specifies a non-default `broker_dir` (e.g., on NFS), use that path
 
 ## 3. Install Dependencies
 
+The broker uses a self-contained venv at `{broker_dir}/.venv` so it doesn't
+conflict with system or conda environments.
+
 ```bash
-ssh {host} "{python_bin} -m pip install claude-agent-sdk aiohttp"
+ssh {host} "{python_bin} -m venv {broker_dir}/.venv && {broker_dir}/.venv/bin/pip install --upgrade pip claude-agent-sdk aiohttp"
 ```
 
-`{python_bin}` may differ per server — check `setup.md` for the correct Python path
-(e.g., `/nfs/shared/miniconda/bin/python3`).
+`{python_bin}` is only used to *create* the venv. After that, always use
+`{broker_dir}/.venv/bin/python3` to run the broker.
 
 ## 4. Environment Configuration
 
@@ -59,7 +61,7 @@ Standard launch command:
 
 ```bash
 cd {work_dir}
-{python_bin} {broker_dir}/remote_broker.py \
+{broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py \
     --port 8200 \
     --name {server_name} \
     --work-dir {work_dir}
@@ -72,7 +74,7 @@ Option A — **tmux** (simple, good for dev):
 tmux new-session -d -s broker "\
     source {env_file} && \
     cd {work_dir} && \
-    {python_bin} {broker_dir}/remote_broker.py \
+    {broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py \
         --port 8200 --name {server_name} --work-dir {work_dir}"
 ```
 
@@ -84,7 +86,7 @@ Description=Claude Code Broker ({server_name})
 
 [Service]
 WorkingDirectory={work_dir}
-ExecStart={python_bin} {broker_dir}/remote_broker.py --port 8200 --name {server_name} --work-dir {work_dir}
+ExecStart={broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py --port 8200 --name {server_name} --work-dir {work_dir}
 EnvironmentFile={env_file}
 Restart=always
 RestartSec=5
@@ -97,7 +99,7 @@ Option C — **nohup** (minimal):
 ```bash
 source {env_file}
 cd {work_dir}
-nohup {python_bin} {broker_dir}/remote_broker.py \
+nohup {broker_dir}/.venv/bin/python3 {broker_dir}/remote_broker.py \
     --port 8200 --name {server_name} --work-dir {work_dir} \
     > {log_dir}/{server_name}-broker.log 2>&1 &
 echo $! > {broker_dir}/{server_name}.pid
@@ -163,7 +165,7 @@ Agent SDK.
 | Broker unreachable | Is SSH tunnel up? `curl localhost:{broker_port}/health` |
 | Permission callback fails | Is reverse tunnel up? From remote: `curl localhost:9120/health` |
 | Agent SDK auth error | Is Claude Code authenticated on remote? Run `claude --version` |
-| Wrong Python/packages | Check `setup.md` for correct `{python_bin}` path |
+| Wrong Python/packages | Is the broker running via `{broker_dir}/.venv/bin/python3`? |
 | Session state missing | Check `CLAUDE_CONFIG_DIR` points to persistent storage |
 
 ## Template Variables
@@ -177,7 +179,7 @@ with values from `config.yaml` and `setup.md`:
 | `{server_name}` | `config.yaml` → `servers[].name` |
 | `{work_dir}` | `config.yaml` → `servers[].work_dir` |
 | `{broker_port}` | `config.yaml` → `servers[].broker_port` |
-| `{python_bin}` | `setup.md` → per-server Python path |
+| `{python_bin}` | `setup.md` → Python used to create venv (default: `python3`) |
 | `{broker_dir}` | `setup.md` → broker install location (default: `~/.distributed-cc`) |
 | `{env_file}` | `setup.md` → per-server env/bashrc to source |
 | `{log_dir}` | `setup.md` → log directory |

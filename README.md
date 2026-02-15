@@ -63,13 +63,14 @@ make deploy HOST=user@server-a NAME=server-a
 ssh user@server-a
 mkdir -p ~/.distributed-cc
 # Copy tools/remote_broker.py to ~/.distributed-cc/
-pip install claude-agent-sdk aiohttp
+python3 -m venv ~/.distributed-cc/.venv
+~/.distributed-cc/.venv/bin/pip install claude-agent-sdk aiohttp
 ```
 
 Then start the broker on the remote server:
 ```bash
 cd /path/to/your/project
-python3 ~/.distributed-cc/remote_broker.py --port 8200 --name server-a --work-dir .
+~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py --port 8200 --name server-a --work-dir .
 ```
 
 ### 3. SSH Tunnels
@@ -99,6 +100,10 @@ See `config.example.yaml` for all options. Key sections:
 - **permission** — callback HTTP server port
 - **telegram** — bot token and allowed user IDs (for Telegram mode)
 
+Optionally, create a `config.md` alongside `config.yaml` for extra instructions
+(server notes, rules, preferences). The orchestrator and permission evaluator
+will read it for additional context. See `config.example.md` for an example.
+
 ## Testing
 
 ```bash
@@ -125,7 +130,8 @@ tools/
   install-broker.sh  — one-line remote installer
   start_tunnels.sh   — SSH tunnel helper
 
-config.example.yaml  — example configuration
+config.example.yaml  — example configuration (YAML)
+config.example.md    — example extra instructions (optional)
 ```
 
 ## Requirements

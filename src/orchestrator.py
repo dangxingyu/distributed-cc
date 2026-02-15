@@ -23,8 +23,9 @@ ROUTER_SYSTEM_PROMPT = """\
 You are an orchestrator managing distributed Claude Code sessions across remote servers.
 
 IMPORTANT: First, read the config file at `{config_path}` to understand the available servers \
-and sessions. If a `setup.md` exists in the same directory, read it too for additional context \
-about each server's environment and capabilities.
+and sessions. Also check for these optional files in the same directory and read them if they exist:
+- `config.md` — extra instructions and context from the user about the setup
+- `setup.md` — per-server environment details and capabilities
 
 Based on the config and the user's message, decide what to do.
 

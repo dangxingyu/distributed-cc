@@ -26,7 +26,7 @@ Session: {session_id}
 Tool: {tool_name}
 Input: {tool_input}
 
-Read `{config_path}` and `setup.md` (if it exists) to understand the project context, \
+Read `{config_path}`, `config.md`, and `setup.md` (if they exist) to understand the project context, \
 what each server/session is supposed to do, and what operations are expected.
 
 Then decide whether to allow this action. Your final response MUST be ONLY a JSON object:
@@ -47,7 +47,7 @@ Session: {session_id}
 
 {questions_formatted}
 
-Read `{config_path}` and `setup.md` (if it exists) to understand the project context \
+Read `{config_path}`, `config.md`, and `setup.md` (if they exist) to understand the project context \
 and what each server/session is working on.
 
 Can you confidently answer based on that context? Your final response MUST be ONLY a JSON object:
