@@ -6,6 +6,7 @@ Handles two types of callbacks from remote brokers:
 
 Both follow the same pattern:
   fast-path auto-decide → Claude evaluates → if unsure → escalate to human
+  → if human doesn't respond → Claude forced-decides (no escalate option)
 """
 
 import asyncio
@@ -36,6 +37,45 @@ Guidelines:
 - approve: Safe read-only operations, running tests, linting, and actions that align with the session's stated purpose
 - deny: Clearly destructive actions (rm -rf /, DROP TABLE, modifying /etc, force-pushing to main)
 - escalate: Anything ambiguous — writing to files you're unsure about, running unfamiliar commands, network operations, installing packages
+"""
+
+PERMISSION_FORCED_PROMPT = """\
+You are a security evaluator for a distributed Claude Code system.
+A remote Claude Code session wants to perform the following action:
+
+Server: {server_name}
+Session: {session_id}
+Tool: {tool_name}
+Input: {tool_input}
+
+Read `{config_path}`, `config.md`, and `setup.md` (if they exist) to understand the project context.
+
+The human operator was asked but did not respond in time. \
+You MUST make a final decision — there is no "escalate" option. \
+When in doubt, lean towards approve if it looks like normal development work, \
+or deny if it could cause damage.
+
+Your final response MUST be ONLY a JSON object:
+{{"decision": "approve" | "deny", "reason": "brief explanation"}}
+"""
+
+CLARIFICATION_FORCED_PROMPT = """\
+You are an orchestrator managing a remote Claude Code session.
+The session is asking a clarifying question:
+
+Server: {server_name}
+Session: {session_id}
+
+{questions_formatted}
+
+Read `{config_path}`, `config.md`, and `setup.md` (if they exist) to understand the project context.
+
+The human operator was asked but did not respond in time. \
+You MUST answer these questions using your best judgment — the agent is blocked waiting. \
+Pick the most reasonable option based on the project context.
+
+Your final response MUST be ONLY a JSON object:
+{{"answers": {{"<question_text>": "<chosen_option_label>"}}, "reason": "brief explanation"}}
 """
 
 CLARIFICATION_EVAL_PROMPT = """\
@@ -112,6 +152,12 @@ class PermissionEvaluator:
                 title=f"Permission: {tool_name}",
                 detail=f"Server: {server_name}/{session_id}\nTool: {tool_name}\nInput: {json.dumps(tool_input, ensure_ascii=False)[:500]}",
                 send_escalation=send_escalation,
+                fallback_context={
+                    "server_name": server_name,
+                    "session_id": session_id,
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                },
             )
 
     # ── Clarification evaluation (AskUserQuestion) ─────────────────────
@@ -188,7 +234,8 @@ class PermissionEvaluator:
         except asyncio.TimeoutError:
             self._pending.pop(request_id, None)
             self._pending_meta.pop(request_id, None)
-            return {"answers": None, "reason": "Timed out waiting for human"}
+            log.info(f"Clarification timeout for {server_name}/{session_id}, falling back to Claude")
+            return await self._forced_clarification(server_name, session_id, questions)
 
     # ── Human resolution ───────────────────────────────────────────────
 
@@ -251,6 +298,41 @@ class PermissionEvaluator:
             log.exception(f"Claude eval error: {e}")
             return None
 
+    # ── Forced fallback (human didn't respond) ────────────────────────
+
+    async def _forced_permission(self, ctx: dict) -> dict:
+        """Claude makes a forced approve/deny decision (no escalate)."""
+        prompt = PERMISSION_FORCED_PROMPT.format(
+            server_name=ctx["server_name"],
+            session_id=ctx["session_id"],
+            tool_name=ctx["tool_name"],
+            tool_input=json.dumps(ctx["tool_input"], ensure_ascii=False)[:2000],
+            config_path=self._config_path,
+        )
+        decision = await self._call_claude(prompt)
+        if decision and decision.get("decision") == "approve":
+            return {"approved": True, "reason": f"[fallback] {decision.get('reason', '')}"}
+        reason = decision.get("reason", "Forced deny after timeout") if decision else "Fallback evaluator error"
+        return {"approved": False, "reason": f"[fallback] {reason}"}
+
+    async def _forced_clarification(self, server_name: str, session_id: str, questions: list[dict]) -> dict:
+        """Claude answers clarification questions (forced, no 'can't answer')."""
+        q_lines = []
+        for i, q in enumerate(questions, 1):
+            opts = ", ".join(o.get("label", "?") for o in q.get("options", []))
+            q_lines.append(f"Q{i} [{q.get('header', '')}]: {q['question']}\n    Options: {opts}")
+
+        prompt = CLARIFICATION_FORCED_PROMPT.format(
+            server_name=server_name,
+            session_id=session_id,
+            questions_formatted="\n".join(q_lines),
+            config_path=self._config_path,
+        )
+        result = await self._call_claude(prompt)
+        if result and result.get("answers"):
+            return {"answers": result["answers"]}
+        return {"answers": None, "reason": "Fallback evaluator could not answer"}
+
     # ── Generic escalation (permission) ────────────────────────────────
 
     async def _escalate(
@@ -259,6 +341,7 @@ class PermissionEvaluator:
         title: str,
         detail: str,
         send_escalation: callable,
+        fallback_context: dict | None = None,
     ) -> dict:
         request_id = uuid.uuid4().hex[:12]
         future = asyncio.get_event_loop().create_future()
@@ -271,4 +354,7 @@ class PermissionEvaluator:
             return result
         except asyncio.TimeoutError:
             self._pending.pop(request_id, None)
+            if fallback_context:
+                log.info(f"Permission timeout, falling back to Claude for {fallback_context.get('tool_name')}")
+                return await self._forced_permission(fallback_context)
             return {"approved": False, "reason": "Timed out"}
