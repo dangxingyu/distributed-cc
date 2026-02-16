@@ -59,6 +59,47 @@ def format_sessions_list(servers: list) -> str:
     return "\n".join(lines)
 
 
+def format_plan_created(plan) -> str:
+    """Format a notification when a work plan is created."""
+    lines = [f"Plan created with {len(plan.items)} task(s):"]
+    for item in plan.items:
+        deps = f" (after {', '.join(item.depends_on)})" if item.depends_on else ""
+        lines.append(f"  [{item.id}] {item.description}{deps}")
+    return "\n".join(lines)
+
+
+def format_plan_summary(plan) -> str:
+    """Format a summary when a work plan completes."""
+    done = sum(1 for i in plan.items if i.status == "done")
+    failed = sum(1 for i in plan.items if i.status == "failed")
+    total = len(plan.items)
+
+    header = f"Plan complete: {done}/{total} tasks done"
+    if failed:
+        header += f", {failed} failed"
+
+    lines = [header]
+    for item in plan.items:
+        icon = {"done": "+", "failed": "x", "pending": "-"}.get(item.status, "?")
+        summary = ""
+        if item.result:
+            summary = f": {item.result[:200]}{'...' if len(item.result) > 200 else ''}"
+        lines.append(f"  [{icon}] {item.id} — {item.description}{summary}")
+    return truncate("\n".join(lines))
+
+
+def format_task_progress(item, verdict: str) -> str:
+    """Format a progress update for a single work item."""
+    if verdict == "done":
+        summary = item.result[:300] if item.result else "(no output)"
+        return truncate(f"Task {item.id} done: {summary}")
+    elif verdict == "retry":
+        return f"Task {item.id} retrying ({item.retries}/{item.max_retries}): {item.feedback or '(no feedback)'}"
+    elif verdict == "failed":
+        return f"Task {item.id} failed: {item.feedback or item.result or '(unknown error)'}"
+    return f"Task {item.id}: {verdict}"
+
+
 def truncate(text: str, max_len: int = MAX_MESSAGE_LEN) -> str:
     if len(text) <= max_len:
         return text

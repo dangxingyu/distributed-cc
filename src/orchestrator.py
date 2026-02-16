@@ -11,11 +11,20 @@ orchestrator's HTTP endpoints (/permission, /clarification).
 import asyncio
 import json
 import logging
+import uuid
 
 from .session import SessionManager, SessionResult
 from .store import Store, TaskStatus
+from .models import WorkItem, WorkPlan
 from .permission import PermissionEvaluator
-from .formatter import format_result, format_routing_decision, format_task_status
+from .formatter import (
+    format_result,
+    format_routing_decision,
+    format_task_status,
+    format_plan_created,
+    format_plan_summary,
+    format_task_progress,
+)
 
 log = logging.getLogger(__name__)
 
@@ -31,22 +40,63 @@ Based on the config and the user's message, decide what to do.
 
 Your final response MUST be ONLY a JSON object (no markdown, no extra text):
 
-1. Route a task to a remote session:
-{{"action": "route", "server": "<server_name>", "session": "<session_id>", "prompt": "<detailed prompt to send>"}}
+1. Route a single task to a remote session:
+{{"action": "route", "server": "<server_name>", "session": "<session_id>", "prompt": "<detailed prompt>"}}
 
-2. Answer directly (for simple questions, status checks, or chitchat):
+2. Plan multiple tasks (for complex requests that need decomposition):
+{{"action": "plan", "tasks": [
+    {{"id": "t1", "description": "human-readable goal", "server": "<server>", "session": "<session>", "prompt": "<detailed prompt>", "depends_on": []}},
+    {{"id": "t2", "description": "human-readable goal", "server": "<server>", "session": "<session>", "prompt": "<detailed prompt>", "depends_on": ["t1"]}}
+]}}
+
+3. Answer directly (for simple questions, status checks, or chitchat):
 {{"action": "reply", "text": "<your response>"}}
 
-3. Show running tasks:
+4. Show running tasks:
 {{"action": "show_tasks"}}
 
 Rules:
-- When routing, write a clear, detailed prompt that captures the user's intent. \
+- Most requests should use "route". The worker is a capable Claude Code agent — trust it to \
+handle implementation details, debugging, testing, etc. within a single task.
+- Only use "plan" when the request genuinely spans multiple LARGE, independent workstreams \
+that belong on different servers/sessions (e.g. "implement the backend auth on server A and \
+the frontend login page on server B"). Think of each task as something a good engineer could \
+spend hours on — NOT fine-grained subtasks like "write tests" or "update docs".
+- NEVER decompose a single-session request into subtasks. If the whole job runs on one \
+server/session, use "route" and let the worker figure out the steps.
+- When routing or planning, write clear, detailed prompts that capture the user's intent. \
 Include relevant context from conversation history and what you learned from config/setup docs.
+- Use "depends_on" only when one workstream genuinely cannot start without the other's output.
 - If the user asks about a specific project/server, route to the matching session.
 - If ambiguous which session to use, ask the user to clarify via "reply".
 - For greetings, status questions, or meta-questions, use "reply".
 - If the user asks to list sessions, read the config and reply with a formatted list directly.
+"""
+
+VERIFY_PROMPT = """\
+You are reviewing the output of a remote Claude Code session.
+
+Task: {description}
+Server: {server}/{session}
+
+Result:
+{result_text}
+
+Give a high-level verdict on whether the task goal was achieved. Do NOT nitpick style, \
+minor details, or things the worker could easily fix themselves. Focus on whether the \
+core objective was met.
+
+Your response MUST be ONLY a JSON object:
+{{"verdict": "<done|retry|failed>", "reason": "...", "new_tasks": []}}
+
+- "done": The main goal was achieved. Provide a brief summary in "reason".
+- "retry": The worker clearly missed the core objective or left major functionality \
+broken/unimplemented. Provide specific, actionable feedback in "reason".
+- "failed": Fundamental blocker prevents completion (e.g. missing access, wrong server). \
+Explain why in "reason".
+- "new_tasks": Only include if the result reveals a genuinely separate workstream that \
+was not part of the original request. Do NOT use this to decompose the current task.
+  Each: {{"id": "tN", "description": "...", "server": "...", "session": "...", "prompt": "...", "depends_on": [...]}}
 """
 
 
@@ -105,53 +155,229 @@ class Orchestrator:
             session = decision.get("session", "")
             prompt = decision.get("prompt", user_text)
 
+            plan = WorkPlan(
+                id=uuid.uuid4().hex[:8],
+                chat_id=chat_id,
+                user_message=user_text,
+                items=[WorkItem(
+                    id="t1",
+                    description=user_text[:200],
+                    server=server,
+                    session=session,
+                    prompt=prompt,
+                )],
+            )
             await send_reply(format_routing_decision(server, session, prompt))
+            asyncio.create_task(self._execute_plan(plan, send_reply))
 
-            task_id = await self._store.create_task(
-                chat_id, user_text, server, session, prompt
+        elif action == "plan":
+            tasks_data = decision.get("tasks", [])
+            if not tasks_data:
+                await send_reply("Plan has no tasks.")
+                return
+
+            plan = WorkPlan(
+                id=uuid.uuid4().hex[:8],
+                chat_id=chat_id,
+                user_message=user_text,
+                items=[
+                    WorkItem(
+                        id=t["id"],
+                        description=t.get("description", t.get("prompt", "")[:200]),
+                        server=t["server"],
+                        session=t["session"],
+                        prompt=t["prompt"],
+                        depends_on=t.get("depends_on", []),
+                    )
+                    for t in tasks_data
+                ],
             )
-            asyncio.create_task(
-                self._execute_and_reply(task_id, chat_id, server, session, prompt, send_reply)
-            )
+            await send_reply(format_plan_created(plan))
+            asyncio.create_task(self._execute_plan(plan, send_reply))
+
         else:
             await send_reply(f"Unknown action: {action}")
 
-    # ── Task execution ─────────────────────────────────────────────────
+    # ── Plan execution ─────────────────────────────────────────────────
 
-    async def _execute_and_reply(
-        self,
-        task_id: int,
-        chat_id: int,
-        server_name: str,
-        session_id: str,
-        prompt: str,
-        send_reply: callable,
-    ):
-        """Run a remote task and send the result back.
-
-        Permission and clarification are handled in real-time by the broker's
-        canUseTool callback → HTTP → this orchestrator's endpoints.
-        No post-hoc evaluation needed.
-        """
+    async def _execute_plan(self, plan: WorkPlan, send_reply: callable):
+        """Execute a work plan: run items respecting dependencies, verify each."""
         try:
-            result: SessionResult = await self._session_mgr.run_task(
-                server_name, session_id, prompt, task_id=task_id
-            )
-            status = TaskStatus.FAILED if result.is_error else TaskStatus.DONE
-            await self._store.finish_task(task_id, status, result.result_text)
+            while True:
+                # Find items ready to run
+                done_ids = {i.id for i in plan.items if i.status == "done"}
+                failed_ids = {i.id for i in plan.items if i.status == "failed"}
 
-            reply = format_result(result.result_text, is_error=result.is_error)
-            if result.cost_usd:
-                reply += f"\n(cost: ${result.cost_usd:.4f})"
-            if result.duration_secs:
-                reply += f" ({result.duration_secs:.0f}s)"
-            await self._store.add_message(chat_id, "assistant", reply)
-            await send_reply(reply)
+                ready = [
+                    i for i in plan.items
+                    if i.status == "pending"
+                    and all(d in done_ids for d in i.depends_on)
+                ]
+
+                # Check if we're stuck (deps on failed items)
+                stuck = [
+                    i for i in plan.items
+                    if i.status == "pending"
+                    and any(d in failed_ids for d in i.depends_on)
+                ]
+                for item in stuck:
+                    item.status = "failed"
+                    item.feedback = "Dependency failed"
+
+                if not ready:
+                    # No more items to run — check if anything is still running
+                    running = [i for i in plan.items if i.status == "running"]
+                    if not running:
+                        break
+                    # Wait for running items to finish (shouldn't happen in this loop)
+                    await asyncio.sleep(1)
+                    continue
+
+                # Execute ready items (sequentially to avoid overwhelming brokers)
+                for item in ready:
+                    await self._execute_item(plan, item, send_reply)
+
+            # All done — send summary
+            all_done = all(i.status == "done" for i in plan.items)
+            plan.status = "completed" if all_done else "failed"
+
+            summary = format_plan_summary(plan)
+            await self._store.add_message(plan.chat_id, "assistant", summary)
+            await send_reply(summary)
 
         except Exception as e:
-            log.exception(f"Task #{task_id} failed: {e}")
+            log.exception(f"Plan {plan.id} failed: {e}")
+            plan.status = "failed"
+            await send_reply(f"Plan execution failed: {e}")
+
+    async def _execute_item(
+        self, plan: WorkPlan, item: WorkItem, send_reply: callable,
+    ):
+        """Execute a single work item with verification and retry loop."""
+        item.status = "running"
+
+        task_id = await self._store.create_task(
+            plan.chat_id, item.description, item.server, item.session, item.prompt
+        )
+
+        prompt = item.prompt
+        if item.feedback:
+            prompt = (
+                f"PREVIOUS ATTEMPT FEEDBACK: {item.feedback}\n\n"
+                f"Please address the feedback above and complete the task:\n\n"
+                f"{item.prompt}"
+            )
+
+        try:
+            result: SessionResult = await self._session_mgr.run_task(
+                item.server, item.session, prompt, task_id=task_id
+            )
+
+            if result.is_error:
+                await self._store.finish_task(task_id, TaskStatus.FAILED, result.result_text)
+                item.status = "failed"
+                item.result = result.result_text
+                await send_reply(format_task_progress(item, "failed"))
+                return
+
+            await self._store.finish_task(task_id, TaskStatus.DONE, result.result_text)
+            item.result = result.result_text
+
+            # Verify the result
+            verdict = await self._verify_result(item)
+
+            if verdict["verdict"] == "done":
+                item.status = "done"
+                cost_info = ""
+                if result.cost_usd:
+                    cost_info += f"\n(cost: ${result.cost_usd:.4f})"
+                if result.duration_secs:
+                    cost_info += f" ({result.duration_secs:.0f}s)"
+                await send_reply(format_task_progress(item, "done") + cost_info)
+
+            elif verdict["verdict"] == "retry" and item.retries < item.max_retries:
+                item.retries += 1
+                item.feedback = verdict.get("reason", "Please try again")
+                item.status = "pending"  # Will be picked up again in the loop
+                await send_reply(format_task_progress(item, "retry"))
+
+            else:
+                item.status = "failed"
+                item.feedback = verdict.get("reason", "Verification failed")
+                await send_reply(format_task_progress(item, "failed"))
+
+            # Add any new tasks discovered during verification
+            for new_task in verdict.get("new_tasks", []):
+                if any(i.id == new_task["id"] for i in plan.items):
+                    continue  # Skip duplicates
+                plan.items.append(WorkItem(
+                    id=new_task["id"],
+                    description=new_task.get("description", new_task.get("prompt", "")[:200]),
+                    server=new_task["server"],
+                    session=new_task["session"],
+                    prompt=new_task["prompt"],
+                    depends_on=new_task.get("depends_on", []),
+                ))
+
+        except Exception as e:
+            log.exception(f"Work item {item.id} failed: {e}")
             await self._store.finish_task(task_id, TaskStatus.FAILED, str(e))
-            await send_reply(f"Task #{task_id} failed: {e}")
+            item.status = "failed"
+            item.result = str(e)
+            await send_reply(format_task_progress(item, "failed"))
+
+    # ── Verification ───────────────────────────────────────────────────
+
+    async def _verify_result(self, item: WorkItem) -> dict:
+        """Call Claude to verify a task result. Returns verdict dict."""
+        verify_prompt = VERIFY_PROMPT.format(
+            description=item.description,
+            server=item.server,
+            session=item.session,
+            result_text=item.result or "(no output)",
+        )
+
+        cmd = [
+            "claude", "-p",
+            "--output-format", "json",
+            "--model", self._model,
+        ]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=verify_prompt.encode()), timeout=30
+            )
+            if proc.returncode != 0:
+                log.error(f"Verify claude failed: {stderr.decode()}")
+                return {"verdict": "done", "reason": "Verification unavailable", "new_tasks": []}
+
+            outer = json.loads(stdout.decode())
+            result_text = outer.get("result", "")
+            clean = result_text.strip()
+            if clean.startswith("```"):
+                clean = "\n".join(clean.split("\n")[1:])
+            if clean.endswith("```"):
+                clean = clean.rsplit("```", 1)[0]
+            parsed = json.loads(clean.strip())
+            # Ensure required fields
+            parsed.setdefault("verdict", "done")
+            parsed.setdefault("reason", "")
+            parsed.setdefault("new_tasks", [])
+            return parsed
+
+        except (json.JSONDecodeError, asyncio.TimeoutError) as e:
+            log.error(f"Verify parse error: {e}")
+            # If verification fails to parse, assume done (don't block on verification bugs)
+            return {"verdict": "done", "reason": "Verification parse error", "new_tasks": []}
+        except Exception as e:
+            log.error(f"Verify error: {e}")
+            return {"verdict": "done", "reason": f"Verification error: {e}", "new_tasks": []}
 
     # ── Broker callbacks (called by HTTP endpoints in main.py) ─────────
 
