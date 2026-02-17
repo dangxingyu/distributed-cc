@@ -16,6 +16,8 @@ class WorkItem:
     feedback: str | None = None    # From verification (for retry)
     retries: int = 0
     max_retries: int = 2
+    approach_changes: int = 0
+    max_approach_changes: int = 1
 
 
 @dataclass

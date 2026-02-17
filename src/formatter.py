@@ -1,10 +1,10 @@
-"""Format Claude Code output for Telegram messages."""
+"""Format output for the channel-style interaction model.
+
+Each project is like a Slack channel with user, orchestrator, and workers.
+Messages are prefixed to show who's speaking and to whom.
+"""
 
 import re
-
-# Telegram message limit
-MAX_MESSAGE_LEN = 4096
-TRUNCATION_NOTICE = "\n\n... (truncated, reply 'full' to see more)"
 
 
 def escape_markdown_v2(text: str) -> str:
@@ -14,25 +14,10 @@ def escape_markdown_v2(text: str) -> str:
 
 
 def format_result(result_text: str, is_error: bool = False) -> str:
-    """Format a Claude session result for Telegram.
-
-    Returns plain text (not MarkdownV2) — Telegram's plain mode is more
-    forgiving with code snippets that contain special characters.
-    """
+    """Format a Claude session result."""
     if is_error:
-        text = f"[Error] {result_text}"
-    else:
-        text = result_text
-
-    return truncate(text)
-
-
-def format_routing_decision(server: str, session: str, prompt: str) -> str:
-    """Format a routing decision notification."""
-    return (
-        f">> Routing to {server}/{session}\n"
-        f">> Prompt: {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
-    )
+        return f"[Error] {result_text}"
+    return result_text
 
 
 def format_task_status(tasks: list) -> str:
@@ -59,49 +44,60 @@ def format_sessions_list(servers: list) -> str:
     return "\n".join(lines)
 
 
-def format_plan_created(plan) -> str:
-    """Format a notification when a work plan is created."""
-    lines = [f"Plan created with {len(plan.items)} task(s):"]
+# ── Channel-style formatters ──────────────────────────────────────────
+
+
+def format_channel_orchestrator(text: str) -> str:
+    """Format an orchestrator message in channel style."""
+    return f"orchestrator: {text}"
+
+
+def format_channel_dispatch(server: str, session: str, prompt: str) -> str:
+    """Format orchestrator dispatching work to a worker."""
+    return f"orchestrator -> {server}/{session}: {prompt}"
+
+
+def format_channel_worker_result(item, verdict: str) -> str:
+    """Format a worker result in channel style."""
+    tag = f"{item.server}/{item.session}"
+    if verdict == "done":
+        summary = item.result or "(no output)"
+        return f"{tag}: Done. {summary}"
+    elif verdict == "retry":
+        return f"orchestrator: @{tag} ({item.retries}/{item.max_retries}) {item.feedback or 'Please try again.'}"
+    elif verdict == "retry_different":
+        return f"orchestrator: @{tag} Trying a different approach."
+    elif verdict == "escalate":
+        return f"orchestrator: @{tag} Needs your input."
+    elif verdict == "failed":
+        return f"{tag}: Failed. {item.feedback or item.result or '(unknown error)'}"
+    return f"{tag}: {verdict}"
+
+
+def format_channel_plan_created(plan) -> str:
+    """Format plan creation in channel style."""
+    lines = [f"orchestrator: Planning {len(plan.items)} task(s):"]
     for item in plan.items:
         deps = f" (after {', '.join(item.depends_on)})" if item.depends_on else ""
-        lines.append(f"  [{item.id}] {item.description}{deps}")
+        lines.append(f"  [{item.id}] {item.description} -> {item.server}/{item.session}{deps}")
     return "\n".join(lines)
 
 
-def format_plan_summary(plan) -> str:
-    """Format a summary when a work plan completes."""
+def format_channel_plan_summary(plan) -> str:
+    """Format plan completion in channel style."""
     done = sum(1 for i in plan.items if i.status == "done")
     failed = sum(1 for i in plan.items if i.status == "failed")
     total = len(plan.items)
 
-    header = f"Plan complete: {done}/{total} tasks done"
+    header = f"orchestrator: Plan complete — {done}/{total} done"
     if failed:
         header += f", {failed} failed"
 
     lines = [header]
     for item in plan.items:
         icon = {"done": "+", "failed": "x", "pending": "-"}.get(item.status, "?")
-        summary = ""
+        result = ""
         if item.result:
-            summary = f": {item.result[:200]}{'...' if len(item.result) > 200 else ''}"
-        lines.append(f"  [{icon}] {item.id} — {item.description}{summary}")
-    return truncate("\n".join(lines))
-
-
-def format_task_progress(item, verdict: str) -> str:
-    """Format a progress update for a single work item."""
-    if verdict == "done":
-        summary = item.result[:300] if item.result else "(no output)"
-        return truncate(f"Task {item.id} done: {summary}")
-    elif verdict == "retry":
-        return f"Task {item.id} retrying ({item.retries}/{item.max_retries}): {item.feedback or '(no feedback)'}"
-    elif verdict == "failed":
-        return f"Task {item.id} failed: {item.feedback or item.result or '(unknown error)'}"
-    return f"Task {item.id}: {verdict}"
-
-
-def truncate(text: str, max_len: int = MAX_MESSAGE_LEN) -> str:
-    if len(text) <= max_len:
-        return text
-    cut = max_len - len(TRUNCATION_NOTICE)
-    return text[:cut] + TRUNCATION_NOTICE
+            result = f": {item.result}"
+        lines.append(f"  [{icon}] {item.id} — {item.description}{result}")
+    return "\n".join(lines)

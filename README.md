@@ -23,7 +23,9 @@ Distribute Claude Code sessions across multiple servers from a single orchestrat
 └─────────────────┘          └─────────────────┘
 ```
 
-The orchestrator routes tasks to remote servers, each running a broker daemon that drives Claude Code via the Agent SDK. Permission requests and clarification questions are forwarded back to the orchestrator through SSH reverse tunnels.
+Each project works like a Slack channel: the user talks to the orchestrator, the orchestrator assigns work to remote Claude Code workers, workers report back, and the orchestrator evaluates results — all visible in one conversation stream. The orchestrator maintains a single persistent Claude session per chat that accumulates context across tasks.
+
+Remote servers each run a broker daemon that drives Claude Code via the Agent SDK. Permission requests and clarification questions are forwarded back to the orchestrator through SSH reverse tunnels.
 
 ## Quick Start
 
@@ -125,7 +127,7 @@ make test-e2e     # End-to-end tests (costs money)
 ```
 src/
   main.py          — entry point, wires components together
-  orchestrator.py  — routes tasks to sessions, handles callbacks
+  orchestrator.py  — persistent Claude session per chat, routes tasks, evaluates results
   session.py       — manages server connections and sessions
   store.py         — SQLite persistence
   permission.py    — evaluates permission requests

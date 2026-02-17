@@ -1,7 +1,12 @@
-"""Orchestrator: the brain that routes user messages to Claude Code sessions.
+"""Orchestrator: the brain that manages distributed Claude Code sessions.
 
-Uses Claude (via `claude -p`) to understand user intent and decide
-which server/session should handle the request.
+Uses a single persistent Claude session per chat (via `claude -p --resume`)
+to route tasks, evaluate worker results, and accumulate context — like a
+PhD student managing research across multiple workers.
+
+The orchestrator session handles both user messages (routing decisions) and
+worker results (verdicts), eliminating the need for separate verification,
+reflection, or suggestion pipelines.
 
 Permission and clarification are handled in real-time by the Agent SDK's
 canUseTool callback in the remote broker, which calls back to this
@@ -19,84 +24,87 @@ from .models import WorkItem, WorkPlan
 from .permission import PermissionEvaluator
 from .formatter import (
     format_result,
-    format_routing_decision,
     format_task_status,
-    format_plan_created,
-    format_plan_summary,
-    format_task_progress,
+    format_channel_orchestrator,
+    format_channel_dispatch,
+    format_channel_worker_result,
+    format_channel_plan_created,
+    format_channel_plan_summary,
 )
 
 log = logging.getLogger(__name__)
 
-ROUTER_SYSTEM_PROMPT = """\
+ORCHESTRATOR_SYSTEM_PROMPT = """\
 You are an orchestrator managing distributed Claude Code sessions across remote servers.
+You act like a PhD student managing a research project — you receive direction from the user \
+(professor), assign work to Claude Code workers, evaluate their reports, and decide next steps.
 
-IMPORTANT: First, read the config file at `{config_path}` to understand the available servers \
-and sessions. Also check for these optional files in the same directory and read them if they exist:
+SETUP: First, read the config file at `{config_path}` to understand available servers and sessions. \
+Also check for these optional files in the same directory and read them if they exist:
 - `config.md` — extra instructions and context from the user about the setup
 - `setup.md` — per-server environment details and capabilities
 
-Based on the config and the user's message, decide what to do.
+Your response MUST always be ONLY a JSON object (no markdown, no extra text).
 
-Your final response MUST be ONLY a JSON object (no markdown, no extra text):
+=== WHEN RECEIVING A USER MESSAGE ===
 
-1. Route a single task to a remote session:
+Decide what to do:
+
+1. Route a single task:
 {{"action": "route", "server": "<server_name>", "session": "<session_id>", "prompt": "<detailed prompt>"}}
 
-2. Plan multiple tasks (for complex requests that need decomposition):
+2. Plan multiple tasks (for complex requests spanning multiple servers/sessions):
 {{"action": "plan", "tasks": [
     {{"id": "t1", "description": "human-readable goal", "server": "<server>", "session": "<session>", "prompt": "<detailed prompt>", "depends_on": []}},
     {{"id": "t2", "description": "human-readable goal", "server": "<server>", "session": "<session>", "prompt": "<detailed prompt>", "depends_on": ["t1"]}}
 ]}}
 
-3. Answer directly (for simple questions, status checks, or chitchat):
+3. Reply directly (for questions, status, chitchat):
 {{"action": "reply", "text": "<your response>"}}
 
 4. Show running tasks:
 {{"action": "show_tasks"}}
 
-Rules:
-- Most requests should use "route". The worker is a capable Claude Code agent — trust it to \
-handle implementation details, debugging, testing, etc. within a single task.
-- Only use "plan" when the request genuinely spans multiple LARGE, independent workstreams \
-that belong on different servers/sessions (e.g. "implement the backend auth on server A and \
-the frontend login page on server B"). Think of each task as something a good engineer could \
-spend hours on — NOT fine-grained subtasks like "write tests" or "update docs".
-- NEVER decompose a single-session request into subtasks. If the whole job runs on one \
-server/session, use "route" and let the worker figure out the steps.
-- When routing or planning, write clear, detailed prompts that capture the user's intent. \
-Include relevant context from conversation history and what you learned from config/setup docs.
-- Use "depends_on" only when one workstream genuinely cannot start without the other's output.
-- If the user asks about a specific project/server, route to the matching session.
-- If ambiguous which session to use, ask the user to clarify via "reply".
-- For greetings, status questions, or meta-questions, use "reply".
-- If the user asks to list sessions, read the config and reply with a formatted list directly.
-"""
+Rules for routing:
+- Most requests should use "route". Workers are capable — trust them with implementation.
+- Only use "plan" when the request spans multiple LARGE, independent workstreams on \
+different servers/sessions. Each task = hours of work, NOT subtasks like "write tests".
+- NEVER decompose a single-session request into subtasks.
+- Write clear prompts capturing user intent plus context from config/setup docs.
+- Use "depends_on" only for genuine data dependencies between workstreams.
+- If ambiguous which session, ask via "reply".
 
-VERIFY_PROMPT = """\
-You are reviewing the output of a remote Claude Code session.
+=== WHEN RECEIVING A WORKER RESULT ===
 
-Task: {description}
-Server: {server}/{session}
+Messages tagged [WORKER RESULT] report what a worker produced. Evaluate the result and decide:
 
-Result:
-{result_text}
+1. Task succeeded:
+{{"action": "verdict", "task_id": "<id>", "status": "done", "summary": "<brief summary for the user>"}}
 
-Give a high-level verdict on whether the task goal was achieved. Do NOT nitpick style, \
-minor details, or things the worker could easily fix themselves. Focus on whether the \
-core objective was met.
+2. Task needs retry — worker missed the core objective:
+{{"action": "verdict", "task_id": "<id>", "status": "retry", "feedback": "<specific, actionable feedback>"}}
 
-Your response MUST be ONLY a JSON object:
-{{"verdict": "<done|retry|failed>", "reason": "...", "new_tasks": []}}
+3. Task failed — fundamental blocker:
+{{"action": "verdict", "task_id": "<id>", "status": "failed", "summary": "<what went wrong>"}}
 
-- "done": The main goal was achieved. Provide a brief summary in "reason".
-- "retry": The worker clearly missed the core objective or left major functionality \
-broken/unimplemented. Provide specific, actionable feedback in "reason".
-- "failed": Fundamental blocker prevents completion (e.g. missing access, wrong server). \
-Explain why in "reason".
-- "new_tasks": Only include if the result reveals a genuinely separate workstream that \
-was not part of the original request. Do NOT use this to decompose the current task.
-  Each: {{"id": "tN", "description": "...", "server": "...", "session": "...", "prompt": "...", "depends_on": [...]}}
+4. Task failed but try a different approach:
+{{"action": "verdict", "task_id": "<id>", "status": "retry_different", "new_prompt": "<completely new prompt>"}}
+
+5. Need user input to proceed:
+{{"action": "verdict", "task_id": "<id>", "status": "escalate", "question": "<specific question for the user>"}}
+
+Optionally include follow-up work or suggestions:
+{{"action": "verdict", "task_id": "<id>", "status": "done", "summary": "...", \
+"new_tasks": [{{"id": "tN", "description": "...", "server": "...", "session": "...", "prompt": "...", "depends_on": [...]}}], \
+"suggestions": "<optional follow-up suggestions for the user>"}}
+
+Verdict rules:
+- Focus on whether the CORE OBJECTIVE was met. Don't nitpick style or minor details.
+- "retry": the worker clearly missed the main goal. Provide actionable feedback.
+- "retry_different": the approach itself was wrong — provide a completely new prompt.
+- "escalate": you genuinely need the user's judgment.
+- "new_tasks": only for genuinely separate workstreams discovered during execution.
+- "suggestions": only when results naturally suggest follow-up work the user might want.
 """
 
 
@@ -115,9 +123,9 @@ class Orchestrator:
         self._model = model
         self._config_path = config_path
         self._send_telegram: callable = None
-        self._system_prompt = ROUTER_SYSTEM_PROMPT.format(config_path=config_path)
-        # Per-chat router session IDs for --resume (Claude maintains its own context)
-        self._router_sessions: dict[int, str] = {}
+        self._system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(config_path=config_path)
+        # Per-chat orchestrator session IDs for --resume
+        self._orchestrator_sessions: dict[int, str] = {}
 
     def set_send_telegram(self, fn):
         """Inject the Telegram send function (set by Bot after wiring)."""
@@ -134,7 +142,7 @@ class Orchestrator:
         """Process a user message end-to-end."""
         await self._store.add_message(chat_id, "user", user_text)
 
-        decision = await self._get_routing_decision(chat_id, user_text)
+        decision = await self._send_to_orchestrator(chat_id, user_text)
         if decision is None:
             await send_reply("Sorry, I couldn't understand that. Try again?")
             return
@@ -144,7 +152,7 @@ class Orchestrator:
         if action == "reply":
             text = decision.get("text", "...")
             await self._store.add_message(chat_id, "assistant", text)
-            await send_reply(text)
+            await send_reply(format_channel_orchestrator(text))
 
         elif action == "show_tasks":
             tasks = await self._store.get_running_tasks(chat_id)
@@ -167,13 +175,13 @@ class Orchestrator:
                     prompt=prompt,
                 )],
             )
-            await send_reply(format_routing_decision(server, session, prompt))
+            await send_reply(format_channel_dispatch(server, session, prompt))
             asyncio.create_task(self._execute_plan(plan, send_reply))
 
         elif action == "plan":
             tasks_data = decision.get("tasks", [])
             if not tasks_data:
-                await send_reply("Plan has no tasks.")
+                await send_reply(format_channel_orchestrator("Plan has no tasks."))
                 return
 
             plan = WorkPlan(
@@ -192,16 +200,17 @@ class Orchestrator:
                     for t in tasks_data
                 ],
             )
-            await send_reply(format_plan_created(plan))
+            await send_reply(format_channel_plan_created(plan))
             asyncio.create_task(self._execute_plan(plan, send_reply))
 
         else:
-            await send_reply(f"Unknown action: {action}")
+            await send_reply(format_channel_orchestrator(f"Unknown action: {action}"))
 
     # ── Plan execution ─────────────────────────────────────────────────
 
     async def _execute_plan(self, plan: WorkPlan, send_reply: callable):
-        """Execute a work plan: run items respecting dependencies, verify each."""
+        """Execute a work plan: run items respecting dependencies, send
+        each result to the orchestrator session for evaluation."""
         try:
             while True:
                 # Find items ready to run
@@ -225,15 +234,13 @@ class Orchestrator:
                     item.feedback = "Dependency failed"
 
                 if not ready:
-                    # No more items to run — check if anything is still running
                     running = [i for i in plan.items if i.status == "running"]
                     if not running:
                         break
-                    # Wait for running items to finish (shouldn't happen in this loop)
                     await asyncio.sleep(1)
                     continue
 
-                # Execute ready items (sequentially to avoid overwhelming brokers)
+                # Execute ready items sequentially
                 for item in ready:
                     await self._execute_item(plan, item, send_reply)
 
@@ -241,7 +248,7 @@ class Orchestrator:
             all_done = all(i.status == "done" for i in plan.items)
             plan.status = "completed" if all_done else "failed"
 
-            summary = format_plan_summary(plan)
+            summary = format_channel_plan_summary(plan)
             await self._store.add_message(plan.chat_id, "assistant", summary)
             await send_reply(summary)
 
@@ -253,19 +260,23 @@ class Orchestrator:
     async def _execute_item(
         self, plan: WorkPlan, item: WorkItem, send_reply: callable,
     ):
-        """Execute a single work item with verification and retry loop."""
+        """Execute a single work item: run worker, send result to orchestrator, handle verdict."""
         item.status = "running"
 
         task_id = await self._store.create_task(
             plan.chat_id, item.description, item.server, item.session, item.prompt
         )
 
+        # Build prompt with upstream context and retry feedback
+        upstream_context = self._build_upstream_context(plan, item)
         prompt = item.prompt
+        if upstream_context:
+            prompt = upstream_context + prompt
         if item.feedback:
             prompt = (
                 f"PREVIOUS ATTEMPT FEEDBACK: {item.feedback}\n\n"
                 f"Please address the feedback above and complete the task:\n\n"
-                f"{item.prompt}"
+                f"{prompt}"
             )
 
         try:
@@ -277,39 +288,78 @@ class Orchestrator:
                 await self._store.finish_task(task_id, TaskStatus.FAILED, result.result_text)
                 item.status = "failed"
                 item.result = result.result_text
-                await send_reply(format_task_progress(item, "failed"))
+                await send_reply(format_channel_worker_result(item, "failed"))
                 return
 
             await self._store.finish_task(task_id, TaskStatus.DONE, result.result_text)
             item.result = result.result_text
 
-            # Verify the result
-            verdict = await self._verify_result(item)
+            # Send result to orchestrator session for evaluation
+            worker_report = self._format_worker_result(item, plan, is_error=False)
+            verdict = await self._send_to_orchestrator(plan.chat_id, worker_report)
 
-            if verdict["verdict"] == "done":
+            if verdict is None or verdict.get("action") != "verdict":
+                # Orchestrator didn't return a valid verdict — assume done
+                log.warning("No valid verdict from orchestrator, assuming done")
+                item.status = "done"
+                await send_reply(format_channel_worker_result(item, "done"))
+                return
+
+            status = verdict.get("status", "done")
+
+            if status == "done":
                 item.status = "done"
                 cost_info = ""
                 if result.cost_usd:
                     cost_info += f"\n(cost: ${result.cost_usd:.4f})"
                 if result.duration_secs:
                     cost_info += f" ({result.duration_secs:.0f}s)"
-                await send_reply(format_task_progress(item, "done") + cost_info)
+                await send_reply(format_channel_worker_result(item, "done") + cost_info)
+                # Handle suggestions
+                suggestions = verdict.get("suggestions", "")
+                if suggestions:
+                    await send_reply(format_channel_orchestrator(
+                        f"Suggested next steps: {suggestions}"
+                    ))
 
-            elif verdict["verdict"] == "retry" and item.retries < item.max_retries:
+            elif status == "retry" and item.retries < item.max_retries:
                 item.retries += 1
-                item.feedback = verdict.get("reason", "Please try again")
-                item.status = "pending"  # Will be picked up again in the loop
-                await send_reply(format_task_progress(item, "retry"))
+                item.feedback = verdict.get("feedback", "Please try again")
+                item.status = "pending"
+                await send_reply(format_channel_worker_result(item, "retry"))
+
+            elif status == "retry_different" and item.approach_changes < item.max_approach_changes:
+                item.approach_changes += 1
+                new_prompt = verdict.get("new_prompt")
+                if new_prompt:
+                    item.prompt = new_prompt
+                    item.retries = 0
+                    item.feedback = None
+                    item.status = "pending"
+                    await send_reply(format_channel_worker_result(item, "retry_different"))
+                else:
+                    item.status = "failed"
+                    item.feedback = verdict.get("summary", "No new approach provided")
+                    await send_reply(format_channel_worker_result(item, "failed"))
+
+            elif status == "escalate":
+                question = verdict.get("question", "Need your input on this task.")
+                await send_reply(format_channel_orchestrator(
+                    f"Task {item.id} needs your input: {question}"
+                ))
+                item.status = "failed"
+                item.feedback = f"Escalated: {question}"
 
             else:
+                # failed, or retry/approach_change exhausted
                 item.status = "failed"
-                item.feedback = verdict.get("reason", "Verification failed")
-                await send_reply(format_task_progress(item, "failed"))
+                item.feedback = verdict.get("summary", verdict.get("feedback", "Task failed"))
+                await send_reply(format_channel_worker_result(item, "failed"))
 
-            # Add any new tasks discovered during verification
+            # Add any new tasks discovered
             for new_task in verdict.get("new_tasks", []):
                 if any(i.id == new_task["id"] for i in plan.items):
-                    continue  # Skip duplicates
+                    continue
                 plan.items.append(WorkItem(
                     id=new_task["id"],
                     description=new_task.get("description", new_task.get("prompt", "")[:200]),
@@ -324,24 +374,28 @@ class Orchestrator:
             await self._store.finish_task(task_id, TaskStatus.FAILED, str(e))
             item.status = "failed"
             item.result = str(e)
-            await send_reply(format_task_progress(item, "failed"))
+            await send_reply(format_channel_worker_result(item, "failed"))
 
-    # ── Verification ───────────────────────────────────────────────────
+    # ── Orchestrator session ───────────────────────────────────────────
 
-    async def _verify_result(self, item: WorkItem) -> dict:
-        """Call Claude to verify a task result. Returns verdict dict."""
-        verify_prompt = VERIFY_PROMPT.format(
-            description=item.description,
-            server=item.server,
-            session=item.session,
-            result_text=item.result or "(no output)",
-        )
+    async def _send_to_orchestrator(self, chat_id: int, text: str) -> dict | None:
+        """Send a message to the orchestrator Claude session and parse the JSON response.
 
+        Used for both user messages (routing decisions) and worker result
+        feedback (verdicts). Resumes the existing session for this chat,
+        or starts a new one with the system prompt.
+        """
         cmd = [
             "claude", "-p",
             "--output-format", "json",
             "--model", self._model,
         ]
+
+        session_id = self._orchestrator_sessions.get(chat_id)
+        if session_id:
+            cmd.extend(["--resume", session_id])
+        else:
+            cmd.extend(["--system-prompt", self._system_prompt])
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -351,41 +405,94 @@ class Orchestrator:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=verify_prompt.encode()), timeout=30
+                proc.communicate(input=text.encode()), timeout=120
             )
             if proc.returncode != 0:
-                log.error(f"Verify claude failed: {stderr.decode()}")
-                return {"verdict": "done", "reason": "Verification unavailable", "new_tasks": []}
+                log.error("Orchestrator claude failed: %s", stderr.decode())
+                return None
 
             outer = json.loads(stdout.decode())
+
+            # Capture session ID so future calls resume this conversation
+            if outer.get("session_id"):
+                self._orchestrator_sessions[chat_id] = outer["session_id"]
+
             result_text = outer.get("result", "")
             clean = result_text.strip()
             if clean.startswith("```"):
                 clean = "\n".join(clean.split("\n")[1:])
             if clean.endswith("```"):
                 clean = clean.rsplit("```", 1)[0]
-            parsed = json.loads(clean.strip())
-            # Ensure required fields
-            parsed.setdefault("verdict", "done")
-            parsed.setdefault("reason", "")
-            parsed.setdefault("new_tasks", [])
-            return parsed
+            return json.loads(clean.strip())
 
         except (json.JSONDecodeError, asyncio.TimeoutError) as e:
-            log.error(f"Verify parse error: {e}")
-            # If verification fails to parse, assume done (don't block on verification bugs)
-            return {"verdict": "done", "reason": "Verification parse error", "new_tasks": []}
+            log.error("Orchestrator parse error: %s", e)
+            return None
         except Exception as e:
-            log.error(f"Verify error: {e}")
-            return {"verdict": "done", "reason": f"Verification error: {e}", "new_tasks": []}
+            log.exception("Orchestrator error: %s", e)
+            return None
+
+    # ── Helpers ─────────────────────────────────────────────────────────
+
+    def _format_worker_result(self, item: WorkItem, plan: WorkPlan, is_error: bool) -> str:
+        """Format a worker result for the orchestrator session."""
+        result_text = item.result or "(no output)"
+        if len(result_text) > 2000:
+            result_text = result_text[:2000] + "... (truncated)"
+
+        plan_context = self._format_plan_context(plan, item.id)
+
+        return (
+            f"[WORKER RESULT]\n"
+            f"Task: {item.id} — {item.description}\n"
+            f"Server: {item.server}/{item.session}\n"
+            f"Status: {'error' if is_error else 'completed'}\n"
+            f"Attempt: {item.retries + 1}\n\n"
+            f"Plan context:\n{plan_context}\n\n"
+            f"Output:\n{result_text}"
+        )
+
+    def _build_upstream_context(self, plan: WorkPlan, item: WorkItem) -> str:
+        """Collect results from upstream (depends_on) tasks, truncated."""
+        if not item.depends_on:
+            return ""
+        parts = []
+        for dep_id in item.depends_on:
+            dep = next((i for i in plan.items if i.id == dep_id), None)
+            if dep and dep.result:
+                truncated = dep.result[:1000]
+                if len(dep.result) > 1000:
+                    truncated += "... (truncated)"
+                parts.append(
+                    f"[{dep.id}] {dep.description}:\n{truncated}"
+                )
+        if not parts:
+            return ""
+        return "CONTEXT FROM UPSTREAM TASKS:\n\n" + "\n\n".join(parts) + "\n\n---\n\n"
+
+    def _format_plan_context(self, plan: WorkPlan, current_item_id: str) -> str:
+        """Format plan context: completed/pending/current tasks."""
+        lines = []
+        for item in plan.items:
+            if item.id == current_item_id:
+                status_label = "CURRENT"
+            elif item.status == "done":
+                status_label = "COMPLETED"
+                result_preview = (item.result or "")[:300]
+                if result_preview:
+                    lines.append(f"  [{item.id}] ({status_label}) {item.description}: {result_preview}")
+                    continue
+            elif item.status == "failed":
+                status_label = "FAILED"
+            else:
+                status_label = "PENDING"
+            lines.append(f"  [{item.id}] ({status_label}) {item.description}")
+        return "\n".join(lines)
 
     # ── Broker callbacks (called by HTTP endpoints in main.py) ─────────
 
     async def handle_permission_request(self, data: dict) -> dict:
-        """Handle /permission callback from remote broker.
-
-        The agent proactively asks for permission before certain tool calls.
-        """
+        """Handle /permission callback from remote broker."""
         return await self._permission.evaluate_permission(
             server_name=data.get("server_name", "unknown"),
             session_id=data.get("session_id", "unknown"),
@@ -395,10 +502,7 @@ class Orchestrator:
         )
 
     async def handle_clarification_request(self, data: dict) -> dict:
-        """Handle /clarification callback from remote broker (AskUserQuestion).
-
-        The agent proactively asks a clarifying question.
-        """
+        """Handle /clarification callback from remote broker (AskUserQuestion)."""
         return await self._permission.evaluate_clarification(
             server_name=data.get("server_name", "unknown"),
             session_id=data.get("session_id", "unknown"),
@@ -417,56 +521,3 @@ class Orchestrator:
             if self._send_telegram:
                 await self._send_telegram(request_id, interaction_type, title, detail)
         return send_escalation
-
-    # ── Routing ────────────────────────────────────────────────────────
-
-    async def _get_routing_decision(self, chat_id: int, user_text: str) -> dict | None:
-        """Let the router Claude decide. It maintains its own session via --resume,
-        so it naturally remembers conversation history, config it read, etc."""
-        cmd = [
-            "claude", "-p",
-            "--output-format", "json",
-            "--model", self._model,
-        ]
-
-        # Resume existing router session or start fresh with system prompt
-        session_id = self._router_sessions.get(chat_id)
-        if session_id:
-            cmd.extend(["--resume", session_id])
-        else:
-            cmd.extend(["--system-prompt", self._system_prompt])
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=user_text.encode()), timeout=60
-            )
-            if proc.returncode != 0:
-                log.error(f"Router claude failed: {stderr.decode()}")
-                return None
-
-            outer = json.loads(stdout.decode())
-
-            # Capture session ID so future calls resume this conversation
-            if outer.get("session_id"):
-                self._router_sessions[chat_id] = outer["session_id"]
-
-            result_text = outer.get("result", "")
-            clean = result_text.strip()
-            if clean.startswith("```"):
-                clean = "\n".join(clean.split("\n")[1:])
-            if clean.endswith("```"):
-                clean = clean.rsplit("```", 1)[0]
-            return json.loads(clean.strip())
-
-        except (json.JSONDecodeError, asyncio.TimeoutError) as e:
-            log.error(f"Router parse error: {e}")
-            return None
-        except Exception as e:
-            log.exception(f"Router error: {e}")
-            return None

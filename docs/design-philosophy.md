@@ -43,3 +43,23 @@ The workers (Claude Code) execute.
 - The student asks the professor when they genuinely need advice or a decision (design choices, interpreting ambiguous results, prioritization)
 - If the professor doesn't respond, the student makes their best judgment and keeps going
 - Routine tool permissions and implementation details are the student's call, not the professor's
+
+## Channel Model
+
+Each project is like a Slack channel with three participants: user, orchestrator, and workers.
+
+```
+#project-backend
+  user: investigate why the API is slow, might be the DB queries
+  orchestrator: Looking into it. Assigning to worker on prod server.
+  orchestrator -> prod/backend: Profile the /users endpoint, check for N+1 queries
+  prod/backend: Done. Found 3 N+1 queries in users handler. Fixed. Response time 2s→80ms.
+  orchestrator: Task complete — N+1 queries fixed, API response time improved 25x.
+  orchestrator: Suggested next steps: Run load tests to verify under production traffic.
+```
+
+Key principles:
+- **Everything visible** — the user sees orchestrator↔worker exchanges, not just final results
+- **One persistent session** — the orchestrator is a single Claude session (via `--resume`) that accumulates context across all interactions, not a pipeline of separate calls
+- **Workers get curated context** — workers see the orchestrator's prompt, not the full channel history. The orchestrator's job is to distill relevant context.
+- **Natural decision-making** — instead of separate verify/reflect/suggest pipelines, the orchestrator sees worker results and naturally decides: accept, retry, try differently, escalate, or suggest next steps
