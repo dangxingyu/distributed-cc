@@ -945,6 +945,17 @@ class Orchestrator:
                         continue  # valid JSON action — handled by caller
                     except json.JSONDecodeError:
                         pass
+                # Strip JSON code fences (model sometimes wraps action in commentary)
+                # e.g. "Some text...\n```json\n{...}\n```"
+                if '{"action"' in text:
+                    # Extract only the text before the JSON block
+                    for marker in ("```json", "```", '{"action"'):
+                        idx = text.find(marker)
+                        if idx >= 0:
+                            text = text[:idx].strip()
+                            break
+                    if not text:
+                        continue
                 # Forward non-JSON text as orchestrator commentary
                 formatted = format_channel_orchestrator(text)
                 await self._reply(chat_id, send_reply, formatted)
