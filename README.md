@@ -240,6 +240,11 @@ config.example.yaml  — example configuration (YAML)
 config.example.md    — example extra instructions (optional)
 ```
 
+## Documentation
+
+- [Design Philosophy](docs/design-philosophy.md) — Core design philosophy (Professor → PhD Student → Claude Code model)
+- [Broker Guide](docs/broker-guide.md) — Broker deployment & operations
+
 ## Requirements
 
 - Python 3.10+
