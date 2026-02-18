@@ -78,9 +78,6 @@ class Router:
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         self._load_config()
 
-        for orch in self._orchestrators.values():
-            asyncio.create_task(self._register_project(orch))
-
     async def close(self):
         for task in self._sse_tasks.values():
             task.cancel()
@@ -160,6 +157,13 @@ class Router:
         except aiohttp.ClientError as e:
             log.warning("Cannot reach daemon for %s: %s", orch.project_id, e)
             orch.status = "disconnected"
+
+    async def _ensure_registered(self, orch: RemoteOrchestrator) -> bool:
+        """Lazily register with daemon on first interaction. Returns True if ready."""
+        if orch.status not in ("unknown", "disconnected"):
+            return True
+        await self._register_project(orch)
+        return orch.status not in ("unknown", "disconnected")
 
     # -- SSE -----------------------------------------------------------
 
@@ -341,8 +345,8 @@ class Router:
             await send_reply(f"Project `{project_id}` not found in config.")
             return
 
-        if orch.status == "disconnected":
-            await send_reply(f"Daemon for `{project_id}` is disconnected. Check SSH tunnel.")
+        if not await self._ensure_registered(orch):
+            await send_reply(f"Cannot reach daemon for `{project_id}`. Is the daemon running and SSH tunnel open?")
             return
 
         effective_text = orchestrator_body if addressed_to_orchestrator else stripped

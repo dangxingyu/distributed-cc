@@ -226,12 +226,24 @@ async def test_channel_status_callback():
 
 
 async def test_route_to_disconnected_daemon():
+    """Message to unreachable daemon fails with helpful error."""
     router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="disconnected")])
     router._channel_project[1] = "proj"
 
+    # Mock HTTP to simulate unreachable daemon
+    mock_resp = AsyncMock()
+    mock_resp.status = 502
+    mock_resp.text = AsyncMock(return_value="bad gateway")
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.post = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
     send_reply = AsyncMock()
     await router.route_message(1, "do something", send_reply)
-    assert "disconnected" in send_reply.call_args[0][0].lower()
+    assert "cannot reach" in send_reply.call_args[0][0].lower()
 
 
 async def test_ingest_progress_event_dedupes_event_id():
