@@ -444,6 +444,11 @@ class Orchestrator:
                 cancelled_orch += 1
         active.clear()
 
+        # Cancel pending AskUserQuestion futures (avoid stale captures)
+        pending = self._pending_answers.pop(chat_id, None)
+        if pending and not pending.done():
+            pending.cancel()
+
         # Drain the message queue
         queue = self._message_queues.get(chat_id)
         if queue:
