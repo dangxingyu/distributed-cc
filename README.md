@@ -1,209 +1,159 @@
 # distributed-cc
 
-Distribute Claude Code sessions across multiple servers from a single orchestrator.
+Distribute Claude Code sessions across multiple servers with an autonomous orchestrator.
 
 ```
-┌─────────────────────────────────────────────┐
-│  Orchestrator (your laptop)                 │
-│                                             │
-│  src/main.py ──→ Web (default), CLI, Telegram │
-│       │                                     │
-│  Permission/Clarification HTTP server :9120 │
-└──────┬──────────────────────────────────────┘
-       │ SSH tunnels
+┌─────────────────────────────────────┐
+│  Laptop (Router)                    │
+│  src/main.py → Web UI :8080        │
+│  Callback HTTP :9120 (permissions)  │
+└──────┬──────────────────────────────┘
+       │ SSH tunnels (-L/-R)
        ├──────────────────────────────┐
        │                              │
-┌──────▼──────────┐          ┌───────▼─────────┐
-│  Server A       │          │  Server B       │
-│  remote_broker  │          │  remote_broker  │
-│  :8200          │          │  :8200          │
-│                 │          │                 │
-│  Claude Code    │          │  Claude Code    │
-│  Agent SDK      │          │  Agent SDK      │
-└─────────────────┘          └─────────────────┘
+┌──────▼──────────────────┐   ┌──────▼──────────────────┐
+│  Server A               │   │  Server B               │
+│  orchestrator_daemon.py │   │  orchestrator_daemon.py │
+│  :8200                  │   │  :8201                  │
+│                         │   │                         │
+│  RALPH Loop             │   │  RALPH Loop             │
+│  (Agent SDK → tools)    │   │  (Agent SDK → tools)    │
+└─────────────────────────┘   └─────────────────────────┘
 ```
 
-Each project works like a Slack channel: the user talks to the orchestrator, the orchestrator assigns work to remote Claude Code workers, workers report back, and the orchestrator evaluates results — all visible in one conversation stream. The orchestrator maintains a single persistent Claude session per chat that accumulates context across tasks.
+Each project maps to a Slack-like channel in the web UI. The user sends a task, the **router** relays it to a remote **orchestrator daemon**, which autonomously works on it via a RALPH loop (Reason → Act → Learn → Plan → Hypothesize). Progress streams back in real-time via SSE. User messages to a running task become interruptions injected at the next iteration boundary.
 
-Remote servers each run a broker daemon that drives Claude Code via the Agent SDK. Permission requests and clarification questions are forwarded back to the orchestrator through SSH reverse tunnels.
+The orchestrator daemon uses the Claude Agent SDK directly — it reads files, writes code, runs tests, and evaluates results autonomously, like a PhD student working on a research task. It only pauses when genuinely stuck and needing user input.
 
 ## Usage
 
-The default interface is the **web app** at `http://localhost:8080`. It provides a Slack-like chat UI with channels, message bubbles, a members panel, and @mention autocomplete. Orchestrator replies, worker dispatches, and task results stream back over WebSocket in real-time. Permission and clarification escalations appear as inline cards with action buttons.
+Open the **web app** at `http://localhost:8080`. Create a channel, connect it to a project with `/connect <project-id>`, and send your task.
 
-Just type your message — it goes directly to the orchestrator. Use `@orchestrator /stop` to cancel all running worker tasks.
+| Action | What happens |
+|--------|-------------|
+| Send message (project idle) | Starts a new RALPH loop task on the daemon |
+| Send message (task running) | Queued as interruption for next iteration |
+| `/connect <project-id>` | Link channel to a remote project |
+| `/stop` | Stop the running task |
+| `/status` | Show current task status and iteration |
 
-### Alternative interfaces
-
-**CLI mode** (`make run`) — terminal REPL, same direct-message behavior as web.
-
-**Telegram mode** (`make run-telegram`) — unprefixed messages become **channel notes** (ambient observations auto-injected into the orchestrator's next interaction). Use `@orchestrator` prefix for direct messages.
-
-### Message routing details
-
-| Input | Behavior |
-|---|---|
-| `<text>` (web/CLI) | Direct message to orchestrator. Queued non-blocking if busy. |
-| `@orchestrator <text>` | Explicit direct message (required in Telegram, optional elsewhere). |
-| `@orchestrator /stop` | Cancels all running worker tasks for the channel. |
-| `<text>` (Telegram only) | Channel note — stored and prepended as `[CHANNEL NOTES]` to the next orchestrator message. |
-
-**Non-blocking queue**: When the orchestrator is busy (e.g., evaluating a worker result), messages are queued and processed in order once the lock is released. No messages are lost.
-
-### `/setup` — automated server bootstrap
-
-Instead of manually installing brokers and opening tunnels, you can let the orchestrator do it:
-
-```
-/setup della at xd7812@della-gpu
-```
-
-The orchestrator will SSH in, install the broker if needed, start it in a tmux session, open SSH tunnels, and verify connectivity. You can also just type `/setup` and it will read from `config.json` / `config.md`, or ask for clarification if info is missing.
-
-Works with servers not yet in your config — just describe them in the message.
+Progress events (tool calls, text output, iteration markers) stream into the monitor panel. Permission escalations for unknown tools appear as inline cards with approve/deny buttons.
 
 ## Setup
 
-The manual setup below is for reference. For most cases, `/setup` handles everything automatically.
+Three components: **daemon** on each remote server, **SSH tunnels**, and the **router** on your laptop.
 
-There are three components to get running: the **broker** on each remote server, **SSH tunnels** connecting them, and the **orchestrator** on your laptop.
+### Step 1: Install the daemon on each remote server
 
-```
-Your laptop                          Remote server (e.g. server-a)
-──────────                           ─────────────────────────────
-Orchestrator (:9120 callback)        Broker daemon (:8200)
-     │                                    │
-     │  SSH tunnel                        │  Claude Code Agent SDK
-     │  -L 8201:localhost:8200  ──────►   │  runs tasks in project dirs
-     │  -R 9120:localhost:9120  ◄──────   │  callbacks for permissions
-     │                                    │
-Web app (:8080)                     Session: /path/to/project
-```
+The daemon is an autonomous agent that receives tasks and works on them independently.
 
-### Step 1: Install the broker on each remote server
-
-The broker is a lightweight daemon that receives tasks from the orchestrator and runs Claude Code via the Agent SDK. Install it once per server.
-
-**Option A — One-line installer** (on the remote server):
-```bash
-curl -fsSL https://raw.githubusercontent.com/dangxingyu/distributed-cc/main/tools/install-broker.sh | bash
-```
-
-**Option B — Deploy from your laptop**:
+**Option A — Deploy from your laptop**:
 ```bash
 make deploy HOST=user@server-a NAME=server-a
 ```
 
-Both options install to `~/.distributed-cc/` on the remote, set up a venv, and install dependencies (`claude-agent-sdk`, `aiohttp`).
+**Option B — One-line installer** (on the remote server):
+```bash
+curl -fsSL https://raw.githubusercontent.com/dangxingyu/distributed-cc/main/tools/install-broker.sh | bash
+```
 
-**Prerequisite**: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and authenticated on each remote server (`claude` command available and logged in).
+Both install to `~/.distributed-cc/` on the remote, set up a venv, and install dependencies (`claude-agent-sdk`, `aiohttp`).
 
-### Step 2: Start the broker daemon
+**Prerequisite**: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and authenticated on each remote server.
 
-On the remote server, start the broker in a persistent session (tmux/screen):
+### Step 2: Start the daemon
+
+On the remote server, start the daemon in a persistent session (tmux/screen):
 
 ```bash
 # In tmux on server-a:
-~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py \
-    --port 8200 --name server-a
+~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py \
+    --port 8200 --name server-a --callback-url http://127.0.0.1:9120
 ```
 
-The broker listens on `:8200` and manages Claude Code sessions. One broker per server — it handles multiple projects/sessions.
+The daemon listens on `:8200` and runs RALPH loop tasks autonomously. One daemon per server.
 
 ### Step 3: Open SSH tunnels
 
 Each remote server needs two tunnels from your laptop:
 
-- **Forward tunnel** (`-L`): lets the orchestrator send tasks to the remote broker
-- **Reverse tunnel** (`-R`): lets the remote broker send permission/clarification callbacks back to the orchestrator
+- **Forward tunnel** (`-L`): lets the router send tasks to the remote daemon
+- **Reverse tunnel** (`-R`): lets the remote daemon send permission escalations back
 
 ```bash
-# One command per server (run from your laptop, e.g. in a tmux pane):
+# One command per server (from your laptop):
 ssh -N \
     -L 8201:localhost:8200 \
     -R 9120:localhost:9120 \
     user@server-a
 ```
 
-For multiple servers, use different local ports (`-L 8201`, `-L 8202`, etc.). The reverse tunnel port (`9120`) is the same for all servers — it's the orchestrator's callback port.
+For multiple servers, use different local ports (`-L 8201`, `-L 8202`, etc.).
 
-**Helper script**: Edit `tools/start_tunnels.sh` with your servers, then run:
-```bash
-make tunnels   # starts all tunnels in background, Ctrl+C to stop
-```
-
-**Local broker** (same machine): No tunnels needed. The orchestrator connects directly to `localhost:8200`.
-
-### Step 4: Configure the orchestrator
+### Step 4: Configure the router
 
 ```bash
 git clone https://github.com/dangxingyu/distributed-cc.git
 cd distributed-cc
-uv sync --extra dev --extra telegram
+uv sync --extra dev
 
 cp config.example.json config.json
 ```
 
-Edit `config.json` — the orchestrator reads this on startup to discover servers. Each entry's `broker_port` must match the local side of your SSH tunnel:
+Edit `config.json` — the router reads this on startup to discover orchestrator daemons:
 
 ```json
 {
-  "servers": [
-    {"name": "server-a", "host": "user@server-a.example.com", "broker_port": 8201},
-    {"name": "server-b", "host": "user@server-b.example.com", "broker_port": 8202},
-    {"name": "local", "host": null, "broker_port": 8200}
+  "orchestrators": [
+    {
+      "project_id": "my-project",
+      "name": "server-a",
+      "host": "user@server-a",
+      "broker_port": 8201,
+      "project_dir": "/path/to/project",
+      "max_iterations": 20
+    },
+    {
+      "project_id": "local-dev",
+      "name": "local",
+      "host": null,
+      "broker_port": 8200,
+      "project_dir": "/Users/me/project"
+    }
   ]
 }
 ```
 
-### Step 5: Start the orchestrator
+### Step 5: Start the router
 
 ```bash
-make run              # Web app at localhost:8080 (default)
-make run-cli          # CLI mode (terminal REPL)
-make run-telegram     # Telegram bot mode (needs TELEGRAM_TOKEN env var)
+make run    # Web app at localhost:8080
 ```
 
-The web app is the recommended interface — it gives you channels, real-time streaming, and inline permission/clarification cards. The orchestrator also starts a callback HTTP server on `:9120` (for broker permission requests) and connects to brokers via the configured ports.
-
-### Step 6: Register project sessions (optional)
-
-Workers are created dynamically by the orchestrator when you ask it to do work — it calls the broker's `/register` endpoint automatically. You can also pre-register sessions manually on the remote server:
-
-```bash
-# On server-a, from a project directory:
-cd /path/to/your/project
-~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/broker_session.py start
-# Optional: --name custom-name --desc "Training run"
-```
-
-The broker heartbeats registered sessions to the orchestrator, so they appear automatically.
+The router starts the web UI on `:8080` and a callback HTTP server on `:9120` (for daemon permission escalations). It connects to each daemon, registers projects, and begins listening for SSE progress events.
 
 ### Startup order summary
 
-1. **Broker** on each remote server (persistent — start once)
+1. **Daemon** on each remote server (persistent — start once)
 2. **SSH tunnels** from your laptop (persistent — start once per server)
-3. **Orchestrator** on your laptop (start per work session)
-
-The broker and tunnels can be left running indefinitely. Only the orchestrator needs restarting between sessions.
+3. **Router** on your laptop (start per work session)
 
 ## Configuration
 
-The orchestrator reads `config.json` from the working directory on startup to discover servers and preferences. See `config.example.json` for all options. Key sections:
+The router reads `config.json` from the working directory on startup. Key fields:
 
-- **servers** — list of remote/local servers with broker ports (sessions register dynamically)
-- **orchestrator** — model selection, tool permission config (auto-approve, deny, escalate-to-human)
-
-Infrastructure settings (ports, data dir) use sensible defaults and can be overridden via CLI flags (`--http-port`, `--web-port`, `--web-host`, `--data-dir`). Telegram mode reads `TELEGRAM_TOKEN` and `TELEGRAM_ALLOWED_USERS` from environment variables.
+- **orchestrators** — list of remote/local daemons with project IDs, ports, and directories
+- **broker_port** — local port for the SSH forward tunnel (must match `-L` flag)
+- **max_iterations** — maximum RALPH loop iterations before auto-stopping (default: 20)
 
 Optionally, create a `config.md` alongside `config.json` for extra instructions
-(server notes, rules, preferences). The orchestrator reads it for additional context.
+(server notes, rules, preferences). The daemon reads it for additional context.
 See `config.example.md` for an example.
 
 ## Testing
 
 ```bash
-make test         # Unit/integration tests (no Claude calls)
+make test         # Unit/integration tests (no Claude calls, 70 tests)
 make test-e2e     # End-to-end tests (costs money)
 ```
 
@@ -211,33 +161,30 @@ make test-e2e     # End-to-end tests (costs money)
 
 ```
 src/
-  main.py          — entry point, wires components together
-  orchestrator.py  — message routing, persistent Claude session per chat, task evaluation
-  session.py       — manages server connections and remote broker sessions
-  store.py         — JSON file persistence (messages, tasks, workers, notes)
-  models.py        — data models (WorkItem, WorkPlan)
+  main.py          — entry point, wires Router + WebChat + callback server
+  router.py        — thin relay: routes messages, manages permissions, SSE listener
   web.py           — web chat frontend (localhost:8080)
-  cli.py           — terminal REPL frontend
-  bot.py           — Telegram bot frontend
-  formatter.py     — output formatting
+  store.py         — JSON file persistence (messages, channels, notes, logs)
+  session.py       — server config data model
+  formatter.py     — output formatting utilities
   static/
     index.html     — single-page chat UI
 
 tools/
-  remote_broker.py   — broker daemon for remote servers
-  broker_session.py  — CLI to register/unregister sessions with broker
-  deploy.sh          — deploy broker via SSH/SCP
-  install-broker.sh  — one-line remote installer
-  start_tunnels.sh   — SSH tunnel helper
+  orchestrator_daemon.py  — autonomous RALPH loop daemon (deploys to remote servers)
+  remote_broker.py        — legacy broker (kept for backward compat)
+  deploy.sh               — deploy daemon via SSH/SCP
+  install-broker.sh       — one-line remote installer
+  start_tunnels.sh        — SSH tunnel helper
 
-config.example.json  — example configuration (JSON)
+config.example.json  — example configuration
 config.example.md    — example extra instructions (optional)
 ```
 
 ## Documentation
 
 - [Design Philosophy](docs/design-philosophy.md) — Core design philosophy (Professor → PhD Student → Claude Code model)
-- [Broker Guide](docs/broker-guide.md) — Broker deployment & operations
+- [Daemon Guide](docs/broker-guide.md) — Daemon deployment & operations
 
 ## Requirements
 
