@@ -10,7 +10,7 @@ You (laptop)                          Remote servers
 │  │  Router        │  │              │  Daemon :8200        │
 │  │  /setup        │  │     SSH      │  (autonomous agent)  │
 │  │  /connect      │  │◄────────────►├──────────────────────┤
-│  │  Sysadmin CLI  │  │              │  Server B            │
+│  │  @orchestrator │  │              │  Server B            │
 │  └────────────────┘  │              │  Daemon :8200        │
 └──────────────────────┘              └──────────────────────┘
 ```
@@ -27,25 +27,34 @@ cd distributed-cc
 uv sync --extra dev
 ```
 
-### 2. Set up a remote server
-
-The easiest way is the built-in `/setup` command, which SSHs into the server, installs everything, and configures it for you:
+### 2. Start the router
 
 ```bash
 make run
-# Open http://localhost:8080, then type:
+# Open http://localhost:8080
+```
+
+This starts the router and web UI on your laptop. No daemons need to be running yet — the router connects to daemons lazily when you first interact with a project.
+
+### 3. Set up a remote server
+
+The easiest way is the built-in `/setup` command. In the web UI, type:
+
+```
 /setup user@your-server.example.com
 ```
 
-The sysadmin session will:
-- Probe the server (OS, Python, GPUs, etc.)
+The sysadmin session (a local Claude Code agent) will:
+- SSH into the server and probe the environment (OS, Python, GPUs, etc.)
 - Install the daemon and dependencies
 - Update your local `config.json`
 - Tell you what SSH tunnel command to run
 
-Or do it manually — see [Manual Setup](#manual-setup) below.
+Type follow-up messages to give it context (e.g. "this machine uses conda", "the project is in /data/my-repo"). Type `/done` when finished.
 
-### 3. Open SSH tunnels
+Or set things up manually — see [Manual Setup](#manual-setup) below.
+
+### 4. Open SSH tunnels
 
 Each remote server needs two tunnels (one command per server):
 
@@ -54,49 +63,58 @@ ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@your-server
 ```
 
 - `-L` lets your laptop reach the remote daemon
-- `-R` lets the daemon send permission requests back to you
+- `-R` lets the daemon stream progress back to you
 
 Use different local ports for each server (`8201`, `8202`, etc.).
 
-### 4. Start working
+### 5. Start working
 
-Open `http://localhost:8080`. Create a channel, connect it to a project, and send your task:
+Create a channel, connect it to a project, and send your task:
 
 ```
 /connect my-project
 Investigate why the training loss plateaus — might be reward hacking
 ```
 
-The remote agent starts working autonomously. You'll see tool calls, text output, and iteration progress streaming in real-time.
+The remote agent starts working autonomously. You'll see tool calls, text output, and iteration progress streaming in real-time via the monitor panel.
 
-## Commands
+## Commands and messaging
 
 | Command | Description |
 |---------|-------------|
 | `/connect <project-id>` | Link this channel to a remote project |
-| `/status` | Show current task status and iteration count |
+| `/connect` | Show current connection and available projects |
+| `/status` | Show current task status, iteration count, and queued tasks |
 | `/stop` | Stop the running task |
 | `/setup <user@host>` | Deploy a daemon to a new server (interactive) |
 | `/setup` | Health-check all configured servers |
 | `/done` | Exit setup mode |
 
-When a task is running, any message you send becomes an interruption — picked up at the next iteration boundary.
+### Messaging while a task is running
+
+| What you type | What happens |
+|---------------|-------------|
+| Regular message | Queued as the next task (starts after current one finishes) |
+| `@orchestrator <message>` | Urgent interrupt — injected at the next iteration boundary |
+| `@orchestrator /stop` | Commands also work with the `@orchestrator` prefix |
 
 ## Configuration
 
-The router reads `config.json` on startup:
+The router reads `config.json` on startup to know about available servers. Daemons are contacted lazily — only when you first interact with a project.
 
 ```json
 {
   "servers": [
     {
-      "name": "server-a",
-      "host": "user@server-a.example.com",
+      "name": "h100",
+      "host": "ubuntu@209.20.157.135",
+      "work_dir": "/home/ubuntu",
       "broker_port": 8201
     },
     {
       "name": "local",
       "host": null,
+      "work_dir": "/path/to/project",
       "broker_port": 8200
     }
   ],
@@ -106,8 +124,9 @@ The router reads `config.json` on startup:
 }
 ```
 
-- **name** — friendly label for the server
+- **name** — project identifier (used with `/connect`)
 - **host** — SSH destination (`user@host`), or `null` for local
+- **work_dir** — working directory on the remote server
 - **broker_port** — local port for the SSH tunnel (must match your `-L` flag)
 
 Copy `config.example.json` to get started: `cp config.example.json config.json`
@@ -148,7 +167,7 @@ curl http://127.0.0.1:8201/health
 ## Testing
 
 ```bash
-make test         # Unit tests (~90 tests, no API calls)
+make test         # Unit tests (114 tests, no API calls)
 make test-e2e     # End-to-end tests (calls Claude, costs money)
 ```
 
@@ -157,10 +176,10 @@ make test-e2e     # End-to-end tests (calls Claude, costs money)
 ```
 src/
   main.py         — entry point: Router + WebChat + callback server
-  router.py       — routes messages to daemons, manages setup mode
+  router.py       — routes messages to daemons, manages urgency/deferral
   setup.py        — sysadmin session for /setup (local Agent SDK)
-  web.py          — web chat frontend (HTTP + WebSocket)
-  store.py        — JSON file persistence
+  web.py          — multi-client web chat (HTTP + WebSocket)
+  store.py        — JSON file persistence (messages, logs, channel-project mapping)
   static/
     index.html    — single-page chat UI
 
