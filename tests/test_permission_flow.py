@@ -150,7 +150,8 @@ async def test_http_permission_callback(aiohttp_client):
     from src.session import SessionManager, ServerConfig
     from src.store import Store
 
-    store = Store(":memory:")
+    import tempfile
+    store = Store(tempfile.mkdtemp())
     await store.init()
 
     mgr = SessionManager(servers=[], default_model="haiku")

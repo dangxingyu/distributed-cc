@@ -107,7 +107,7 @@ async def main():
     cfg = load_config(args.config)
 
     # Store
-    store = Store(cfg.get("db", {}).get("path", "./data/orchestrator.db"))
+    store = Store(cfg.get("data", {}).get("dir", "./data"))
     await store.init()
 
     # Permission evaluator

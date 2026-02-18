@@ -1,4 +1,4 @@
-"""Test SQLite store — messages, tasks, and channel workers."""
+"""Test JSON file store — messages, tasks, and channel workers."""
 
 import asyncio
 import os
@@ -8,8 +8,7 @@ from src.store import Store, TaskStatus, ChannelWorker
 
 @pytest.fixture
 async def store(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    s = Store(db_path)
+    s = Store(str(tmp_path / "data"))
     await s.init()
     yield s
     await s.close()

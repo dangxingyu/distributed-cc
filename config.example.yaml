@@ -43,5 +43,5 @@ orchestrator:
 permission:
   port: 9120                # HTTP server for broker callbacks
 
-db:
-  path: ./data/orchestrator.db
+data:
+  dir: ./data

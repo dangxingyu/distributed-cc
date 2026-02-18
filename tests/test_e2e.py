@@ -195,7 +195,8 @@ async def test_e2e_full_stack():
     await broker_site.start()
 
     # Set up orchestrator stack
-    store = Store(":memory:")
+    import tempfile
+    store = Store(tempfile.mkdtemp())
     await store.init()
 
     perm = PermissionEvaluator(model="haiku", config_path="config.yaml")
