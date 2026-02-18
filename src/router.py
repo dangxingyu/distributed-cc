@@ -11,7 +11,6 @@ import asyncio
 import json
 import logging
 import os
-import uuid
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -49,14 +48,8 @@ class Router:
         # SSE listener tasks
         self._sse_tasks: dict[str, asyncio.Task] = {}
 
-        # Permission escalation: request_id → asyncio.Future
-        self._pending_permissions: dict[str, asyncio.Future] = {}
-        self._pending_meta: dict[str, dict] = {}
-
         # Callbacks for sending to web UI
         self._progress_callback = None     # (project_id, event) → forward to UI
-        self._status_callback = None       # (project_id, status) → update UI
-        self._escalation_callback = None   # (request_id, data) → send to web UI
 
         # Per-channel status callbacks (for typing indicator)
         self._channel_status_callbacks: dict[int, callable] = {}
@@ -95,14 +88,15 @@ class Router:
             cfg = json.load(f)
         log.info("Loaded config.json from %s", self._cwd)
 
-        for o in cfg.get("orchestrators", []):
+        for s in cfg.get("servers", []):
+            name = s["name"]
             orch = RemoteOrchestrator(
-                project_id=o["project_id"],
-                name=o.get("name", o["project_id"]),
-                host=o.get("host"),
-                broker_port=o.get("broker_port", 8200),
-                project_dir=o.get("project_dir", ""),
-                max_iterations=o.get("max_iterations", 20),
+                project_id=name,
+                name=name,
+                host=s.get("host"),
+                broker_port=s.get("broker_port", 8200),
+                project_dir=s.get("work_dir", ""),
+                max_iterations=s.get("max_iterations", 20),
             )
             self._orchestrators[orch.project_id] = orch
 
@@ -250,6 +244,39 @@ class Router:
                 await self._handle_setup(chat_id, stripped, send_reply, send_log)
                 return
 
+        # ── @mention routing (instant interrupt to a specific daemon) ──
+        mention_target, mention_body = self._parse_mention(stripped)
+        if mention_target:
+            orch = self._orchestrators.get(mention_target)
+            if not orch:
+                await send_reply(
+                    f"Unknown server `{mention_target}`. "
+                    f"Available: {', '.join(self._orchestrators.keys()) or '(none)'}"
+                )
+                return
+            # @mention always interrupts, even if idle (starts task if needed)
+            if orch.status in ("idle", "done", "stuck", "error", "unknown"):
+                await self._start_task(chat_id, mention_target, mention_body, send_reply, send_log)
+            else:
+                await self._interrupt_task(chat_id, mention_target, mention_body, send_reply)
+            return
+
+        # ── /connect command ──
+        if stripped.startswith("/connect"):
+            parts = stripped.split(None, 1)
+            if len(parts) > 1:
+                new_pid = parts[1].strip()
+                await self._connect_channel(chat_id, new_pid, send_reply)
+            else:
+                project_id = self._channel_project.get(chat_id)
+                if project_id:
+                    await send_reply(f"Connected to project: **{project_id}**")
+                else:
+                    available = ", ".join(self._orchestrators.keys()) or "(none)"
+                    await send_reply(f"Not connected. Use `/connect <project-id>`. Available: {available}")
+            return
+
+        # ── Remaining commands require a connected project ──
         project_id = self._channel_project.get(chat_id)
         if not project_id:
             await send_reply(
@@ -258,23 +285,13 @@ class Router:
             )
             return
 
-        # Handle /connect command (already connected, show status)
-        if stripped.startswith("/connect"):
-            parts = stripped.split(None, 1)
-            if len(parts) > 1:
-                new_pid = parts[1].strip()
-                await self._connect_channel(chat_id, new_pid, send_reply)
-            else:
-                await send_reply(f"Connected to project: **{project_id}**")
-            return
-
         # Handle /stop
-        if stripped.lower() in ("/stop", "@orchestrator /stop"):
+        if stripped.lower() == "/stop":
             await self._stop_task(chat_id, project_id, send_reply)
             return
 
         # Handle /status
-        if stripped.lower() in ("/status",):
+        if stripped.lower() == "/status":
             await self._show_status(chat_id, project_id, send_reply)
             return
 
@@ -291,7 +308,7 @@ class Router:
         if orch.status in ("idle", "done", "stuck", "error", "unknown"):
             await self._start_task(chat_id, project_id, text, send_reply, send_log)
         else:
-            # Running → interrupt
+            # Running → moderate interrupt (queued for next iteration)
             await self._interrupt_task(chat_id, project_id, text, send_reply)
 
     async def _start_task(
@@ -392,6 +409,25 @@ class Router:
                 await send_reply("\n".join(lines))
         except aiohttp.ClientError as e:
             await send_reply(f"Cannot reach daemon: {e}")
+
+    # ── @mention parsing ────────────────────────────────────────────────
+
+    def _parse_mention(self, text: str) -> tuple[str | None, str]:
+        """Parse @name from the start of a message.
+
+        Returns (target_name, body) if @mention found, else (None, text).
+        Matches against known orchestrator names.
+        """
+        if not text.startswith("@"):
+            return None, text
+        parts = text.split(None, 1)
+        if not parts:
+            return None, text
+        candidate = parts[0][1:]  # strip the @
+        if candidate in self._orchestrators:
+            body = parts[1] if len(parts) > 1 else ""
+            return candidate, body
+        return None, text
 
     # ── Setup Mode ─────────────────────────────────────────────────────
 
@@ -507,43 +543,6 @@ class Router:
     def set_progress_callback(self, callback: callable):
         """Set the global progress callback (for web UI)."""
         self._progress_callback = callback
-
-    # ── Permission Escalation ─────────────────────────────────────────
-
-    async def handle_permission_escalation(self, data: dict) -> dict:
-        """Handle a permission escalation from a daemon.
-
-        Called by the HTTP callback server. Creates a pending future,
-        sends the request to the web UI, and waits for resolution.
-        """
-        request_id = uuid.uuid4().hex[:12]
-        future = asyncio.get_event_loop().create_future()
-        self._pending_permissions[request_id] = future
-        self._pending_meta[request_id] = data
-
-        # Notify web UI via escalation callback
-        if self._escalation_callback:
-            await self._escalation_callback(request_id, data)
-
-        try:
-            result = await asyncio.wait_for(future, timeout=300)
-            return result
-        except asyncio.TimeoutError:
-            self._pending_permissions.pop(request_id, None)
-            self._pending_meta.pop(request_id, None)
-            return {"approved": False, "reason": "Timeout"}
-
-    def resolve_permission(self, request_id: str, approved: bool, reason: str = "") -> bool:
-        """Resolve a pending permission escalation (from web UI)."""
-        future = self._pending_permissions.pop(request_id, None)
-        self._pending_meta.pop(request_id, None)
-        if future and not future.done():
-            future.set_result({"approved": approved, "reason": reason})
-            return True
-        return False
-
-    def set_escalation_callback(self, callback):
-        self._escalation_callback = callback
 
     # ── Health Check ──────────────────────────────────────────────────
 

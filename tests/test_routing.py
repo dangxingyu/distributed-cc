@@ -1,4 +1,4 @@
-"""Test Router message routing: /connect, /stop, /status, idle→task, running→interrupt."""
+"""Test Router message routing: /connect, /stop, /status, @mention, setup mode."""
 
 import asyncio
 import json
@@ -169,28 +169,6 @@ async def test_get_project_status():
     assert router.get_project_status("unknown") == "unknown"
 
 
-# ── Permission escalation ─────────────────────────────────────────────
-
-
-async def test_resolve_permission():
-    router = _make_router([])
-
-    # Create a pending permission
-    future = asyncio.get_event_loop().create_future()
-    router._pending_permissions["req123"] = future
-
-    ok = router.resolve_permission("req123", approved=True, reason="looks good")
-    assert ok
-    result = await future
-    assert result["approved"] is True
-
-
-async def test_resolve_permission_expired():
-    router = _make_router([])
-    ok = router.resolve_permission("nonexistent", approved=True)
-    assert not ok
-
-
 # ── Status callbacks ──────────────────────────────────────────────────
 
 
@@ -226,6 +204,90 @@ async def test_route_to_disconnected_daemon():
     send_reply = AsyncMock()
     await router.route_message(1, "do something", send_reply)
     assert "disconnected" in send_reply.call_args[0][0].lower()
+
+
+# ── @mention routing ──────────────────────────────────────────────────
+
+
+async def test_mention_routes_to_named_server():
+    """@name message routes to that specific server."""
+    router = _make_router([
+        RemoteOrchestrator(project_id="h100", name="h100", status="idle"),
+    ])
+    # No channel-project connection needed for @mention
+
+    mock_resp = AsyncMock()
+    mock_resp.json = AsyncMock(return_value={"ok": True})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.post = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+    await router.route_message(1, "@h100 run the tests", send_reply, send_log)
+
+    mock_http.post.assert_called_once()
+    call_args = mock_http.post.call_args
+    assert "/task" in call_args[0][0]
+    payload = call_args[1]["json"]
+    assert payload["project_id"] == "h100"
+    assert payload["task"] == "run the tests"
+
+
+async def test_mention_unknown_server_falls_through():
+    """@unknown-name falls through to normal routing (not recognized as mention)."""
+    router = _make_router([
+        RemoteOrchestrator(project_id="h100", name="h100"),
+    ])
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "@nonexistent do stuff", send_reply)
+    # Not a known name, so _parse_mention returns None → normal routing → no project
+    send_reply.assert_called_once()
+    assert "connect" in send_reply.call_args[0][0].lower()
+    assert "h100" in send_reply.call_args[0][0]
+
+
+async def test_mention_interrupts_running_server():
+    """@name message to a running server sends interrupt."""
+    router = _make_router([
+        RemoteOrchestrator(project_id="h100", name="h100", status="running"),
+    ])
+
+    mock_resp = AsyncMock()
+    mock_resp.json = AsyncMock(return_value={"ok": True})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.post = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "@h100 stop and check this instead", send_reply)
+
+    mock_http.post.assert_called_once()
+    assert "/interrupt" in mock_http.post.call_args[0][0]
+
+
+async def test_parse_mention():
+    """_parse_mention correctly extracts @name."""
+    router = _make_router([
+        RemoteOrchestrator(project_id="h100", name="h100"),
+    ])
+
+    target, body = router._parse_mention("@h100 do something")
+    assert target == "h100"
+    assert body == "do something"
+
+    target, body = router._parse_mention("@unknown do something")
+    assert target is None
+
+    target, body = router._parse_mention("normal message")
+    assert target is None
 
 
 # ── Setup mode routing ───────────────────────────────────────────────────
@@ -295,8 +357,8 @@ async def test_setup_mode_exit_on_connect():
 async def test_reload_config_adds_new_projects(tmp_path):
     """reload_config picks up new projects from config.json."""
     config = {
-        "orchestrators": [
-            {"project_id": "new-proj", "name": "new-srv", "project_dir": "/tmp"},
+        "servers": [
+            {"name": "new-srv", "work_dir": "/tmp"},
         ]
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -307,29 +369,29 @@ async def test_reload_config_adds_new_projects(tmp_path):
     with patch.object(router, "_register_project", new_callable=AsyncMock):
         router.reload_config()
 
-    assert "new-proj" in router._orchestrators
+    assert "new-srv" in router._orchestrators
 
 
 async def test_reload_config_removes_old_projects(tmp_path):
     """reload_config cancels SSE tasks for removed projects."""
     # Start with one project
     config = {
-        "orchestrators": [
-            {"project_id": "old-proj", "name": "old-srv", "project_dir": "/tmp"},
+        "servers": [
+            {"name": "old-srv", "work_dir": "/tmp"},
         ]
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
     router = Router(cwd=str(tmp_path))
     router._load_config()
-    assert "old-proj" in router._orchestrators
+    assert "old-srv" in router._orchestrators
 
     # Add a mock SSE task
     mock_task = MagicMock()
-    router._sse_tasks["old-proj"] = mock_task
+    router._sse_tasks["old-srv"] = mock_task
 
     # Now empty the config
-    (tmp_path / "config.json").write_text('{"orchestrators": []}')
+    (tmp_path / "config.json").write_text('{"servers": []}')
     router.reload_config()
 
-    assert "old-proj" not in router._orchestrators
+    assert "old-srv" not in router._orchestrators
     mock_task.cancel.assert_called_once()

@@ -23,7 +23,6 @@ from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 from claude_agent_sdk.types import (
     AssistantMessage,
     PermissionResultAllow,
-    PermissionResultDeny,
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
@@ -202,20 +201,10 @@ class SetupSession:
             return '{"servers": [], "orchestrator": {}}'
 
     def _make_can_use_tool(self):
-        """Create tool permission callback. Sysadmin gets full local access."""
-        auto_approve = {
-            "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-            "WebSearch", "WebFetch",
-        }
+        """Create tool permission callback. Auto-approve everything."""
 
         async def can_use_tool(tool_name: str, input_data: dict, context=None):
-            if tool_name in auto_approve:
-                return PermissionResultAllow()
-            # Deny unknown tools — sysadmin shouldn't need anything exotic
-            log.warning(f"[setup] denied tool: {tool_name}")
-            return PermissionResultDeny(
-                message=f"Tool '{tool_name}' is not available in setup mode."
-            )
+            return PermissionResultAllow()
 
         return can_use_tool
 

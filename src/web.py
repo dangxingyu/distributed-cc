@@ -38,7 +38,6 @@ class WebChat:
         self._app: web.Application | None = None
 
         # Wire callbacks
-        self._router.set_escalation_callback(self._send_escalation)
         self._router.set_progress_callback(self._handle_progress)
 
     async def start(self):
@@ -231,32 +230,6 @@ class WebChat:
 
             chat_id = self._active_channel
 
-            # Handle /connect command before routing
-            if text.strip().startswith("/connect"):
-                parts = text.strip().split(None, 1)
-                if len(parts) > 1:
-                    project_id = parts[1].strip()
-                    ok = await self._router.connect_channel(chat_id, project_id)
-                    if ok:
-                        orch = self._router._orchestrators.get(project_id)
-                        name = orch.name if orch else project_id
-                        await self._ws_send({"type": "reply", "text": f"Connected to **{name}** (`{project_id}`)"})
-                        await self._ws_send({
-                            "type": "project_connected",
-                            "project_id": project_id,
-                            "project_status": self._router.get_project_status(project_id),
-                        })
-                    else:
-                        available = ", ".join(o.project_id for o in self._router.list_orchestrators())
-                        await self._ws_send({"type": "reply", "text": f"Unknown project: `{project_id}`. Available: {available or '(none)'}"})
-                else:
-                    project_id = self._router.get_channel_project(chat_id)
-                    if project_id:
-                        await self._ws_send({"type": "reply", "text": f"Connected to `{project_id}`"})
-                    else:
-                        await self._ws_send({"type": "reply", "text": "Not connected. Use `/connect <project-id>`"})
-                return
-
             async def send_reply(msg: str):
                 await self._store.add_message(chat_id, "assistant", msg)
                 await self._ws_send({"type": "reply", "text": msg})
@@ -268,22 +241,10 @@ class WebChat:
             # Save user message
             await self._store.add_message(chat_id, "user", text)
 
+            # Route everything through the router (including /connect)
             asyncio.create_task(
                 self._router.route_message(chat_id, text, send_reply, send_log)
             )
-
-        elif msg_type == "permission_response":
-            request_id = data.get("request_id", "")
-            approved = data.get("approved", False)
-            reason = data.get("reason", "Approved" if approved else "Denied")
-            ok = self._router.resolve_permission(request_id, approved=approved, reason=reason)
-            if ok:
-                resolution = "APPROVED" if approved else "DENIED"
-                await self._ws_send({
-                    "type": "escalation_resolved",
-                    "request_id": request_id,
-                    "resolution": resolution,
-                })
 
         else:
             await self._ws_send({"type": "error", "text": f"Unknown message type: {msg_type}"})
@@ -291,7 +252,14 @@ class WebChat:
     # ── Progress callback (from router) ───────────────────────────────
 
     async def _handle_progress(self, project_id: str, event: dict):
-        """Handle a progress event from a daemon (via router)."""
+        """Handle a progress event from a daemon (via router).
+
+        Routing:
+          text, tool_use, tool_error → monitor log (not chat)
+          iteration → progress indicator
+          done, stuck → chat reply + progress indicator
+          error → progress indicator
+        """
         # Find which channel this project is connected to
         for chat_id, pid in self._router._channel_project.items():
             if pid == project_id and chat_id == self._active_channel:
@@ -299,16 +267,13 @@ class WebChat:
                 data_text = event.get("data", "")
                 iteration = event.get("iteration", 0)
 
-                # Forward different event types to the UI
                 if event_type == "text":
-                    await self._ws_send({
-                        "type": "reply",
-                        "text": data_text,
-                    })
-                    await self._store.add_message(chat_id, "assistant", data_text)
+                    # Intermediate orchestrator text → monitor only
+                    await self._ws_send({"type": "log", "text": data_text})
+                    await self._store.add_log(chat_id, data_text)
                 elif event_type == "tool_use":
-                    await self._ws_send({"type": "log", "text": f"orchestrator -> {data_text}"})
-                    await self._store.add_log(chat_id, f"orchestrator -> {data_text}")
+                    await self._ws_send({"type": "log", "text": f"→ {data_text}"})
+                    await self._store.add_log(chat_id, f"→ {data_text}")
                 elif event_type == "tool_error":
                     await self._ws_send({"type": "log", "text": f"[ERROR] {data_text}"})
                     await self._store.add_log(chat_id, f"[ERROR] {data_text}")
@@ -345,23 +310,10 @@ class WebChat:
                         "iteration": iteration,
                         "status": "error",
                     })
+                    if data_text:
+                        await self._ws_send({"type": "log", "text": f"[ERROR] {data_text}"})
+                        await self._store.add_log(chat_id, f"[ERROR] {data_text}")
                 break
-
-    # ── Escalation sender ─────────────────────────────────────────────
-
-    async def _send_escalation(self, request_id: str, data: dict):
-        """Send a permission escalation card to the browser."""
-        await self._ws_send({
-            "type": "permission_request",
-            "request_id": request_id,
-            "title": f"Permission: {data.get('tool_name', '?')}",
-            "detail": (
-                f"Daemon: {data.get('daemon_name', '?')}\n"
-                f"Project: {data.get('project_id', '?')}\n"
-                f"Tool: {data.get('tool_name', '?')}\n"
-                f"Input: {json.dumps(data.get('tool_input', {}), ensure_ascii=False)[:500]}"
-            ),
-        })
 
     # ── Helpers ────────────────────────────────────────────────────────
 

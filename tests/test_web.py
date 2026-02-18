@@ -6,7 +6,6 @@ Verifies:
 - Channel CRUD REST endpoints
 - Projects API endpoint
 - WebSocket connect/switch_channel/message
-- Permission escalation over WebSocket
 """
 
 import asyncio
@@ -287,7 +286,7 @@ async def test_ws_message_routes_via_router(aiohttp_client):
 
 
 async def test_ws_connect_command(aiohttp_client):
-    """/connect command via WebSocket links channel to project."""
+    """/connect command via WebSocket routes through router and links channel."""
     client, web_chat, router, store = await _make_web(aiohttp_client)
     ch_id = await store.create_channel("connect-ch")
 
@@ -297,68 +296,12 @@ async def test_ws_connect_command(aiohttp_client):
 
     await ws.send_json({"type": "message", "text": "/connect test-proj"})
 
+    # The router handles /connect and calls send_reply
     msg = await ws.receive_json()
     assert msg["type"] == "reply"
-    assert "test-server" in msg["text"] or "test-proj" in msg["text"]
-
-    msg2 = await ws.receive_json()
-    assert msg2["type"] == "project_connected"
-    assert msg2["project_id"] == "test-proj"
+    assert "test-proj" in msg["text"]
 
     assert router.get_channel_project(ch_id) == "test-proj"
-
-    await ws.close()
-    await store.close()
-
-
-# ── Permission escalation ─────────────────────────────────────────────
-
-async def test_ws_permission_escalation(aiohttp_client):
-    """Permission escalation sends card to client over WS."""
-    client, web_chat, router, store = await _make_web(aiohttp_client)
-    ws = await client.ws_connect("/ws")
-
-    await web_chat._send_escalation(
-        request_id="req123",
-        data={
-            "tool_name": "Bash",
-            "daemon_name": "test-server",
-            "project_id": "test-proj",
-            "tool_input": {"command": "rm -rf /"},
-        },
-    )
-
-    msg = await ws.receive_json()
-    assert msg["type"] == "permission_request"
-    assert msg["request_id"] == "req123"
-    assert "Bash" in msg["title"]
-
-    await ws.close()
-    await store.close()
-
-
-async def test_ws_permission_resolve(aiohttp_client):
-    """Client sends approval -> resolve_permission called."""
-    client, web_chat, router, store = await _make_web(aiohttp_client)
-
-    future = asyncio.get_event_loop().create_future()
-    router._pending_permissions["req456"] = future
-
-    ws = await client.ws_connect("/ws")
-    await ws.send_json({
-        "type": "permission_response",
-        "request_id": "req456",
-        "approved": True,
-        "reason": "Looks good",
-    })
-
-    msg = await ws.receive_json()
-    assert msg["type"] == "escalation_resolved"
-    assert msg["request_id"] == "req456"
-    assert msg["resolution"] == "APPROVED"
-
-    result = await asyncio.wait_for(future, timeout=1)
-    assert result["approved"] is True
 
     await ws.close()
     await store.close()

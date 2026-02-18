@@ -7,9 +7,10 @@
       "broker_port": 8200
     },
     {
-      "name": "della",
-      "host": "xd7812@della-gpu",
-      "work_dir": "/scratch/gpfs/ARORA/xd7812/Configuration-to-Performance-Scaling-Law"
+      "name": "h100",
+      "host": "ubuntu@209.20.157.135",
+      "work_dir": "/home/ubuntu",
+      "broker_port": 8201
     }
   ],
 

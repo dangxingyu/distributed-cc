@@ -38,7 +38,6 @@ from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 from claude_agent_sdk.types import (
     AssistantMessage,
     PermissionResultAllow,
-    PermissionResultDeny,
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
@@ -208,51 +207,11 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
         await done.wait()
 
 
-def _make_can_use_tool(project_id: str):
-    """Create a can_use_tool callback for the orchestrator session.
-
-    Most tools are auto-approved (orchestrator has strong agency).
-    AskUserQuestion and unknown tools escalate to user via HTTP callback.
-    """
-    # Tools the orchestrator can use freely
-    auto_approve = {
-        "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-        "WebSearch", "WebFetch", "NotebookEdit",
-        "Task", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
-        "EnterPlanMode", "ExitPlanMode",
-    }
+def _make_can_use_tool():
+    """Create a can_use_tool callback that auto-approves everything."""
 
     async def can_use_tool(tool_name: str, input_data: dict, context=None):
-        if tool_name in auto_approve:
-            return PermissionResultAllow()
-
-        if tool_name == "AskUserQuestion":
-            # The orchestrator is asking a question — this means it's stuck.
-            # We'll let it through but the RALPH loop will detect [NEED_USER_INPUT]
-            return PermissionResultAllow()
-
-        # Escalate unknown tools to user via HTTP callback
-        log.info(f"[can_use_tool] {tool_name} → escalating to router")
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=300)) as http:
-                async with http.post(
-                    f"{CALLBACK_URL}/permission_escalation",
-                    json={
-                        "project_id": project_id,
-                        "daemon_name": DAEMON_NAME,
-                        "tool_name": tool_name,
-                        "tool_input": _safe_serialize(input_data),
-                    },
-                ) as resp:
-                    result = await resp.json()
-                    if result.get("approved"):
-                        return PermissionResultAllow()
-                    return PermissionResultDeny(
-                        message=result.get("reason", "Denied by user")
-                    )
-        except Exception as e:
-            log.error(f"Permission escalation failed: {e}")
-            return PermissionResultDeny(message=f"Cannot reach router: {e}")
+        return PermissionResultAllow()
 
     return can_use_tool
 
@@ -324,7 +283,7 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
 
             # One Agent SDK turn
             options = ClaudeAgentOptions(
-                can_use_tool=_make_can_use_tool(project_id),
+                can_use_tool=_make_can_use_tool(),
                 model="claude-opus-4-6",
                 cwd=project.project_dir,
                 allowed_tools=[

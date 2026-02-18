@@ -27,19 +27,6 @@ log = logging.getLogger(__name__)
 
 # ── HTTP handlers for daemon callbacks ────────────────────────────────
 
-async def handle_permission_escalation(request: web.Request) -> web.Response:
-    """POST /permission_escalation — daemon asks user to approve a tool."""
-    router: Router = request.app["router"]
-    try:
-        data = await request.json()
-        log.info(f"Permission escalation: {data.get('tool_name')} from {data.get('daemon_name')}")
-        result = await router.handle_permission_escalation(data)
-        return web.json_response(result)
-    except Exception as e:
-        log.exception(f"Permission escalation error: {e}")
-        return web.json_response({"approved": False, "reason": str(e)}, status=500)
-
-
 async def handle_progress(request: web.Request) -> web.Response:
     """POST /progress — daemon sends progress events."""
     # This is handled by the SSE listener in the router, but daemons can also
@@ -88,7 +75,6 @@ async def main():
     # Callback HTTP server (daemon → router)
     http_app = web.Application()
     http_app["router"] = router
-    http_app.router.add_post("/permission_escalation", handle_permission_escalation)
     http_app.router.add_post("/progress", handle_progress)
     http_runner = await start_callback_server(http_app, args.http_port)
 
