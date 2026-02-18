@@ -27,7 +27,13 @@ import re
 import uuid
 
 from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
-from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    TextBlock,
+    ToolUseBlock,
+)
 
 from .session import SessionManager, SessionResult
 from .store import Store, TaskStatus, ChannelWorker
@@ -432,7 +438,7 @@ class Orchestrator:
         # Store send_reply so the can_use_tool callback can route questions
         self._active_reply_fns[chat_id] = send_reply
         try:
-            decision = await self._send_to_orchestrator(chat_id, augmented_text)
+            decision = await self._send_to_orchestrator(chat_id, augmented_text, send_reply)
         finally:
             self._active_reply_fns.pop(chat_id, None)
 
@@ -441,6 +447,11 @@ class Orchestrator:
             return
 
         await self._handle_decision(chat_id, user_text, decision, send_reply)
+
+    async def _reply(self, chat_id: int, send_reply: callable, text: str):
+        """Send a reply to the user AND persist it to the store."""
+        await self._store.add_message(chat_id, "assistant", text)
+        await send_reply(text)
 
     async def _handle_decision(
         self,
@@ -454,12 +465,11 @@ class Orchestrator:
 
         if action == "reply":
             text = decision.get("text", "...")
-            await self._store.add_message(chat_id, "assistant", text)
-            await send_reply(format_channel_orchestrator(text))
+            await self._reply(chat_id, send_reply, format_channel_orchestrator(text))
 
         elif action == "show_tasks":
             tasks = await self._store.get_running_tasks(chat_id)
-            await send_reply(format_task_status(tasks))
+            await self._reply(chat_id, send_reply, format_task_status(tasks))
 
         elif action == "create_worker":
             await self._handle_create_worker(chat_id, user_text, decision, send_reply)
@@ -481,13 +491,13 @@ class Orchestrator:
                     prompt=prompt,
                 )],
             )
-            await send_reply(format_channel_dispatch(server, session, prompt))
+            await self._reply(chat_id, send_reply, format_channel_dispatch(server, session, prompt))
             asyncio.create_task(self._execute_plan(plan, send_reply))
 
         elif action == "plan":
             tasks_data = decision.get("tasks", [])
             if not tasks_data:
-                await send_reply(format_channel_orchestrator("Plan has no tasks."))
+                await self._reply(chat_id, send_reply, format_channel_orchestrator("Plan has no tasks."))
                 return
 
             plan = WorkPlan(
@@ -506,11 +516,11 @@ class Orchestrator:
                     for t in tasks_data
                 ],
             )
-            await send_reply(format_channel_plan_created(plan))
+            await self._reply(chat_id, send_reply, format_channel_plan_created(plan))
             asyncio.create_task(self._execute_plan(plan, send_reply))
 
         else:
-            await send_reply(format_channel_orchestrator(f"Unknown action: {action}"))
+            await self._reply(chat_id, send_reply, format_channel_orchestrator(f"Unknown action: {action}"))
 
     async def _handle_create_worker(
         self,
@@ -525,7 +535,7 @@ class Orchestrator:
         description = decision.get("description", "")
 
         if not server_name or not work_dir:
-            await send_reply(format_channel_orchestrator("Cannot create worker: missing server or work_dir."))
+            await self._reply(chat_id, send_reply, format_channel_orchestrator("Cannot create worker: missing server or work_dir."))
             return
 
         # Generate session_id from work_dir basename
@@ -535,14 +545,14 @@ class Orchestrator:
         result = await self._session_mgr.register_session(server_name, session_id, work_dir, description)
         if not result.get("ok"):
             error = result.get("error", "Unknown error")
-            await send_reply(format_channel_orchestrator(f"Failed to create worker: {error}"))
+            await self._reply(chat_id, send_reply, format_channel_orchestrator(f"Failed to create worker: {error}"))
             return
 
         # Store in DB
         await self._store.add_channel_worker(chat_id, server_name, session_id, work_dir, description)
         # Update reverse index
         self._worker_to_chat[(server_name, session_id)] = chat_id
-        await send_reply(format_channel_worker_created(server_name, session_id, work_dir))
+        await self._reply(chat_id, send_reply, format_channel_worker_created(server_name, session_id, work_dir))
 
         # Confirm back to orchestrator session so it can continue
         workers = await self._store.get_channel_workers(chat_id)
@@ -551,7 +561,7 @@ class Orchestrator:
             f"{self._format_channel_workers(workers)}\n"
             f"Continue with the user's original request."
         )
-        follow_up = await self._send_to_orchestrator(chat_id, confirmation)
+        follow_up = await self._send_to_orchestrator(chat_id, confirmation, send_reply)
         if follow_up:
             await self._handle_decision(chat_id, user_text, follow_up, send_reply)
 
@@ -598,13 +608,12 @@ class Orchestrator:
             plan.status = "completed" if all_done else "failed"
 
             summary = format_channel_plan_summary(plan)
-            await self._store.add_message(plan.chat_id, "assistant", summary)
-            await send_reply(summary)
+            await self._reply(plan.chat_id, send_reply, summary)
 
         except Exception as e:
             log.exception(f"Plan {plan.id} failed: {e}")
             plan.status = "failed"
-            await send_reply(f"Plan execution failed: {e}")
+            await self._reply(plan.chat_id, send_reply, f"Plan execution failed: {e}")
 
     async def _execute_item(
         self, plan: WorkPlan, item: WorkItem, send_reply: callable,
@@ -637,7 +646,7 @@ class Orchestrator:
                 await self._store.finish_task(task_id, TaskStatus.FAILED, result.result_text)
                 item.status = "failed"
                 item.result = result.result_text
-                await send_reply(format_channel_worker_result(item, "failed"))
+                await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "failed"))
                 return
 
             await self._store.finish_task(task_id, TaskStatus.DONE, result.result_text)
@@ -645,13 +654,13 @@ class Orchestrator:
 
             # Send result to orchestrator session for evaluation
             worker_report = self._format_worker_result(item, plan, is_error=False)
-            verdict = await self._send_to_orchestrator(plan.chat_id, worker_report)
+            verdict = await self._send_to_orchestrator(plan.chat_id, worker_report, send_reply)
 
             if verdict is None or verdict.get("action") != "verdict":
                 # Orchestrator didn't return a valid verdict — assume done
                 log.warning("No valid verdict from orchestrator, assuming done")
                 item.status = "done"
-                await send_reply(format_channel_worker_result(item, "done"))
+                await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "done"))
                 return
 
             status = verdict.get("status", "done")
@@ -663,11 +672,11 @@ class Orchestrator:
                     cost_info += f"\n(cost: ${result.cost_usd:.4f})"
                 if result.duration_secs:
                     cost_info += f" ({result.duration_secs:.0f}s)"
-                await send_reply(format_channel_worker_result(item, "done") + cost_info)
+                await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "done") + cost_info)
                 # Handle suggestions
                 suggestions = verdict.get("suggestions", "")
                 if suggestions:
-                    await send_reply(format_channel_orchestrator(
+                    await self._reply(plan.chat_id, send_reply, format_channel_orchestrator(
                         f"Suggested next steps: {suggestions}"
                     ))
 
@@ -675,7 +684,7 @@ class Orchestrator:
                 item.retries += 1
                 item.feedback = verdict.get("feedback", "Please try again")
                 item.status = "pending"
-                await send_reply(format_channel_worker_result(item, "retry"))
+                await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "retry"))
 
             elif status == "retry_different" and item.approach_changes < item.max_approach_changes:
                 item.approach_changes += 1
@@ -685,15 +694,15 @@ class Orchestrator:
                     item.retries = 0
                     item.feedback = None
                     item.status = "pending"
-                    await send_reply(format_channel_worker_result(item, "retry_different"))
+                    await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "retry_different"))
                 else:
                     item.status = "failed"
                     item.feedback = verdict.get("summary", "No new approach provided")
-                    await send_reply(format_channel_worker_result(item, "failed"))
+                    await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "failed"))
 
             elif status == "escalate":
                 question = verdict.get("question", "Need your input on this task.")
-                await send_reply(format_channel_orchestrator(
+                await self._reply(plan.chat_id, send_reply, format_channel_orchestrator(
                     f"Task {item.id} needs your input: {question}"
                 ))
                 item.status = "failed"
@@ -703,7 +712,7 @@ class Orchestrator:
                 # failed, or retry/approach_change exhausted
                 item.status = "failed"
                 item.feedback = verdict.get("summary", verdict.get("feedback", "Task failed"))
-                await send_reply(format_channel_worker_result(item, "failed"))
+                await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "failed"))
 
             # Add any new tasks discovered
             for new_task in verdict.get("new_tasks", []):
@@ -723,7 +732,7 @@ class Orchestrator:
             await self._store.finish_task(task_id, TaskStatus.FAILED, str(e))
             item.status = "failed"
             item.result = str(e)
-            await send_reply(format_channel_worker_result(item, "failed"))
+            await self._reply(plan.chat_id, send_reply, format_channel_worker_result(item, "failed"))
 
     # ── Orchestrator session (Agent SDK) ──────────────────────────────
 
@@ -733,7 +742,9 @@ class Orchestrator:
             self._session_locks[chat_id] = asyncio.Lock()
         return self._session_locks[chat_id]
 
-    async def _send_to_orchestrator(self, chat_id: int, text: str) -> dict | None:
+    async def _send_to_orchestrator(
+        self, chat_id: int, text: str, send_reply: callable = None,
+    ) -> dict | None:
         """Send a message to the orchestrator Claude session and parse the JSON response.
 
         Uses Agent SDK query() with can_use_tool for permission handling
@@ -741,6 +752,9 @@ class Orchestrator:
         chat, or starts a new one with the system prompt.
 
         Serialized per-chat via session lock. Injects unchecked notes before sending.
+
+        If send_reply is provided, intermediate text and tool activity from the
+        orchestrator's Claude session will be forwarded to the user in real-time.
         """
         async with self._get_session_lock(chat_id):
             # Inject unchecked channel notes
@@ -750,9 +764,11 @@ class Orchestrator:
                 text = f"[CHANNEL NOTES]\n{note_lines}\n\n{text}"
                 await self._store.mark_notes_checked(chat_id)
 
-            return await self._send_to_orchestrator_unlocked(chat_id, text)
+            return await self._send_to_orchestrator_unlocked(chat_id, text, send_reply)
 
-    async def _send_to_orchestrator_unlocked(self, chat_id: int, text: str) -> dict | None:
+    async def _send_to_orchestrator_unlocked(
+        self, chat_id: int, text: str, send_reply: callable = None,
+    ) -> dict | None:
         """Inner implementation of _send_to_orchestrator (no lock)."""
         # Clear nested-session guard so SDK can spawn claude subprocess
         os.environ.pop("CLAUDECODE", None)
@@ -774,24 +790,69 @@ class Orchestrator:
             async for message in query(
                 prompt=_prompt_stream(text), options=options
             ):
-                if isinstance(message, ResultMessage):
+                if isinstance(message, AssistantMessage):
+                    await self._forward_assistant_message(
+                        chat_id, message, send_reply
+                    )
+                elif isinstance(message, ResultMessage):
                     result_text = message.result or ""
                     self._orchestrator_sessions[chat_id] = message.session_id
 
-            # Parse JSON — Agent SDK returns clean text, no markdown fences needed
+            # Parse JSON — strip markdown fences if present
             clean = result_text.strip()
             if clean.startswith("```"):
-                clean = "\n".join(clean.split("\n")[1:])
+                # Handle ```json or ``` fence
+                first_newline = clean.index("\n") if "\n" in clean else len(clean)
+                clean = clean[first_newline + 1:]
             if clean.endswith("```"):
                 clean = clean.rsplit("```", 1)[0]
-            return json.loads(clean.strip())
+            clean = clean.strip()
 
-        except json.JSONDecodeError as e:
-            log.error("Orchestrator JSON parse error: %s (raw: %s)", e, result_text[:200])
-            return None
+            try:
+                return json.loads(clean)
+            except json.JSONDecodeError:
+                # Model returned plain text instead of JSON — treat as a reply
+                log.warning("Orchestrator returned plain text, wrapping as reply: %s", result_text[:200])
+                return {"action": "reply", "text": result_text.strip()}
         except Exception as e:
             log.exception("Orchestrator error: %s", e)
             return None
+
+    async def _forward_assistant_message(
+        self, chat_id: int, message: AssistantMessage, send_reply: callable = None,
+    ):
+        """Extract and forward useful content from an AssistantMessage.
+
+        Forwards non-JSON text blocks as orchestrator commentary, and tool use
+        blocks as activity indicators. Persists forwarded text to the store.
+        """
+        if send_reply is None:
+            return
+
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                text = block.text.strip()
+                if not text:
+                    continue
+                # Skip if this looks like a raw JSON action (will be parsed later)
+                if text.startswith("{") and text.endswith("}"):
+                    try:
+                        json.loads(text)
+                        continue  # valid JSON action — handled by caller
+                    except json.JSONDecodeError:
+                        pass
+                # Forward non-JSON text as orchestrator commentary
+                formatted = format_channel_orchestrator(text)
+                await self._reply(chat_id, send_reply, formatted)
+
+            elif isinstance(block, ToolUseBlock):
+                # Show tool activity as a system-style message
+                tool_msg = f"orchestrator -> {block.name}"
+                if block.name in ("Bash", "Write", "Edit"):
+                    # Include a snippet of the input for context
+                    snippet = json.dumps(block.input, ensure_ascii=False)[:200]
+                    tool_msg += f": {snippet}"
+                await send_reply(tool_msg)
 
     def _make_can_use_tool(self, chat_id: int):
         """Create a can_use_tool callback for the orchestrator session.
@@ -839,7 +900,9 @@ class Orchestrator:
 
         questions = input_data.get("questions", [])
         question_text = _format_questions(questions)
-        await send_reply(format_channel_orchestrator(f"Question:\n{question_text}"))
+        msg = format_channel_orchestrator(f"Question:\n{question_text}")
+        await self._store.add_message(chat_id, "assistant", msg)
+        await send_reply(msg)
 
         # Wait for user response via handle_message resolving the future
         future: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -856,9 +919,9 @@ class Orchestrator:
                 "answers": answers,
             })
         except asyncio.TimeoutError:
-            await send_reply(format_channel_orchestrator(
-                "(No response received, continuing without answer)"
-            ))
+            timeout_msg = format_channel_orchestrator("(No response received, continuing without answer)")
+            await self._store.add_message(chat_id, "assistant", timeout_msg)
+            await send_reply(timeout_msg)
             return PermissionResultDeny(message="No answer from user (timeout)")
         finally:
             self._pending_answers.pop(chat_id, None)

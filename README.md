@@ -6,7 +6,7 @@ Distribute Claude Code sessions across multiple servers from a single orchestrat
 ┌─────────────────────────────────────────────┐
 │  Orchestrator (your laptop)                 │
 │                                             │
-│  src/main.py ──→ CLI or Telegram frontend   │
+│  src/main.py ──→ Web, CLI, or Telegram       │
 │       │                                     │
 │  Permission/Clarification HTTP server :9120 │
 └──────┬──────────────────────────────────────┘
@@ -30,6 +30,10 @@ Remote servers each run a broker daemon that drives Claude Code via the Agent SD
 ## Message Routing
 
 Messages are routed based on prefix. This lets you interact with a busy orchestrator without blocking.
+
+### Web mode
+
+In web mode (`make run-web`), the chat runs at `http://localhost:8080` over WebSocket. Behaves like CLI mode — unprefixed messages go directly to the orchestrator. Orchestrator replies, worker dispatches, and task results stream back in real-time. Permission and clarification escalations appear as inline cards with action buttons.
 
 ### CLI mode
 
@@ -80,6 +84,7 @@ cp config.example.yaml config.yaml
 
 # Run
 make run              # CLI mode
+make run-web          # Web chat mode (localhost:8080)
 make run-telegram     # Telegram bot mode
 ```
 
@@ -168,9 +173,13 @@ src/
   orchestrator.py  — message routing, persistent Claude session per chat, task evaluation
   session.py       — manages server connections and remote broker sessions
   store.py         — JSON file persistence (messages, tasks, workers, notes)
+  models.py        — data models (WorkItem, WorkPlan)
+  web.py           — web chat frontend (localhost:8080)
   cli.py           — terminal REPL frontend
   bot.py           — Telegram bot frontend
   formatter.py     — output formatting
+  static/
+    index.html     — single-page chat UI
 
 tools/
   remote_broker.py   — broker daemon for remote servers
