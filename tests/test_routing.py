@@ -1,6 +1,7 @@
 """Test Router message routing: /connect, /stop, /status, idle→task, running→interrupt."""
 
 import asyncio
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -225,3 +226,110 @@ async def test_route_to_disconnected_daemon():
     send_reply = AsyncMock()
     await router.route_message(1, "do something", send_reply)
     assert "disconnected" in send_reply.call_args[0][0].lower()
+
+
+# ── Setup mode routing ───────────────────────────────────────────────────
+
+
+async def test_setup_command_no_project_needed():
+    """/setup works without a connected project — enters setup mode."""
+    router = _make_router([])  # No orchestrators
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch.object(router, "_handle_setup", new_callable=AsyncMock) as mock_setup:
+        await router.route_message(1, "/setup user@server", send_reply, send_log)
+        mock_setup.assert_called_once_with(1, "/setup user@server", send_reply, send_log)
+        assert 1 in router._setup_channels
+
+
+async def test_setup_mode_routing():
+    """Follow-up messages in setup mode route to setup handler, not daemon."""
+    router = _make_router([
+        RemoteOrchestrator(project_id="proj", name="srv", status="idle"),
+    ])
+    router._channel_project[1] = "proj"
+    router._setup_channels.add(1)
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch.object(router, "_handle_setup", new_callable=AsyncMock) as mock_setup:
+        await router.route_message(1, "this machine uses conda", send_reply, send_log)
+        mock_setup.assert_called_once()
+        # Verify it was routed to setup, not to _start_task
+        assert mock_setup.call_args[0][1] == "this machine uses conda"
+
+
+async def test_setup_mode_exit_on_done():
+    """/done exits setup mode and does not route to daemon."""
+    router = _make_router([])
+    router._setup_channels.add(1)
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "/done", send_reply)
+
+    assert 1 not in router._setup_channels
+    send_reply.assert_called_once()
+    assert "exited" in send_reply.call_args[0][0].lower()
+
+
+async def test_setup_mode_exit_on_connect():
+    """/connect exits setup mode and proceeds with normal connect handling."""
+    router = _make_router([
+        RemoteOrchestrator(project_id="proj", name="srv"),
+    ])
+    router._setup_channels.add(1)
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "/connect proj", send_reply)
+
+    # Should have exited setup mode
+    assert 1 not in router._setup_channels
+
+
+# ── Reload config ────────────────────────────────────────────────────────
+
+
+async def test_reload_config_adds_new_projects(tmp_path):
+    """reload_config picks up new projects from config.json."""
+    config = {
+        "orchestrators": [
+            {"project_id": "new-proj", "name": "new-srv", "project_dir": "/tmp"},
+        ]
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    router = Router(cwd=str(tmp_path))
+    assert len(router._orchestrators) == 0
+
+    with patch.object(router, "_register_project", new_callable=AsyncMock):
+        router.reload_config()
+
+    assert "new-proj" in router._orchestrators
+
+
+async def test_reload_config_removes_old_projects(tmp_path):
+    """reload_config cancels SSE tasks for removed projects."""
+    # Start with one project
+    config = {
+        "orchestrators": [
+            {"project_id": "old-proj", "name": "old-srv", "project_dir": "/tmp"},
+        ]
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    router = Router(cwd=str(tmp_path))
+    router._load_config()
+    assert "old-proj" in router._orchestrators
+
+    # Add a mock SSE task
+    mock_task = MagicMock()
+    router._sse_tasks["old-proj"] = mock_task
+
+    # Now empty the config
+    (tmp_path / "config.json").write_text('{"orchestrators": []}')
+    router.reload_config()
+
+    assert "old-proj" not in router._orchestrators
+    mock_task.cancel.assert_called_once()

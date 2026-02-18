@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from .setup import SetupSession
+
 log = logging.getLogger(__name__)
 
 
@@ -58,6 +60,11 @@ class Router:
 
         # Per-channel status callbacks (for typing indicator)
         self._channel_status_callbacks: dict[int, callable] = {}
+
+        # Setup mode
+        self._setup_session: SetupSession | None = None
+        self._setup_channels: set[int] = set()
+        self._setup_task: asyncio.Task | None = None
 
     async def init(self):
         """Initialize: load config, create HTTP client."""
@@ -224,6 +231,25 @@ class Router:
         If idle → POST /task (start new task)
         If running → POST /interrupt (inject message)
         """
+        stripped = text.strip()
+
+        # ── Setup mode routing (works without a connected project) ──
+        if stripped.startswith("/setup"):
+            self._setup_channels.add(chat_id)
+            await self._handle_setup(chat_id, stripped, send_reply, send_log)
+            return
+
+        if chat_id in self._setup_channels:
+            if stripped.startswith("/connect") or stripped == "/done":
+                self._setup_channels.discard(chat_id)
+                if stripped == "/done":
+                    await send_reply("Exited setup mode.")
+                    return
+                # Fall through to normal routing for /connect
+            else:
+                await self._handle_setup(chat_id, stripped, send_reply, send_log)
+                return
+
         project_id = self._channel_project.get(chat_id)
         if not project_id:
             await send_reply(
@@ -233,7 +259,6 @@ class Router:
             return
 
         # Handle /connect command (already connected, show status)
-        stripped = text.strip()
         if stripped.startswith("/connect"):
             parts = stripped.split(None, 1)
             if len(parts) > 1:
@@ -367,6 +392,74 @@ class Router:
                 await send_reply("\n".join(lines))
         except aiohttp.ClientError as e:
             await send_reply(f"Cannot reach daemon: {e}")
+
+    # ── Setup Mode ─────────────────────────────────────────────────────
+
+    async def _handle_setup(
+        self,
+        chat_id: int,
+        text: str,
+        send_reply: callable,
+        send_log: callable = None,
+    ):
+        """Handle a setup-mode message by routing to the SetupSession."""
+        if self._setup_session is None:
+            self._setup_session = SetupSession(cwd=self._cwd)
+
+        # Wire callbacks
+        self._setup_session.set_callbacks(
+            progress=send_reply,
+            log=send_log,
+        )
+
+        # Build the prompt
+        stripped = text.strip()
+        if stripped.startswith("/setup"):
+            arg = stripped[len("/setup"):].strip()
+            if arg:
+                prompt = (
+                    f"Set up a new server: {arg}\n\n"
+                    "Probe the environment via SSH, deploy the daemon, "
+                    "and update config.json. Follow the deployment procedure."
+                )
+            else:
+                prompt = (
+                    "Run a health check on all configured servers. "
+                    "Read config.json and curl each daemon's /health endpoint."
+                )
+        else:
+            # Follow-up message in setup mode
+            prompt = stripped
+
+        # Run in background so route_message returns immediately
+        async def _run():
+            try:
+                result = await self._setup_session.run(prompt)
+                if result:
+                    await send_reply(result)
+                # Reload config after setup in case it was modified
+                self.reload_config()
+            except Exception as e:
+                log.exception(f"Setup session error: {e}")
+                await send_reply(f"Setup error: {e}")
+
+        self._setup_task = asyncio.create_task(_run())
+
+    def reload_config(self):
+        """Hot-reload config.json. Starts SSE listeners for new projects,
+        cancels removed ones."""
+        old_ids = set(self._orchestrators.keys())
+        self._orchestrators.clear()
+        self._load_config()
+        new_ids = set(self._orchestrators.keys())
+
+        for pid in (new_ids - old_ids):
+            asyncio.create_task(self._register_project(self._orchestrators[pid]))
+
+        for pid in (old_ids - new_ids):
+            task = self._sse_tasks.pop(pid, None)
+            if task:
+                task.cancel()
 
     # ── Channel ↔ Project Mapping ─────────────────────────────────────
 

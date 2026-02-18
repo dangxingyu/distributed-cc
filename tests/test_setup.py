@@ -1,0 +1,175 @@
+"""Tests for SetupSession: init, running flag, progress callbacks, session resume."""
+
+import asyncio
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from src.setup import SetupSession, _prompt_stream
+
+
+# ── Basic state ──────────────────────────────────────────────────────────
+
+
+def test_setup_session_init():
+    """SetupSession starts with no session_id and not running."""
+    s = SetupSession(cwd="/tmp")
+    assert s.session_id is None
+    assert s.is_running is False
+
+
+def test_setup_session_init_resolves_cwd():
+    """cwd is resolved to an absolute path."""
+    s = SetupSession(cwd=".")
+    assert s._cwd.startswith("/")
+
+
+# ── Running flag ─────────────────────────────────────────────────────────
+
+
+async def test_setup_is_running_flag():
+    """is_running is True during run(), False after."""
+    s = SetupSession(cwd="/tmp")
+
+    observed_running = []
+
+    # Mock the _run_inner to capture is_running mid-flight
+    async def fake_run_inner(msg):
+        observed_running.append(s.is_running)
+        return "done"
+
+    s._run_inner = fake_run_inner
+
+    result = await s.run("hello")
+    assert result == "done"
+    assert observed_running == [True]
+    assert s.is_running is False
+
+
+async def test_setup_is_running_flag_on_error():
+    """is_running resets to False even if _run_inner raises."""
+    s = SetupSession(cwd="/tmp")
+
+    async def failing_run_inner(msg):
+        raise RuntimeError("boom")
+
+    s._run_inner = failing_run_inner
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await s.run("hello")
+    assert s.is_running is False
+
+
+# ── Progress callbacks ───────────────────────────────────────────────────
+
+
+async def test_setup_progress_callback():
+    """Progress callback receives text from AssistantMessage TextBlocks."""
+    from claude_agent_sdk.types import TextBlock
+
+    s = SetupSession(cwd="/tmp")
+    received = []
+    log_received = []
+
+    async def on_progress(text):
+        received.append(text)
+
+    async def on_log(text):
+        log_received.append(text)
+
+    s.set_callbacks(progress=on_progress, log=on_log)
+
+    # Simulate an AssistantMessage with a TextBlock
+    mock_msg = MagicMock()
+    mock_msg.content = [TextBlock(text="Setting up server...")]
+    await s._forward_progress(mock_msg)
+
+    assert received == ["Setting up server..."]
+    assert log_received == []
+
+
+async def test_setup_log_callback_on_tool_use():
+    """Log callback receives tool use events."""
+    from claude_agent_sdk.types import ToolUseBlock
+
+    s = SetupSession(cwd="/tmp")
+    log_received = []
+
+    async def on_log(text):
+        log_received.append(text)
+
+    s.set_callbacks(log=on_log)
+
+    mock_msg = MagicMock()
+    mock_msg.content = [ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})]
+    await s._forward_progress(mock_msg)
+
+    assert len(log_received) == 1
+    assert "Bash" in log_received[0]
+    assert "setup ->" in log_received[0]
+
+
+# ── Session resume ───────────────────────────────────────────────────────
+
+
+async def test_setup_session_resume():
+    """session_id is preserved after a successful run for resuming."""
+    s = SetupSession(cwd="/tmp")
+    assert s.session_id is None
+
+    # Simulate a run that sets session_id
+    s._session_id = "sess-abc123"
+    assert s.session_id == "sess-abc123"
+
+
+# ── Config snapshot ──────────────────────────────────────────────────────
+
+
+def test_get_config_snapshot_missing_file(tmp_path):
+    """Returns default JSON when config.json doesn't exist."""
+    s = SetupSession(cwd=str(tmp_path))
+    snapshot = s._get_config_snapshot()
+    assert "servers" in snapshot
+
+
+def test_get_config_snapshot_reads_file(tmp_path):
+    """Reads actual config.json content."""
+    config = '{"servers": [{"name": "test"}]}'
+    (tmp_path / "config.json").write_text(config)
+
+    s = SetupSession(cwd=str(tmp_path))
+    snapshot = s._get_config_snapshot()
+    assert snapshot == config
+
+
+# ── Prompt stream ────────────────────────────────────────────────────────
+
+
+async def test_prompt_stream_yields_message():
+    """_prompt_stream yields one user message then waits for done."""
+    done = asyncio.Event()
+    messages = []
+
+    async def collect():
+        async for msg in _prompt_stream("hello world", done):
+            messages.append(msg)
+
+    task = asyncio.create_task(collect())
+    await asyncio.sleep(0.05)  # Let it yield the first message
+
+    assert len(messages) == 1
+    assert messages[0]["message"]["content"] == "hello world"
+    assert messages[0]["type"] == "user"
+
+    # Stream should still be alive (waiting on done)
+    assert not task.done()
+
+    done.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_prompt_stream_without_done():
+    """_prompt_stream without done event completes after yielding."""
+    messages = []
+    async for msg in _prompt_stream("test"):
+        messages.append(msg)
+    assert len(messages) == 1
