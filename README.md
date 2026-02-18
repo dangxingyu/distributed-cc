@@ -27,6 +27,43 @@ Each project works like a Slack channel: the user talks to the orchestrator, the
 
 Remote servers each run a broker daemon that drives Claude Code via the Agent SDK. Permission requests and clarification questions are forwarded back to the orchestrator through SSH reverse tunnels.
 
+## Message Routing
+
+Messages are routed based on prefix. This lets you interact with a busy orchestrator without blocking.
+
+### CLI mode
+
+In CLI mode, unprefixed messages go directly to the orchestrator (single-user ergonomics). You can still use the `@orchestrator` prefix, but it's optional.
+
+```
+you> fix the auth bug in login.py          # → direct to orchestrator
+you> @orchestrator check the test results  # → same thing, explicit prefix
+you> @orchestrator /stop                   # → cancel all running worker tasks
+```
+
+### Telegram mode
+
+In Telegram, unprefixed messages become **channel notes** — ambient observations stored and auto-injected into the orchestrator's next interaction. Use `@orchestrator` to send direct messages.
+
+```
+the CI is failing on server-b              # → stored as channel note
+@orchestrator deploy the fix to staging    # → direct message to orchestrator
+@orchestrator /stop                        # → cancel all running worker tasks
+```
+
+### How it works
+
+| Input | Behavior |
+|---|---|
+| `@orchestrator <text>` | Direct message. Queued non-blocking if orchestrator is busy (you get a "(queued)" ack). |
+| `@orchestrator /stop` | Cancels all running worker tasks for the channel. |
+| `<text>` (CLI) | Direct message (CLI defaults to direct mode). |
+| `<text>` (Telegram) | Channel note — stored and prepended as `[CHANNEL NOTES]` to the next orchestrator message. You get a "(noted)" ack. |
+
+**Channel notes** are useful for leaving context while the orchestrator is busy evaluating a worker result. For example, "I noticed the linting config uses tabs not spaces" gets picked up on the next orchestrator interaction without interrupting current work.
+
+**Non-blocking queue**: When the orchestrator session lock is held (e.g., evaluating a worker result), direct messages are queued and processed in order once the lock is released. No messages are lost.
+
 ## Quick Start
 
 ### 1. Orchestrator (main node)
@@ -107,13 +144,14 @@ Edit `tools/start_tunnels.sh` to configure your servers.
 See `config.example.yaml` for all options. Key sections:
 
 - **servers** — list of remote/local servers with broker ports (sessions register dynamically)
-- **orchestrator** — model selection for routing and sessions
-- **permission** — callback HTTP server port
+- **orchestrator** — model selection, tool permission config (auto-approve, deny, escalate-to-human)
+- **http** — callback HTTP server port for broker permission/clarification requests
 - **telegram** — bot token and allowed user IDs (for Telegram mode)
+- **data** — directory for JSON persistence files
 
 Optionally, create a `config.md` alongside `config.yaml` for extra instructions
-(server notes, rules, preferences). The orchestrator and permission evaluator
-will read it for additional context. See `config.example.md` for an example.
+(server notes, rules, preferences). The orchestrator reads it for additional context.
+See `config.example.md` for an example.
 
 ## Testing
 
@@ -127,10 +165,9 @@ make test-e2e     # End-to-end tests (costs money)
 ```
 src/
   main.py          — entry point, wires components together
-  orchestrator.py  — persistent Claude session per chat, routes tasks, evaluates results
-  session.py       — manages server connections and sessions
-  store.py         — SQLite persistence
-  permission.py    — evaluates permission requests
+  orchestrator.py  — message routing, persistent Claude session per chat, task evaluation
+  session.py       — manages server connections and remote broker sessions
+  store.py         — JSON file persistence (messages, tasks, workers, notes)
   cli.py           — terminal REPL frontend
   bot.py           — Telegram bot frontend
   formatter.py     — output formatting
