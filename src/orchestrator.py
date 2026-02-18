@@ -898,6 +898,14 @@ class Orchestrator:
             can_use_tool=self._make_can_use_tool(chat_id),
             model=self._model,
             cwd=os.path.dirname(os.path.abspath(self._config_path)),
+            # Auto-approve common tools at the CLI level (bypasses permission
+            # prompt entirely — faster than round-tripping through can_use_tool).
+            # AskUserQuestion is NOT listed so it still goes through can_use_tool.
+            allowed_tools=list(self._auto_approve_tools),
+            # Block tools the orchestrator shouldn't use (uses JSON actions instead)
+            disallowed_tools=["EnterPlanMode", "ExitPlanMode"],
+            # Disable sandbox so orchestrator can use SSH, curl, etc.
+            sandbox={"enabled": False},
         )
 
         session_id = self._orchestrator_sessions.get(chat_id)
