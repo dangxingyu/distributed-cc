@@ -273,6 +273,8 @@ async def test_ws_message_uses_active_channel(aiohttp_client):
         assert msg["type"] == "reply"
         assert msg["text"] == "orchestrator: got it"
 
+        # Let background task finish (route_message runs via create_task)
+        await asyncio.sleep(0.05)
         assert called["chat_id"] == ch_id
         assert called["text"] == "do something"
         assert called["default_direct"] is True

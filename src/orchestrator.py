@@ -55,7 +55,7 @@ WORKER_SAFE_TOOLS = {"Read", "Grep", "Glob", "WebSearch", "WebFetch", "Explore"}
 
 # Message routing patterns
 _ORCH_PREFIX_RE = re.compile(r"^@orchestrator\s+", re.IGNORECASE)
-_STOP_CMD_RE = re.compile(r"^@orchestrator\s+/stop\s*$", re.IGNORECASE)
+_STOP_CMD_RE = re.compile(r"^(?:@orchestrator\s+)?/stop\s*$", re.IGNORECASE)
 
 
 async def _prompt_stream(text: str):
@@ -298,7 +298,7 @@ class Orchestrator:
         # Tool permission config (from config.yaml orchestrator.permissions)
         perm_cfg = (orch_config or {}).get("permissions", {})
         self._auto_approve_tools: set[str] = set(
-            perm_cfg.get("auto_approve", ["Read", "Glob", "Grep", "WebSearch", "WebFetch"])
+            perm_cfg.get("auto_approve", ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", "Write", "Edit"])
         )
         self._denied_tools: set[str] = set(perm_cfg.get("deny", []))
 
@@ -322,6 +322,9 @@ class Orchestrator:
         # Per-chat message queues and queue processor tasks
         self._message_queues: dict[int, asyncio.Queue] = {}
         self._queue_tasks: dict[int, asyncio.Task] = {}
+
+        # Per-chat active orchestrator tasks (for /stop cancellation)
+        self._active_tasks: dict[int, set[asyncio.Task]] = {}
 
     async def init(self):
         """Initialize: populate worker-to-chat reverse index from store."""
@@ -421,9 +424,9 @@ class Orchestrator:
         """Start the queue processor task if not already running."""
         task = self._queue_tasks.get(chat_id)
         if task is None or task.done():
-            self._queue_tasks[chat_id] = asyncio.create_task(
-                self._process_queue(chat_id)
-            )
+            t = asyncio.create_task(self._process_queue(chat_id))
+            self._queue_tasks[chat_id] = t
+            self._track_task(chat_id, t)
 
     async def _process_queue(self, chat_id: int):
         """Drain the message queue, sending each to handle_message."""
@@ -434,19 +437,50 @@ class Orchestrator:
             text, send_reply = queue.get_nowait()
             await self.handle_message(chat_id, text, send_reply)
 
+    def _track_task(self, chat_id: int, task: asyncio.Task):
+        """Register an active task for cancellation via /stop."""
+        if chat_id not in self._active_tasks:
+            self._active_tasks[chat_id] = set()
+        self._active_tasks[chat_id].add(task)
+        task.add_done_callback(lambda t: self._active_tasks.get(chat_id, set()).discard(t))
+
     async def _handle_stop(self, chat_id: int, send_reply: callable):
-        """Cancel running worker tasks and notify the orchestrator."""
+        """Cancel running worker tasks AND orchestrator background tasks."""
+        await self._store.add_message(chat_id, "user", "/stop")
+
+        # Cancel worker tasks
         tasks = await self._store.get_running_tasks(chat_id)
-        cancelled = 0
+        cancelled_workers = 0
         for t in tasks:
             ok = await self._session_mgr.cancel_task(t.server_name, t.session_id)
             if ok:
-                cancelled += 1
+                cancelled_workers += 1
                 await self._store.finish_task(t.id, TaskStatus.FAILED, "Stopped by user")
 
-        await send_reply(f"(stop: cancelled {cancelled}/{len(tasks)} running tasks)")
+        # Cancel orchestrator background tasks (e.g. /setup, pending queries)
+        active = self._active_tasks.get(chat_id, set())
+        cancelled_orch = 0
+        for t in list(active):
+            if not t.done():
+                t.cancel()
+                cancelled_orch += 1
+        active.clear()
 
-        # Fire-and-forget notification to orchestrator session
+        # Drain the message queue
+        queue = self._message_queues.get(chat_id)
+        if queue:
+            while not queue.empty():
+                queue.get_nowait()
+
+        parts = []
+        if cancelled_workers or tasks:
+            parts.append(f"{cancelled_workers}/{len(tasks)} worker tasks")
+        if cancelled_orch:
+            parts.append(f"{cancelled_orch} orchestrator operations")
+        summary = ", ".join(parts) if parts else "nothing running"
+        await send_reply(f"(stop: cancelled {summary})")
+
+        # Notify orchestrator session (fire-and-forget)
         asyncio.create_task(
             self._send_to_orchestrator(chat_id, "[STOP REQUESTED]\nThe user has stopped all running tasks.")
         )
@@ -530,7 +564,8 @@ class Orchestrator:
                 )],
             )
             await self._reply(chat_id, send_reply, format_channel_dispatch(server, session, prompt))
-            asyncio.create_task(self._execute_plan(plan, send_reply))
+            t = asyncio.create_task(self._execute_plan(plan, send_reply))
+            self._track_task(chat_id, t)
 
         elif action == "plan":
             tasks_data = decision.get("tasks", [])
@@ -555,7 +590,8 @@ class Orchestrator:
                 ],
             )
             await self._reply(chat_id, send_reply, format_channel_plan_created(plan))
-            asyncio.create_task(self._execute_plan(plan, send_reply))
+            t = asyncio.create_task(self._execute_plan(plan, send_reply))
+            self._track_task(chat_id, t)
 
         elif action == "register_server":
             await self._handle_register_server(chat_id, decision, send_reply)

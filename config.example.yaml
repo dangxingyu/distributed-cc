@@ -37,8 +37,11 @@ orchestrator:
       - Grep
       - WebSearch
       - WebFetch
+      - Bash
+      - Write
+      - Edit
     deny: []                # Tools the orchestrator may never use
-    # Everything else → escalated directly to human (no Claude intermediary)
+    # Everything else → escalated to human via web UI / Telegram
 
 web:
   host: "127.0.0.1"        # Web chat frontend bind address

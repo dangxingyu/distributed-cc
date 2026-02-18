@@ -100,10 +100,9 @@ class Store:
         data["messages"].append({"role": role, "content": content, "ts": time.time()})
         self._save(chat_id, data)
 
-    async def get_recent_messages(self, chat_id: int, limit: int = 20) -> list[dict]:
+    async def get_recent_messages(self, chat_id: int) -> list[dict]:
         data = self._load(chat_id)
-        msgs = data["messages"][-limit:]
-        return [{"role": m["role"], "content": m["content"]} for m in msgs]
+        return [{"role": m["role"], "content": m["content"]} for m in data["messages"]]
 
     # ---- tasks ----
 

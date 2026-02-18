@@ -26,7 +26,7 @@ async def test_add_and_get_messages(store):
     await store.add_message(1, "assistant", "hi there")
     await store.add_message(1, "user", "how are you")
 
-    msgs = await store.get_recent_messages(1, limit=10)
+    msgs = await store.get_recent_messages(1)
     assert len(msgs) == 3
     assert msgs[0]["role"] == "user"
     assert msgs[0]["content"] == "hello"
@@ -49,13 +49,13 @@ async def test_messages_per_chat(store):
 
 
 @pytest.mark.asyncio
-async def test_message_limit(store):
+async def test_message_all_returned(store):
     for i in range(30):
         await store.add_message(1, "user", f"msg {i}")
 
-    msgs = await store.get_recent_messages(1, limit=5)
-    assert len(msgs) == 5
-    # Should be the 5 most recent
+    msgs = await store.get_recent_messages(1)
+    assert len(msgs) == 30
+    assert msgs[0]["content"] == "msg 0"
     assert msgs[-1]["content"] == "msg 29"
 
 

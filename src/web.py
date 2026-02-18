@@ -5,6 +5,7 @@ own orchestrator session, workers, messages, and notes.  The left sidebar
 lists channels and lets users create / switch between them.
 """
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -75,7 +76,7 @@ class WebChat:
             channel_id = int(channel_str)
         except ValueError:
             return web.json_response({"error": "invalid channel id"}, status=400)
-        messages = await self._store.get_recent_messages(channel_id, limit=50)
+        messages = await self._store.get_recent_messages(channel_id)
         return web.json_response(messages)
 
     async def _handle_channels_list(self, request: web.Request) -> web.Response:
@@ -175,8 +176,12 @@ class WebChat:
             async def send_reply(msg: str):
                 await self._ws_send({"type": "reply", "text": msg})
 
-            await self._orchestrator.route_message(
-                chat_id, text, send_reply, default_direct=True,
+            # Run in background so the WS handler can continue processing
+            # messages (e.g. permission_response) while the orchestrator runs.
+            asyncio.create_task(
+                self._orchestrator.route_message(
+                    chat_id, text, send_reply, default_direct=True,
+                )
             )
 
         elif msg_type == "permission_response":
