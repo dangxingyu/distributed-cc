@@ -176,11 +176,15 @@ class WebChat:
             async def send_reply(msg: str):
                 await self._ws_send({"type": "reply", "text": msg})
 
+            async def send_log(msg: str):
+                await self._ws_send({"type": "log", "text": msg})
+
             # Run in background so the WS handler can continue processing
             # messages (e.g. permission_response) while the orchestrator runs.
             asyncio.create_task(
                 self._orchestrator.route_message(
                     chat_id, text, send_reply, default_direct=True,
+                    send_log=send_log,
                 )
             )
 

@@ -586,6 +586,113 @@ body {
 
 .mention-item .mention-dot.orchestrator { background: var(--green); }
 .mention-item .mention-dot.worker { background: var(--orange); }
+
+/* ── Monitor panel ─────────────────────────────── */
+
+#monitor {
+  width: 350px;
+  min-width: 0;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  transition: width 0.2s ease;
+}
+
+#monitor.monitor-closed {
+  width: 0;
+  border-left: none;
+}
+
+#monitor-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+#monitor-header h2 {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+#monitor-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  border-radius: 4px;
+  transition: color 0.1s ease;
+}
+
+#monitor-close:hover {
+  color: var(--text-primary);
+}
+
+#monitor-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.log-entry {
+  padding: 3px 14px;
+  border-bottom: 1px solid rgba(51, 51, 77, 0.4);
+  word-break: break-all;
+}
+
+.log-entry-tool {
+  color: var(--blue);
+}
+
+.log-entry-text {
+  color: var(--text-muted);
+}
+
+.log-time {
+  color: var(--text-muted);
+  opacity: 0.6;
+  margin-right: 6px;
+  font-size: 10px;
+}
+
+#monitor-btn {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+#monitor-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-light);
+}
+
+#monitor-btn.active {
+  background: var(--blue-dim);
+  border-color: rgba(137, 180, 250, 0.3);
+  color: var(--blue);
+}
 </style>
 </head>
 <body>
@@ -600,6 +707,7 @@ body {
   <div id="header">
     <h1 id="channel-title">distributed-cc</h1>
     <div id="header-right">
+      <button id="monitor-btn" onclick="toggleMonitor()" title="Toggle monitor (Ctrl+M)">Monitor</button>
       <button id="members-btn" style="display:none">
         0 members
         <div id="members-popover"></div>
@@ -621,6 +729,14 @@ body {
   </div>
 </div>
 
+<div id="monitor" class="monitor-closed">
+  <div id="monitor-header">
+    <h2>Monitor</h2>
+    <button id="monitor-close" onclick="toggleMonitor()">&times;</button>
+  </div>
+  <div id="monitor-log"></div>
+</div>
+
 <script>
 const messagesEl = document.getElementById('messages');
 const noChannelEl = document.getElementById('no-channel-msg');
@@ -634,6 +750,9 @@ const newChannelBtn = document.getElementById('new-channel-btn');
 const membersBtn = document.getElementById('members-btn');
 const membersPopover = document.getElementById('members-popover');
 const mentionDropdown = document.getElementById('mention-dropdown');
+const monitorEl = document.getElementById('monitor');
+const monitorLog = document.getElementById('monitor-log');
+const monitorBtn = document.getElementById('monitor-btn');
 
 let ws = null;
 let reconnectTimer = null;
@@ -856,6 +975,7 @@ function onChannelSwitched(channelId) {
   channelTitle.textContent = ch ? '# ' + ch.name : 'distributed-cc';
   noChannelEl.style.display = 'none';
   messagesEl.style.display = 'flex';
+  monitorLog.innerHTML = '';
   renderChannelList();
 }
 
@@ -1071,6 +1191,54 @@ inputEl.addEventListener('keydown', function(e) {
 
 sendBtn.addEventListener('click', sendMessage);
 
+// ── Monitor panel ───────────────────────────────────────────────────
+
+function toggleMonitor() {
+  const isOpen = !monitorEl.classList.contains('monitor-closed');
+  if (isOpen) {
+    monitorEl.classList.add('monitor-closed');
+    monitorBtn.classList.remove('active');
+    localStorage.setItem('dcc_monitor_open', 'false');
+  } else {
+    monitorEl.classList.remove('monitor-closed');
+    monitorBtn.classList.add('active');
+    localStorage.setItem('dcc_monitor_open', 'true');
+  }
+}
+
+function addLogEntry(text) {
+  const entry = document.createElement('div');
+  const isToolCall = /^orchestrator\s*->/.test(text);
+  entry.className = 'log-entry ' + (isToolCall ? 'log-entry-tool' : 'log-entry-text');
+
+  const time = document.createElement('span');
+  time.className = 'log-time';
+  const now = new Date();
+  time.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+  const content = document.createElement('span');
+  content.textContent = text;
+
+  entry.appendChild(time);
+  entry.appendChild(content);
+  monitorLog.appendChild(entry);
+  monitorLog.scrollTop = monitorLog.scrollHeight;
+}
+
+// Restore monitor state from localStorage
+if (localStorage.getItem('dcc_monitor_open') === 'true') {
+  monitorEl.classList.remove('monitor-closed');
+  monitorBtn.classList.add('active');
+}
+
+// Ctrl+M keyboard shortcut
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.key === 'm') {
+    e.preventDefault();
+    toggleMonitor();
+  }
+});
+
 // ── WebSocket ───────────────────────────────────────────────────────
 
 function connect() {
@@ -1109,6 +1277,8 @@ function connect() {
 
     if (data.type === 'channel_switched') {
       onChannelSwitched(data.channel_id);
+    } else if (data.type === 'log') {
+      addLogEntry(data.text);
     } else if (data.type === 'reply') {
       const cls = classifyMessage(data.text);
       addMessage(data.text, 'msg-' + cls);

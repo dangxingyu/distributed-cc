@@ -375,6 +375,7 @@ class Orchestrator:
         raw_text: str,
         send_reply: callable,
         default_direct: bool = False,
+        send_log: callable = None,
     ):
         """Route an incoming message based on prefix.
 
@@ -394,24 +395,25 @@ class Orchestrator:
         m = _ORCH_PREFIX_RE.match(stripped)
         if m:
             text = stripped[m.end():]
-            await self._enqueue_direct_message(chat_id, text, send_reply)
+            await self._enqueue_direct_message(chat_id, text, send_reply, send_log)
             return
 
         # No prefix
         if default_direct:
-            await self._enqueue_direct_message(chat_id, stripped, send_reply)
+            await self._enqueue_direct_message(chat_id, stripped, send_reply, send_log)
         else:
             await self._store.add_note(chat_id, stripped)
             await send_reply("(noted)")
 
     async def _enqueue_direct_message(
-        self, chat_id: int, text: str, send_reply: callable
+        self, chat_id: int, text: str, send_reply: callable,
+        send_log: callable = None,
     ):
         """Queue a direct message for the orchestrator. Ack if lock is held."""
         if chat_id not in self._message_queues:
             self._message_queues[chat_id] = asyncio.Queue()
 
-        self._message_queues[chat_id].put_nowait((text, send_reply))
+        self._message_queues[chat_id].put_nowait((text, send_reply, send_log))
 
         # If the session lock is currently held, ack that we queued it
         lock = self._get_session_lock(chat_id)
@@ -434,8 +436,8 @@ class Orchestrator:
         if queue is None:
             return
         while not queue.empty():
-            text, send_reply = queue.get_nowait()
-            await self.handle_message(chat_id, text, send_reply)
+            text, send_reply, send_log = queue.get_nowait()
+            await self.handle_message(chat_id, text, send_reply, send_log)
 
     def _track_task(self, chat_id: int, task: asyncio.Task):
         """Register an active task for cancellation via /stop."""
@@ -492,6 +494,7 @@ class Orchestrator:
         chat_id: int,
         user_text: str,
         send_reply: callable,
+        send_log: callable = None,
     ):
         """Process a user message end-to-end."""
         # Check if this message is an answer to a pending orchestrator question
@@ -510,7 +513,9 @@ class Orchestrator:
         # Store send_reply so the can_use_tool callback can route questions
         self._active_reply_fns[chat_id] = send_reply
         try:
-            decision = await self._send_to_orchestrator(chat_id, augmented_text, send_reply)
+            decision = await self._send_to_orchestrator(
+                chat_id, augmented_text, send_reply, send_log
+            )
         finally:
             self._active_reply_fns.pop(chat_id, None)
 
@@ -518,7 +523,7 @@ class Orchestrator:
             await send_reply("Sorry, I couldn't understand that. Try again?")
             return
 
-        await self._handle_decision(chat_id, user_text, decision, send_reply)
+        await self._handle_decision(chat_id, user_text, decision, send_reply, send_log)
 
     async def _reply(self, chat_id: int, send_reply: callable, text: str):
         """Send a reply to the user AND persist it to the store."""
@@ -531,6 +536,7 @@ class Orchestrator:
         user_text: str,
         decision: dict,
         send_reply: callable,
+        send_log: callable = None,
     ):
         """Dispatch on orchestrator decision. May recurse for create_worker follow-ups."""
         action = decision.get("action")
@@ -544,7 +550,7 @@ class Orchestrator:
             await self._reply(chat_id, send_reply, format_task_status(tasks))
 
         elif action == "create_worker":
-            await self._handle_create_worker(chat_id, user_text, decision, send_reply)
+            await self._handle_create_worker(chat_id, user_text, decision, send_reply, send_log)
 
         elif action == "assign":
             server = decision.get("server", "")
@@ -564,7 +570,7 @@ class Orchestrator:
                 )],
             )
             await self._reply(chat_id, send_reply, format_channel_dispatch(server, session, prompt))
-            t = asyncio.create_task(self._execute_plan(plan, send_reply))
+            t = asyncio.create_task(self._execute_plan(plan, send_reply, send_log))
             self._track_task(chat_id, t)
 
         elif action == "plan":
@@ -590,7 +596,7 @@ class Orchestrator:
                 ],
             )
             await self._reply(chat_id, send_reply, format_channel_plan_created(plan))
-            t = asyncio.create_task(self._execute_plan(plan, send_reply))
+            t = asyncio.create_task(self._execute_plan(plan, send_reply, send_log))
             self._track_task(chat_id, t)
 
         elif action == "register_server":
@@ -605,6 +611,7 @@ class Orchestrator:
         user_text: str,
         decision: dict,
         send_reply: callable,
+        send_log: callable = None,
     ):
         """Handle create_worker action: register on broker, store in DB, confirm to orchestrator."""
         server_name = decision.get("server", "")
@@ -638,9 +645,9 @@ class Orchestrator:
             f"{self._format_channel_workers(workers)}\n"
             f"Continue with the user's original request."
         )
-        follow_up = await self._send_to_orchestrator(chat_id, confirmation, send_reply)
+        follow_up = await self._send_to_orchestrator(chat_id, confirmation, send_reply, send_log)
         if follow_up:
-            await self._handle_decision(chat_id, user_text, follow_up, send_reply)
+            await self._handle_decision(chat_id, user_text, follow_up, send_reply, send_log)
 
     async def _handle_register_server(
         self, chat_id: int, decision: dict, send_reply: callable,
@@ -671,7 +678,9 @@ class Orchestrator:
 
     # ── Plan execution ─────────────────────────────────────────────────
 
-    async def _execute_plan(self, plan: WorkPlan, send_reply: callable):
+    async def _execute_plan(
+        self, plan: WorkPlan, send_reply: callable, send_log: callable = None,
+    ):
         """Execute a work plan: run items respecting dependencies, send
         each result to the orchestrator session for evaluation."""
         try:
@@ -705,7 +714,7 @@ class Orchestrator:
 
                 # Execute ready items sequentially
                 for item in ready:
-                    await self._execute_item(plan, item, send_reply)
+                    await self._execute_item(plan, item, send_reply, send_log)
 
             # All done — send summary
             all_done = all(i.status == "done" for i in plan.items)
@@ -721,6 +730,7 @@ class Orchestrator:
 
     async def _execute_item(
         self, plan: WorkPlan, item: WorkItem, send_reply: callable,
+        send_log: callable = None,
     ):
         """Execute a single work item: run worker, send result to orchestrator, handle verdict."""
         item.status = "running"
@@ -758,7 +768,7 @@ class Orchestrator:
 
             # Send result to orchestrator session for evaluation
             worker_report = self._format_worker_result(item, plan, is_error=False)
-            verdict = await self._send_to_orchestrator(plan.chat_id, worker_report, send_reply)
+            verdict = await self._send_to_orchestrator(plan.chat_id, worker_report, send_reply, send_log)
 
             if verdict is None or verdict.get("action") != "verdict":
                 # Orchestrator didn't return a valid verdict — assume done
@@ -848,6 +858,7 @@ class Orchestrator:
 
     async def _send_to_orchestrator(
         self, chat_id: int, text: str, send_reply: callable = None,
+        send_log: callable = None,
     ) -> dict | None:
         """Send a message to the orchestrator Claude session and parse the JSON response.
 
@@ -859,6 +870,8 @@ class Orchestrator:
 
         If send_reply is provided, intermediate text and tool activity from the
         orchestrator's Claude session will be forwarded to the user in real-time.
+        If send_log is provided, intermediate output goes to the monitor panel
+        instead of the chat (falling back to send_reply when send_log is None).
         """
         async with self._get_session_lock(chat_id):
             # Inject unchecked channel notes
@@ -868,10 +881,13 @@ class Orchestrator:
                 text = f"[CHANNEL NOTES]\n{note_lines}\n\n{text}"
                 await self._store.mark_notes_checked(chat_id)
 
-            return await self._send_to_orchestrator_unlocked(chat_id, text, send_reply)
+            return await self._send_to_orchestrator_unlocked(
+                chat_id, text, send_reply, send_log
+            )
 
     async def _send_to_orchestrator_unlocked(
         self, chat_id: int, text: str, send_reply: callable = None,
+        send_log: callable = None,
     ) -> dict | None:
         """Inner implementation of _send_to_orchestrator (no lock)."""
         # Clear nested-session guard so SDK can spawn claude subprocess
@@ -896,7 +912,7 @@ class Orchestrator:
             ):
                 if isinstance(message, AssistantMessage):
                     await self._forward_assistant_message(
-                        chat_id, message, send_reply
+                        chat_id, message, send_reply, send_log
                     )
                 elif isinstance(message, ResultMessage):
                     result_text = message.result or ""
@@ -915,6 +931,14 @@ class Orchestrator:
             try:
                 return json.loads(clean)
             except json.JSONDecodeError:
+                # Try to extract embedded JSON action from preamble text
+                # e.g. "Some commentary...\n{"action": "reply", ...}"
+                idx = clean.find('{"action"')
+                if idx > 0:
+                    try:
+                        return json.loads(clean[idx:])
+                    except json.JSONDecodeError:
+                        pass
                 # Model returned plain text instead of JSON — treat as a reply
                 log.warning("Orchestrator returned plain text, wrapping as reply: %s", result_text[:200])
                 return {"action": "reply", "text": result_text.strip()}
@@ -923,14 +947,17 @@ class Orchestrator:
             return None
 
     async def _forward_assistant_message(
-        self, chat_id: int, message: AssistantMessage, send_reply: callable = None,
+        self, chat_id: int, message: AssistantMessage,
+        send_reply: callable = None, send_log: callable = None,
     ):
         """Extract and forward useful content from an AssistantMessage.
 
-        Forwards non-JSON text blocks as orchestrator commentary, and tool use
-        blocks as activity indicators. Persists forwarded text to the store.
+        Forwards non-JSON text blocks and tool use blocks as orchestrator
+        activity. When send_log is provided, output goes to the monitor
+        panel (ephemeral, not persisted). Otherwise falls back to send_reply.
         """
-        if send_reply is None:
+        log_fn = send_log or send_reply
+        if log_fn is None:
             return
 
         for block in message.content:
@@ -958,7 +985,7 @@ class Orchestrator:
                         continue
                 # Forward non-JSON text as orchestrator commentary
                 formatted = format_channel_orchestrator(text)
-                await self._reply(chat_id, send_reply, formatted)
+                await log_fn(formatted)
 
             elif isinstance(block, ToolUseBlock):
                 # Show tool activity as a system-style message
@@ -967,7 +994,7 @@ class Orchestrator:
                     # Include a snippet of the input for context
                     snippet = json.dumps(block.input, ensure_ascii=False)[:200]
                     tool_msg += f": {snippet}"
-                await send_reply(tool_msg)
+                await log_fn(tool_msg)
 
     def _make_can_use_tool(self, chat_id: int):
         """Create a can_use_tool callback for the orchestrator session.

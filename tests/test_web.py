@@ -254,7 +254,7 @@ async def test_ws_message_uses_active_channel(aiohttp_client):
         ch_id = await store.create_channel("routed-ch")
         called = {}
 
-        async def mock_route(chat_id, text, send_reply, default_direct=False):
+        async def mock_route(chat_id, text, send_reply, default_direct=False, send_log=None):
             called["chat_id"] = chat_id
             called["text"] = text
             called["default_direct"] = default_direct
@@ -292,7 +292,7 @@ async def test_ws_reply_to_client(aiohttp_client):
     try:
         ch_id = await store.create_channel("reply-ch")
 
-        async def mock_route(chat_id, text, send_reply, default_direct=False):
+        async def mock_route(chat_id, text, send_reply, default_direct=False, send_log=None):
             await send_reply("first reply")
             await send_reply("second reply")
 
@@ -474,6 +474,39 @@ async def test_channel_members(aiohttp_client):
         assert data[2]["name"] == "gpu-server/sess-1"
         assert data[2]["role"] == "worker"
         assert data[2]["detail"] == "training run"
+    finally:
+        await mgr.close()
+        await store.close()
+
+
+# ── Monitor log messages ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ws_log_message(aiohttp_client):
+    """send_log callback pushes log messages over WebSocket, separate from replies."""
+    client, web_chat, orch, store, mgr = await _make_web(aiohttp_client)
+    try:
+        ch_id = await store.create_channel("log-ch")
+
+        async def mock_route(chat_id, text, send_reply, default_direct=False, send_log=None):
+            if send_log:
+                await send_log("orchestrator -> Bash: echo hello")
+            await send_reply("orchestrator: done")
+
+        orch.route_message = mock_route
+
+        ws = await client.ws_connect("/ws")
+        await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+        await ws.receive_json()  # consume channel_switched
+
+        await ws.send_json({"type": "message", "text": "do work"})
+
+        msg1 = await ws.receive_json()
+        msg2 = await ws.receive_json()
+        assert msg1 == {"type": "log", "text": "orchestrator -> Bash: echo hello"}
+        assert msg2 == {"type": "reply", "text": "orchestrator: done"}
+
+        await ws.close()
     finally:
         await mgr.close()
         await store.close()
