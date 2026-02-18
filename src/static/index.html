@@ -907,9 +907,9 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-function formatTime() {
-  const now = new Date();
-  return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function formatTime(tsSeconds) {
+  const d = tsSeconds ? new Date(tsSeconds * 1000) : new Date();
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 // ── Status display ──────────────────────────────────────────────────
@@ -989,7 +989,7 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function addMessage(text, cssClass) {
+function addMessage(text, cssClass, tsSeconds) {
   let label = 'Orchestrator';
   let body = text;
 
@@ -1012,7 +1012,7 @@ function addMessage(text, cssClass) {
 
   const time = document.createElement('span');
   time.className = 'msg-time';
-  time.textContent = formatTime();
+  time.textContent = formatTime(tsSeconds);
 
   header.appendChild(sender);
   header.appendChild(time);
@@ -1225,7 +1225,7 @@ function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || !ws || ws.readyState !== WebSocket.OPEN || activeChannel === null) return;
 
-  addMessage(text, 'msg-user');
+  addMessage(text, 'msg-user', Date.now() / 1000);
   ws.send(JSON.stringify({ type: 'message', text: text }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
@@ -1238,10 +1238,10 @@ function loadHistory(channelId) {
       messagesEl.innerHTML = '';
       for (const msg of messages) {
         if (msg.role === 'user') {
-          addMessage(msg.content, 'msg-user');
+          addMessage(msg.content, 'msg-user', msg.ts);
         } else {
           const cls = classifyMessage(msg.content);
-          addMessage(msg.content, 'msg-' + cls);
+          addMessage(msg.content, 'msg-' + cls, msg.ts);
         }
       }
     })
@@ -1391,15 +1391,30 @@ function connect() {
 
       // Log iteration markers
       if (data.data && !data.status) {
-        addLogEntry(data.data);
+        addLogEntry(data.data, data.ts);
+      }
+
+    } else if (data.type === 'channel_status') {
+      const idx = channels.findIndex(c => c.id === data.channel_id);
+      if (idx >= 0) {
+        channels[idx].project_status = data.project_status || channels[idx].project_status;
+        if (data.project_id !== undefined) {
+          channels[idx].project_id = data.project_id;
+        }
+        renderChannelList();
+      }
+      if (activeChannel === data.channel_id) {
+        currentProjectStatus = data.project_status || currentProjectStatus;
+        currentIteration = data.iteration || currentIteration;
+        updateProjectBadge(currentProjectStatus, currentIteration, data.data);
       }
 
     } else if (data.type === 'log') {
-      addLogEntry(data.text);
+      addLogEntry(data.text, data.ts);
 
     } else if (data.type === 'reply') {
       const cls = classifyMessage(data.text);
-      addMessage(data.text, 'msg-' + cls);
+      addMessage(data.text, 'msg-' + cls, data.ts);
       if (activeChannel !== null) loadMembers(activeChannel);
 
     } else if (data.type === 'permission_request') {
@@ -1409,7 +1424,7 @@ function connect() {
       markEscalationResolved(data.request_id, data.resolution);
 
     } else if (data.type === 'error') {
-      addMessage('Error: ' + data.text, 'msg-system');
+      addMessage('Error: ' + data.text, 'msg-system', data.ts);
     }
   };
 }

@@ -25,15 +25,18 @@ class Store:
     def _channel_path(self, chat_id: int) -> str:
         return os.path.join(self._channels_dir, f"{chat_id}.json")
 
+    def _default_channel_data(self, chat_id: int, name: str = "") -> dict:
+        return {
+            "meta": {"name": name or f"Channel {chat_id}", "project_id": None},
+            "messages": [],
+            "notes": [],
+            "logs": [],
+        }
+
     def _load(self, chat_id: int) -> dict:
         path = self._channel_path(chat_id)
         if not os.path.exists(path):
-            return {
-                "meta": {"name": ""},
-                "messages": [],
-                "notes": [],
-                "logs": [],
-            }
+            return self._default_channel_data(chat_id)
         with open(path, "r") as f:
             data = json.load(f)
         # Backward compat
@@ -41,7 +44,13 @@ class Store:
             if key not in data:
                 data[key] = []
         if "meta" not in data:
-            data["meta"] = {"name": f"Channel {chat_id}"}
+            data["meta"] = {"name": f"Channel {chat_id}", "project_id": None}
+        else:
+            meta = data["meta"]
+            if "name" not in meta or not meta["name"]:
+                meta["name"] = f"Channel {chat_id}"
+            if "project_id" not in meta:
+                meta["project_id"] = None
         return data
 
     def _save(self, chat_id: int, data: dict):
@@ -60,20 +69,23 @@ class Store:
 
     async def get_recent_messages(self, chat_id: int) -> list[dict]:
         data = self._load(chat_id)
-        return [{"role": m["role"], "content": m["content"]} for m in data["messages"]]
+        messages = []
+        for m in data["messages"]:
+            messages.append({
+                "role": m.get("role", ""),
+                "content": m.get("content", ""),
+                "ts": m.get("ts"),
+            })
+        return messages
 
     # ── channel management ──
 
-    async def create_channel(self, name: str) -> int:
+    async def create_channel(self, name: str, project_id: str | None = None) -> int:
         """Create a new channel with auto-incremented ID. Returns the chat_id."""
         existing = await self.get_all_channel_ids()
         chat_id = max(existing, default=0) + 1
-        data = {
-            "meta": {"name": name},
-            "messages": [],
-            "notes": [],
-            "logs": [],
-        }
+        data = self._default_channel_data(chat_id, name=name)
+        data["meta"]["project_id"] = project_id or None
         self._save(chat_id, data)
         return chat_id
 
@@ -101,6 +113,27 @@ class Store:
         path = self._channel_path(chat_id)
         if os.path.exists(path):
             os.remove(path)
+
+    async def set_channel_project(self, chat_id: int, project_id: str | None):
+        data = self._load(chat_id)
+        data.setdefault("meta", {})
+        data["meta"]["project_id"] = project_id or None
+        if "name" not in data["meta"] or not data["meta"]["name"]:
+            data["meta"]["name"] = f"Channel {chat_id}"
+        self._save(chat_id, data)
+
+    async def get_channel_project(self, chat_id: int) -> str | None:
+        data = self._load(chat_id)
+        project_id = data.get("meta", {}).get("project_id")
+        return project_id or None
+
+    async def get_channel_project_map(self) -> dict[int, str]:
+        mapping: dict[int, str] = {}
+        for chat_id in await self.get_all_channel_ids():
+            project_id = await self.get_channel_project(chat_id)
+            if project_id:
+                mapping[chat_id] = project_id
+        return mapping
 
     # ── logs (monitor) ──
 

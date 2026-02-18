@@ -1,16 +1,18 @@
-"""Web chat frontend — talk to the orchestrator daemon from localhost:8080.
+"""Web chat frontend.
 
 Multi-channel chat UI served over HTTP + WebSocket. Each channel is connected
-to a remote orchestrator daemon via the Router. Progress events from daemons
-are streamed to the UI in real-time.
+to a remote orchestrator daemon via Router. Progress events are persisted for
+all mapped channels and streamed to currently viewing clients.
 """
 
 import asyncio
 import json
 import logging
+import time
+import uuid
 from pathlib import Path
 
-from aiohttp import web, WSMsgType
+from aiohttp import WSMsgType, web
 
 from .router import Router
 from .store import Store
@@ -32,15 +34,20 @@ class WebChat:
         self._store = store
         self._host = host
         self._port = port
-        self._ws: web.WebSocketResponse | None = None
-        self._active_channel: int | None = None
         self._runner: web.AppRunner | None = None
         self._app: web.Application | None = None
 
+        # Multi-client websocket state
+        self._clients: dict[str, web.WebSocketResponse] = {}
+        self._client_active_channel: dict[str, int | None] = {}
+
         # Wire callbacks
         self._router.set_progress_callback(self._handle_progress)
+        self._router.set_mapping_persist_callback(self._persist_channel_mapping)
 
     async def start(self):
+        await self._hydrate_channel_mappings()
+
         self._app = web.Application()
         self._app.router.add_get("/", self._handle_index)
         self._app.router.add_get("/api/history", self._handle_history)
@@ -56,19 +63,30 @@ class WebChat:
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._host, self._port)
         await site.start()
-        log.info(f"Web chat on http://{self._host}:{self._port}")
+        log.info("Web chat on http://%s:%s", self._host, self._port)
 
     async def stop(self):
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
+        for ws in list(self._clients.values()):
+            if not ws.closed:
+                await ws.close()
+        self._clients.clear()
+        self._client_active_channel.clear()
+
         if self._runner:
             await self._runner.cleanup()
 
-    # ── HTTP handlers ──────────────────────────────────────────────────
+    async def _hydrate_channel_mappings(self):
+        mapping = await self._store.get_channel_project_map()
+        for chat_id, project_id in mapping.items():
+            self._router.hydrate_channel_mapping(chat_id, project_id)
+
+    async def _persist_channel_mapping(self, chat_id: int, project_id: str | None):
+        await self._store.set_channel_project(chat_id, project_id)
+
+    # -- HTTP handlers -------------------------------------------------
 
     async def _handle_index(self, request: web.Request) -> web.Response:
-        index_path = STATIC_DIR / "index.html"
-        return web.FileResponse(index_path)
+        return web.FileResponse(STATIC_DIR / "index.html")
 
     async def _handle_history(self, request: web.Request) -> web.Response:
         channel_str = request.query.get("channel")
@@ -78,16 +96,18 @@ class WebChat:
             channel_id = int(channel_str)
         except ValueError:
             return web.json_response({"error": "invalid channel id"}, status=400)
+
         messages = await self._store.get_recent_messages(channel_id)
         return web.json_response(messages)
 
     async def _handle_channels_list(self, request: web.Request) -> web.Response:
         channels = await self._store.get_channel_list()
-        # Enrich with project info
         for ch in channels:
             project_id = self._router.get_channel_project(ch["id"])
             ch["project_id"] = project_id
-            ch["project_status"] = self._router.get_project_status(project_id) if project_id else "unconnected"
+            ch["project_status"] = (
+                self._router.get_project_status(project_id) if project_id else "unconnected"
+            )
         return web.json_response(channels)
 
     async def _handle_channels_create(self, request: web.Request) -> web.Response:
@@ -95,21 +115,31 @@ class WebChat:
         name = body.get("name", "").strip()
         if not name:
             return web.json_response({"error": "name is required"}, status=400)
-        chat_id = await self._store.create_channel(name)
 
-        # Auto-connect if project_id provided
         project_id = body.get("project_id", "").strip()
+        if project_id and not self._router.has_project(project_id):
+            return web.json_response({"error": f"unknown project_id: {project_id}"}, status=400)
+
+        chat_id = await self._store.create_channel(name, project_id=project_id or None)
+
         if project_id:
             await self._router.connect_channel(chat_id, project_id)
 
-        return web.json_response({"id": chat_id, "name": name, "project_id": project_id})
+        return web.json_response({"id": chat_id, "name": name, "project_id": project_id or None})
 
     async def _handle_channels_delete(self, request: web.Request) -> web.Response:
         try:
             channel_id = int(request.match_info["id"])
         except (ValueError, KeyError):
             return web.json_response({"error": "invalid channel id"}, status=400)
+
         await self._store.delete_channel(channel_id)
+        await self._router.disconnect_channel(channel_id)
+
+        for client_id, active_channel in list(self._client_active_channel.items()):
+            if active_channel == channel_id:
+                self._client_active_channel[client_id] = None
+
         return web.json_response({"ok": True})
 
     async def _handle_channels_members(self, request: web.Request) -> web.Response:
@@ -118,18 +148,26 @@ class WebChat:
         except (ValueError, KeyError):
             return web.json_response({"error": "invalid channel id"}, status=400)
 
+        viewer_count = sum(1 for ch in self._client_active_channel.values() if ch == channel_id)
         members = [
-            {"name": "You", "role": "user"},
+            {
+                "name": "Humans",
+                "role": "user",
+                "detail": f"{viewer_count} active viewer(s)",
+            }
         ]
+
         project_id = self._router.get_channel_project(channel_id)
         if project_id:
             orch = self._router._orchestrators.get(project_id)
             if orch:
-                members.append({
-                    "name": f"Orchestrator ({orch.name})",
-                    "role": "orchestrator",
-                    "detail": f"{project_id} — {orch.status}",
-                })
+                members.append(
+                    {
+                        "name": f"Orchestrator ({orch.name})",
+                        "role": "orchestrator",
+                        "detail": f"{project_id} — {orch.status}",
+                    }
+                )
 
         return web.json_response(members)
 
@@ -141,56 +179,54 @@ class WebChat:
             channel_id = int(channel_str)
         except ValueError:
             return web.json_response({"error": "invalid channel id"}, status=400)
+
         logs = await self._store.get_logs(channel_id)
         return web.json_response(logs)
 
     async def _handle_projects_list(self, request: web.Request) -> web.Response:
-        """GET /api/projects — list configured orchestrator projects."""
         result = []
         for orch in self._router.list_orchestrators():
-            result.append({
-                "project_id": orch.project_id,
-                "name": orch.name,
-                "host": orch.host,
-                "status": orch.status,
-                "project_dir": orch.project_dir,
-            })
+            result.append(
+                {
+                    "project_id": orch.project_id,
+                    "name": orch.name,
+                    "host": orch.host,
+                    "status": orch.status,
+                    "project_dir": orch.project_dir,
+                }
+            )
         return web.json_response(result)
 
-    # ── WebSocket handler ──────────────────────────────────────────────
+    # -- WebSocket -----------------------------------------------------
 
     async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = ws
-        self._active_channel = None
+        client_id = uuid.uuid4().hex[:12]
+        self._clients[client_id] = ws
+        self._client_active_channel[client_id] = None
 
-        log.info("WebSocket client connected")
+        log.info("WebSocket client connected: %s", client_id)
 
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
-                    await self._handle_ws_message(msg.data)
+                    await self._handle_ws_message(client_id, msg.data)
                 elif msg.type == WSMsgType.ERROR:
-                    log.error(f"WebSocket error: {ws.exception()}")
+                    log.error("WebSocket error for %s: %s", client_id, ws.exception())
         finally:
-            if self._ws is ws:
-                if self._active_channel is not None:
-                    self._router.remove_channel_status_callback(self._active_channel)
-                self._ws = None
-                self._active_channel = None
-            log.info("WebSocket client disconnected")
+            self._clients.pop(client_id, None)
+            self._client_active_channel.pop(client_id, None)
+            log.info("WebSocket client disconnected: %s", client_id)
 
         return ws
 
-    async def _handle_ws_message(self, raw: str):
+    async def _handle_ws_message(self, client_id: str, raw: str):
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            await self._ws_send({"type": "error", "text": "Invalid JSON"})
+            await self._ws_send_to_client(client_id, {"type": "error", "text": "Invalid JSON"})
             return
 
         msg_type = data.get("type")
@@ -198,129 +234,175 @@ class WebChat:
         if msg_type == "switch_channel":
             channel_id = data.get("channel_id")
             if channel_id is None:
-                await self._ws_send({"type": "error", "text": "missing channel_id"})
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "missing channel_id"})
                 return
-            if self._active_channel is not None:
-                self._router.remove_channel_status_callback(self._active_channel)
-            self._active_channel = int(channel_id)
 
-            # Register status callback for this channel
-            async def send_status(event: dict):
-                await self._ws_send({"type": "progress", **event})
-            self._router.set_channel_status_callback(self._active_channel, send_status)
-
-            # Send current project status
-            project_id = self._router.get_channel_project(self._active_channel)
+            self._client_active_channel[client_id] = int(channel_id)
+            project_id = self._router.get_channel_project(int(channel_id))
             status = self._router.get_project_status(project_id) if project_id else "unconnected"
-            await self._ws_send({
-                "type": "channel_switched",
-                "channel_id": self._active_channel,
-                "project_id": project_id,
-                "project_status": status,
-            })
+            await self._ws_send_to_client(
+                client_id,
+                {
+                    "type": "channel_switched",
+                    "channel_id": int(channel_id),
+                    "project_id": project_id,
+                    "project_status": status,
+                },
+            )
+            return
 
-        elif msg_type == "message":
-            if self._active_channel is None:
-                await self._ws_send({"type": "error", "text": "No channel selected"})
+        if msg_type == "message":
+            channel_id = self._client_active_channel.get(client_id)
+            if channel_id is None:
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "No channel selected"})
                 return
 
             text = data.get("text", "").strip()
             if not text:
                 return
 
-            chat_id = self._active_channel
+            await self._store.add_message(channel_id, "user", text)
 
             async def send_reply(msg: str):
-                await self._store.add_message(chat_id, "assistant", msg)
-                await self._ws_send({"type": "reply", "text": msg})
+                ts = time.time()
+                await self._store.add_message(channel_id, "assistant", msg)
+                await self._ws_send_to_channel(channel_id, {"type": "reply", "text": msg, "ts": ts})
 
             async def send_log(msg: str):
-                await self._store.add_log(chat_id, msg)
-                await self._ws_send({"type": "log", "text": msg})
+                ts = time.time()
+                await self._store.add_log(channel_id, msg)
+                await self._ws_send_to_channel(channel_id, {"type": "log", "text": msg, "ts": ts})
 
-            # Save user message
-            await self._store.add_message(chat_id, "user", text)
+            asyncio.create_task(self._router.route_message(channel_id, text, send_reply, send_log))
+            return
 
-            # Route everything through the router (including /connect)
-            asyncio.create_task(
-                self._router.route_message(chat_id, text, send_reply, send_log)
+        if msg_type == "permission_response":
+            # Backward compatibility for older frontend cards.
+            await self._ws_send_to_client(
+                client_id,
+                {
+                    "type": "error",
+                    "text": "Permission escalation is not active in this build.",
+                },
             )
+            return
 
-        else:
-            await self._ws_send({"type": "error", "text": f"Unknown message type: {msg_type}"})
+        await self._ws_send_to_client(client_id, {"type": "error", "text": f"Unknown message type: {msg_type}"})
 
-    # ── Progress callback (from router) ───────────────────────────────
+    # -- Progress callback --------------------------------------------
 
     async def _handle_progress(self, project_id: str, event: dict):
-        """Handle a progress event from a daemon (via router).
+        chat_ids = self._router.get_channels_for_project(project_id)
+        if not chat_ids:
+            return
 
-        Routing:
-          text, tool_use, tool_error → monitor log (not chat)
-          iteration → progress indicator
-          done, stuck → chat reply + progress indicator
-          error → progress indicator
-        """
-        # Find which channel this project is connected to
-        for chat_id, pid in self._router._channel_project.items():
-            if pid == project_id and chat_id == self._active_channel:
-                event_type = event.get("type", "")
-                data_text = event.get("data", "")
-                iteration = event.get("iteration", 0)
+        event_type = event.get("type", "")
+        data_text = event.get("data", "")
+        iteration = event.get("iteration", 0)
+        ts = event.get("ts")
 
-                if event_type == "text":
-                    # Intermediate orchestrator text → monitor only
-                    await self._ws_send({"type": "log", "text": data_text})
-                    await self._store.add_log(chat_id, data_text)
-                elif event_type == "tool_use":
-                    await self._ws_send({"type": "log", "text": f"→ {data_text}"})
-                    await self._store.add_log(chat_id, f"→ {data_text}")
-                elif event_type == "tool_error":
-                    await self._ws_send({"type": "log", "text": f"[ERROR] {data_text}"})
-                    await self._store.add_log(chat_id, f"[ERROR] {data_text}")
-                elif event_type == "iteration":
-                    await self._ws_send({
-                        "type": "progress",
-                        "data": data_text,
-                        "iteration": iteration,
-                    })
-                elif event_type == "done":
-                    await self._ws_send({
-                        "type": "progress",
-                        "data": data_text,
-                        "iteration": iteration,
-                        "status": "done",
-                    })
-                    if data_text:
-                        await self._ws_send({"type": "reply", "text": f"Task complete: {data_text}"})
-                        await self._store.add_message(chat_id, "assistant", f"Task complete: {data_text}")
-                elif event_type == "stuck":
-                    await self._ws_send({
-                        "type": "progress",
-                        "data": data_text,
-                        "iteration": iteration,
-                        "status": "stuck",
-                    })
-                    if data_text:
-                        await self._ws_send({"type": "reply", "text": f"Needs input: {data_text}"})
-                        await self._store.add_message(chat_id, "assistant", f"Needs input: {data_text}")
-                elif event_type == "error":
-                    await self._ws_send({
-                        "type": "progress",
-                        "data": data_text,
-                        "iteration": iteration,
-                        "status": "error",
-                    })
-                    if data_text:
-                        await self._ws_send({"type": "log", "text": f"[ERROR] {data_text}"})
-                        await self._store.add_log(chat_id, f"[ERROR] {data_text}")
-                break
+        for chat_id in chat_ids:
+            await self._persist_and_emit_progress(chat_id, project_id, event_type, data_text, iteration, ts)
 
-    # ── Helpers ────────────────────────────────────────────────────────
+    async def _persist_and_emit_progress(
+        self,
+        chat_id: int,
+        project_id: str,
+        event_type: str,
+        data_text: str,
+        iteration: int,
+        ts: float | None,
+    ):
+        if event_type == "text":
+            await self._store.add_log(chat_id, data_text)
+            await self._ws_send_to_channel(chat_id, {"type": "log", "text": data_text, "ts": ts})
+        elif event_type == "tool_use":
+            line = f"→ {data_text}"
+            await self._store.add_log(chat_id, line)
+            await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
+        elif event_type == "tool_error":
+            line = f"[ERROR] {data_text}"
+            await self._store.add_log(chat_id, line)
+            await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
+        elif event_type == "iteration":
+            await self._ws_send_to_channel(
+                chat_id,
+                {"type": "progress", "data": data_text, "iteration": iteration, "ts": ts},
+            )
+        elif event_type == "done":
+            await self._ws_send_to_channel(
+                chat_id,
+                {
+                    "type": "progress",
+                    "data": data_text,
+                    "iteration": iteration,
+                    "status": "done",
+                    "ts": ts,
+                },
+            )
+            if data_text:
+                msg = f"Task complete: {data_text}"
+                await self._store.add_message(chat_id, "assistant", msg)
+                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "ts": ts})
+        elif event_type == "stuck":
+            await self._ws_send_to_channel(
+                chat_id,
+                {
+                    "type": "progress",
+                    "data": data_text,
+                    "iteration": iteration,
+                    "status": "stuck",
+                    "ts": ts,
+                },
+            )
+            if data_text:
+                msg = f"Needs input: {data_text}"
+                await self._store.add_message(chat_id, "assistant", msg)
+                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "ts": ts})
+        elif event_type == "error":
+            await self._ws_send_to_channel(
+                chat_id,
+                {
+                    "type": "progress",
+                    "data": data_text,
+                    "iteration": iteration,
+                    "status": "error",
+                    "ts": ts,
+                },
+            )
+            if data_text:
+                line = f"[ERROR] {data_text}"
+                await self._store.add_log(chat_id, line)
+                await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
 
-    async def _ws_send(self, data: dict):
-        """Send JSON over WebSocket, guarding against closed connection."""
-        if self._ws and not self._ws.closed:
-            try:
-                await self._ws.send_json(data)
-            except (ConnectionError, RuntimeError):
-                log.warning("Failed to send WebSocket message (connection closed)")
+        project_status = self._router.get_project_status(project_id)
+        await self._ws_broadcast(
+            {
+                "type": "channel_status",
+                "channel_id": chat_id,
+                "project_id": project_id,
+                "project_status": project_status,
+                "iteration": iteration,
+                "data": data_text,
+            }
+        )
+
+    # -- WS send helpers ----------------------------------------------
+
+    async def _ws_send_to_client(self, client_id: str, data: dict):
+        ws = self._clients.get(client_id)
+        if not ws or ws.closed:
+            return
+        try:
+            await ws.send_json(data)
+        except (ConnectionError, RuntimeError):
+            log.warning("Failed to send WebSocket message to %s", client_id)
+
+    async def _ws_send_to_channel(self, channel_id: int, data: dict):
+        for client_id, active_channel in list(self._client_active_channel.items()):
+            if active_channel == channel_id:
+                await self._ws_send_to_client(client_id, data)
+
+    async def _ws_broadcast(self, data: dict):
+        for client_id in list(self._clients.keys()):
+            await self._ws_send_to_client(client_id, data)

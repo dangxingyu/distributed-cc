@@ -115,12 +115,14 @@ class Project:
 class ProgressEvent:
     """An event streamed to SSE subscribers and the router callback."""
     type: str           # text, tool_use, tool_result, tool_error, iteration, done, stuck, error
+    event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     data: str = ""
     iteration: int = 0
     timestamp: float = field(default_factory=time.time)
 
     def to_sse(self) -> str:
         payload = json.dumps({
+            "event_id": self.event_id,
             "type": self.type,
             "data": self.data,
             "iteration": self.iteration,
@@ -178,6 +180,7 @@ async def emit_progress(project_id: str, event: ProgressEvent):
                     "project_id": project_id,
                     "daemon_name": DAEMON_NAME,
                     "event": {
+                        "event_id": event.event_id,
                         "type": event.type,
                         "data": event.data,
                         "iteration": event.iteration,

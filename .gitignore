@@ -1,5 +1,7 @@
 # Local config (has machine-specific paths)
 config.yaml
+config.json
+CLAUDE.md
 
 # Runtime data
 data/

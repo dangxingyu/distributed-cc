@@ -29,15 +29,12 @@ log = logging.getLogger(__name__)
 
 async def handle_progress(request: web.Request) -> web.Response:
     """POST /progress — daemon sends progress events."""
-    # This is handled by the SSE listener in the router, but daemons can also
-    # push events directly via HTTP callback for reliability.
     router: Router = request.app["router"]
     try:
         data = await request.json()
         project_id = data.get("project_id", "")
         event = data.get("event", {})
-        if router._progress_callback:
-            await router._progress_callback(project_id, event)
+        await router.ingest_progress_event(project_id, event, source="callback")
         return web.json_response({"ok": True})
     except Exception as e:
         log.exception(f"Progress callback error: {e}")
