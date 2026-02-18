@@ -100,8 +100,13 @@ next steps autonomously. If the professor doesn't respond, figure it out yoursel
 You are in a project channel. Each channel is one project.
 
 SETUP: At the start of a conversation, look for local config files in the working directory: \
-`config.md`, `setup.md`, or `config.json`. Read whichever exist for server \
-details, project context, and extra instructions.
+`config.md` or `setup.md`. Read whichever exist for project context and extra instructions. \
+Server and worker info is already provided in each message — no need to read config.json.
+
+=== AVAILABLE SERVERS ===
+
+Each message starts with an [AVAILABLE SERVERS] block listing servers you can create workers on. \
+Use these server names with create_worker or assign actions.
 
 === RESPONSE FORMAT ===
 
@@ -209,7 +214,7 @@ direct requests. Acknowledge naturally within your response.
 SETUP_PROMPT = """\
 [SETUP TASK]
 Set up server connections. Use Bash to SSH in, install broker, start it, open tunnels, \
-and verify. Read local config files (`config.md`, `config.json`, etc.) for server details.
+and verify. Server details are in [AVAILABLE SERVERS] above. Read `config.md` for extra context.
 
 For each remote server:
 1. Check/install broker: `ssh <host> 'test -f ~/.distributed-cc/remote_broker.py && echo ok || \
@@ -542,9 +547,13 @@ class Orchestrator:
             if args:
                 task_prompt += f"\nUser specified: {args}\n"
 
-        # Prepend channel workers context
+        # Prepend server + worker context
         workers = await self._store.get_channel_workers(chat_id)
-        context = self._format_channel_workers(workers)
+        context = (
+            self._format_available_servers()
+            + "\n"
+            + self._format_channel_workers(workers)
+        )
         augmented_text = f"{context}\n{task_prompt}[USER MESSAGE]\n{user_text}"
 
         # Store send_reply so the can_use_tool callback can route questions
@@ -1401,6 +1410,20 @@ class Orchestrator:
         return {"answers": None, "reason": "Orchestrator could not answer"}
 
     # ── Helpers ─────────────────────────────────────────────────────────
+
+    def _format_available_servers(self) -> str:
+        """Format registered servers for injection into orchestrator messages."""
+        servers = self._session_mgr.list_servers()
+        if not servers:
+            return "[AVAILABLE SERVERS]\n  (none — use /setup or register_server)"
+        lines = ["[AVAILABLE SERVERS]"]
+        for s in servers:
+            host = s.host or "localhost"
+            parts = [f"{s.name} ({host}, broker_port: {s.broker_port})"]
+            if s.work_dir:
+                parts.append(f"work_dir: {s.work_dir}")
+            lines.append(f"  " + ", ".join(parts))
+        return "\n".join(lines)
 
     @staticmethod
     def _format_channel_workers(workers: list[ChannelWorker]) -> str:
