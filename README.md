@@ -1,193 +1,179 @@
-# distributed-cc
+# Distributed Claude Code
 
-Distribute Claude Code sessions across multiple servers with an autonomous orchestrator.
+Run Claude Code sessions across multiple servers from a single chat interface on your laptop.
 
 ```
-┌─────────────────────────────────────┐
-│  Laptop (Router)                    │
-│  src/main.py → Web UI :8080        │
-│  Callback HTTP :9120 (permissions)  │
-└──────┬──────────────────────────────┘
-       │ SSH tunnels (-L/-R)
-       ├──────────────────────────────┐
-       │                              │
-┌──────▼──────────────────┐   ┌──────▼──────────────────┐
-│  Server A               │   │  Server B               │
-│  orchestrator_daemon.py │   │  orchestrator_daemon.py │
-│  :8200                  │   │  :8201                  │
-│                         │   │                         │
-│  RALPH Loop             │   │  RALPH Loop             │
-│  (Agent SDK → tools)    │   │  (Agent SDK → tools)    │
-└─────────────────────────┘   └─────────────────────────┘
+You (laptop)                          Remote servers
+┌──────────────────────┐
+│  Web UI :8080        │     SSH      ┌──────────────────────┐
+│  ┌────────────────┐  │◄────────────►│  Server A            │
+│  │  Router        │  │              │  Daemon :8200        │
+│  │  /setup        │  │     SSH      │  (autonomous agent)  │
+│  │  /connect      │  │◄────────────►├──────────────────────┤
+│  │  Sysadmin CLI  │  │              │  Server B            │
+│  └────────────────┘  │              │  Daemon :8200        │
+└──────────────────────┘              └──────────────────────┘
 ```
 
-Each project maps to a Slack-like channel in the web UI. The user sends a task, the **router** relays it to a remote **orchestrator daemon**, which autonomously works on it via a RALPH loop (Reason → Act → Learn → Plan → Hypothesize). Progress streams back in real-time via SSE. User messages to a running task become interruptions injected at the next iteration boundary.
+Send a task, and an autonomous agent on the remote server works on it — reading files, writing code, running tests — streaming progress back in real-time. Think of it as having PhD students on different machines that you supervise from one place.
 
-The orchestrator daemon uses the Claude Agent SDK directly — it reads files, writes code, runs tests, and evaluates results autonomously, like a PhD student working on a research task. It only pauses when genuinely stuck and needing user input.
+## Quick Start
 
-## Usage
-
-Open the **web app** at `http://localhost:8080`. Create a channel, connect it to a project with `/connect <project-id>`, and send your task.
-
-| Action | What happens |
-|--------|-------------|
-| Send message (project idle) | Starts a new RALPH loop task on the daemon |
-| Send message (task running) | Queued as interruption for next iteration |
-| `/connect <project-id>` | Link channel to a remote project |
-| `/stop` | Stop the running task |
-| `/status` | Show current task status and iteration |
-
-Progress events (tool calls, text output, iteration markers) stream into the monitor panel. Permission escalations for unknown tools appear as inline cards with approve/deny buttons.
-
-## Setup
-
-Three components: **daemon** on each remote server, **SSH tunnels**, and the **router** on your laptop.
-
-### Step 1: Install the daemon on each remote server
-
-The daemon is an autonomous agent that receives tasks and works on them independently.
-
-**Option A — Deploy from your laptop**:
-```bash
-make deploy HOST=user@server-a NAME=server-a
-```
-
-**Option B — One-line installer** (on the remote server):
-```bash
-curl -fsSL https://raw.githubusercontent.com/dangxingyu/distributed-cc/main/tools/install-broker.sh | bash
-```
-
-Both install to `~/.distributed-cc/` on the remote, set up a venv, and install dependencies (`claude-agent-sdk`, `aiohttp`).
-
-**Prerequisite**: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and authenticated on each remote server.
-
-### Step 2: Start the daemon
-
-On the remote server, start the daemon in a persistent session (tmux/screen):
-
-```bash
-# In tmux on server-a:
-~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py \
-    --port 8200 --name server-a --callback-url http://127.0.0.1:9120
-```
-
-The daemon listens on `:8200` and runs RALPH loop tasks autonomously. One daemon per server.
-
-### Step 3: Open SSH tunnels
-
-Each remote server needs two tunnels from your laptop:
-
-- **Forward tunnel** (`-L`): lets the router send tasks to the remote daemon
-- **Reverse tunnel** (`-R`): lets the remote daemon send permission escalations back
-
-```bash
-# One command per server (from your laptop):
-ssh -N \
-    -L 8201:localhost:8200 \
-    -R 9120:localhost:9120 \
-    user@server-a
-```
-
-For multiple servers, use different local ports (`-L 8201`, `-L 8202`, etc.).
-
-### Step 4: Configure the router
+### 1. Install
 
 ```bash
 git clone https://github.com/dangxingyu/distributed-cc.git
 cd distributed-cc
 uv sync --extra dev
-
-cp config.example.json config.json
 ```
 
-Edit `config.json` — the router reads this on startup to discover orchestrator daemons:
+### 2. Set up a remote server
 
-```json
-{
-  "orchestrators": [
-    {
-      "project_id": "my-project",
-      "name": "server-a",
-      "host": "user@server-a",
-      "broker_port": 8201,
-      "project_dir": "/path/to/project",
-      "max_iterations": 20
-    },
-    {
-      "project_id": "local-dev",
-      "name": "local",
-      "host": null,
-      "broker_port": 8200,
-      "project_dir": "/Users/me/project"
-    }
-  ]
-}
-```
-
-### Step 5: Start the router
+The easiest way is the built-in `/setup` command, which SSHs into the server, installs everything, and configures it for you:
 
 ```bash
-make run    # Web app at localhost:8080
+make run
+# Open http://localhost:8080, then type:
+/setup user@your-server.example.com
 ```
 
-The router starts the web UI on `:8080` and a callback HTTP server on `:9120` (for daemon permission escalations). It connects to each daemon, registers projects, and begins listening for SSE progress events.
+The sysadmin session will:
+- Probe the server (OS, Python, GPUs, etc.)
+- Install the daemon and dependencies
+- Update your local `config.json`
+- Tell you what SSH tunnel command to run
 
-### Startup order summary
+Or do it manually — see [Manual Setup](#manual-setup) below.
 
-1. **Daemon** on each remote server (persistent — start once)
-2. **SSH tunnels** from your laptop (persistent — start once per server)
-3. **Router** on your laptop (start per work session)
+### 3. Open SSH tunnels
+
+Each remote server needs two tunnels (one command per server):
+
+```bash
+ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@your-server
+```
+
+- `-L` lets your laptop reach the remote daemon
+- `-R` lets the daemon send permission requests back to you
+
+Use different local ports for each server (`8201`, `8202`, etc.).
+
+### 4. Start working
+
+Open `http://localhost:8080`. Create a channel, connect it to a project, and send your task:
+
+```
+/connect my-project
+Investigate why the training loss plateaus — might be reward hacking
+```
+
+The remote agent starts working autonomously. You'll see tool calls, text output, and iteration progress streaming in real-time.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/connect <project-id>` | Link this channel to a remote project |
+| `/status` | Show current task status and iteration count |
+| `/stop` | Stop the running task |
+| `/setup <user@host>` | Deploy a daemon to a new server (interactive) |
+| `/setup` | Health-check all configured servers |
+| `/done` | Exit setup mode |
+
+When a task is running, any message you send becomes an interruption — picked up at the next iteration boundary.
 
 ## Configuration
 
-The router reads `config.json` from the working directory on startup. Key fields:
+The router reads `config.json` on startup:
 
-- **orchestrators** — list of remote/local daemons with project IDs, ports, and directories
-- **broker_port** — local port for the SSH forward tunnel (must match `-L` flag)
-- **max_iterations** — maximum RALPH loop iterations before auto-stopping (default: 20)
+```json
+{
+  "servers": [
+    {
+      "name": "server-a",
+      "host": "user@server-a.example.com",
+      "broker_port": 8201
+    },
+    {
+      "name": "local",
+      "host": null,
+      "broker_port": 8200
+    }
+  ],
+  "orchestrator": {
+    "model": "claude-opus-4-6"
+  }
+}
+```
 
-Optionally, create a `config.md` alongside `config.json` for extra instructions
-(server notes, rules, preferences). The daemon reads it for additional context.
-See `config.example.md` for an example.
+- **name** — friendly label for the server
+- **host** — SSH destination (`user@host`), or `null` for local
+- **broker_port** — local port for the SSH tunnel (must match your `-L` flag)
+
+Copy `config.example.json` to get started: `cp config.example.json config.json`
+
+## Manual Setup
+
+If you prefer to set up servers yourself instead of using `/setup`:
+
+**On the remote server:**
+
+```bash
+# Install uv (if missing)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Deploy the daemon
+mkdir -p ~/.distributed-cc
+# Copy orchestrator_daemon.py to the server (from your laptop):
+# scp tools/orchestrator_daemon.py user@server:~/.distributed-cc/
+
+# Install dependencies
+cd ~/.distributed-cc
+uv venv .venv
+uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp
+
+# Start the daemon (in tmux for persistence)
+tmux new-session -d -s daemon \
+  '.venv/bin/python3 orchestrator_daemon.py --port 8200 --name server-a --callback-url http://127.0.0.1:9120'
+```
+
+**Prerequisite**: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and authenticated on each remote server.
+
+**Verify it's running** (after SSH tunnel is up):
+
+```bash
+curl http://127.0.0.1:8201/health
+```
 
 ## Testing
 
 ```bash
-make test         # Unit/integration tests (no Claude calls, 70 tests)
-make test-e2e     # End-to-end tests (costs money)
+make test         # Unit tests (~90 tests, no API calls)
+make test-e2e     # End-to-end tests (calls Claude, costs money)
 ```
 
 ## Project Structure
 
 ```
 src/
-  main.py          — entry point, wires Router + WebChat + callback server
-  router.py        — thin relay: routes messages, manages permissions, SSE listener
-  web.py           — web chat frontend (localhost:8080)
-  store.py         — JSON file persistence (messages, channels, notes, logs)
-  session.py       — server config data model
-  formatter.py     — output formatting utilities
+  main.py         — entry point: Router + WebChat + callback server
+  router.py       — routes messages to daemons, manages setup mode
+  setup.py        — sysadmin session for /setup (local Agent SDK)
+  web.py          — web chat frontend (HTTP + WebSocket)
+  store.py        — JSON file persistence
   static/
-    index.html     — single-page chat UI
+    index.html    — single-page chat UI
 
 tools/
-  orchestrator_daemon.py  — autonomous RALPH loop daemon (deploys to remote servers)
-  remote_broker.py        — legacy broker (kept for backward compat)
-  deploy.sh               — deploy daemon via SSH/SCP
-  install-broker.sh       — one-line remote installer
-  start_tunnels.sh        — SSH tunnel helper
+  orchestrator_daemon.py  — autonomous agent daemon (runs on remote servers)
 
-config.example.json  — example configuration
-config.example.md    — example extra instructions (optional)
+docs/
+  design-philosophy.md    — Professor → PhD Student → Claude Code model
+  broker-guide.md         — detailed daemon operations guide
 ```
-
-## Documentation
-
-- [Design Philosophy](docs/design-philosophy.md) — Core design philosophy (Professor → PhD Student → Claude Code model)
-- [Daemon Guide](docs/broker-guide.md) — Daemon deployment & operations
 
 ## Requirements
 
 - Python 3.10+
-- [uv](https://docs.astral.sh/uv/) for dependency management
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated on each remote server
+- [uv](https://docs.astral.sh/uv/)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on each remote server
