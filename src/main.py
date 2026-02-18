@@ -73,16 +73,6 @@ async def handle_clarification(request: web.Request) -> web.Response:
         return web.json_response({"answers": None, "reason": str(e)}, status=500)
 
 
-async def handle_heartbeat(request: web.Request) -> web.Response:
-    orchestrator: Orchestrator = request.app["orchestrator"]
-    try:
-        data = await request.json()
-        orchestrator.handle_heartbeat(data)
-        return web.json_response({"ok": True})
-    except Exception as e:
-        log.exception(f"Heartbeat error: {e}")
-        return web.json_response({"ok": False, "reason": str(e)}, status=500)
-
 
 async def start_http_server(app: web.Application, port: int):
     runner = web.AppRunner(app)
@@ -139,7 +129,6 @@ async def main():
     http_app["orchestrator"] = orchestrator
     http_app.router.add_post("/permission", handle_permission)
     http_app.router.add_post("/clarification", handle_clarification)
-    http_app.router.add_post("/heartbeat", handle_heartbeat)
     http_runner = await start_http_server(http_app, http_cfg.get("port", 9120))
 
     # Frontend

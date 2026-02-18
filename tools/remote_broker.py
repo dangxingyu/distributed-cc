@@ -41,7 +41,6 @@ log = logging.getLogger("broker")
 ORCHESTRATOR_URL = os.environ.get("ORCH_URL", "http://127.0.0.1:9120")
 SERVER_NAME = os.environ.get("SERVER_NAME", "unknown")
 DEFAULT_WORK_DIR = "."
-HEARTBEAT_INTERVAL = 30  # seconds
 
 
 # ── Session tracking ───────────────────────────────────────────────────
@@ -197,38 +196,6 @@ async def run_agent_task(
         await http.close()
 
 
-# ── Heartbeat ─────────────────────────────────────────────────────────
-
-async def _send_heartbeat():
-    """POST current session list to orchestrator."""
-    payload = {
-        "server_name": SERVER_NAME,
-        "sessions": [
-            {
-                "session_id": s.session_id,
-                "work_dir": s.work_dir,
-                "description": s.description,
-                "status": s.status,
-            }
-            for s in sessions.values()
-        ],
-    }
-    try:
-        async with ClientSession(timeout=ClientTimeout(total=5)) as http:
-            async with http.post(f"{ORCHESTRATOR_URL}/heartbeat", json=payload) as resp:
-                if resp.status != 200:
-                    log.warning(f"Heartbeat failed: HTTP {resp.status}")
-    except Exception as e:
-        log.debug(f"Heartbeat failed (orchestrator unreachable): {e}")
-
-
-async def _heartbeat_loop():
-    """Periodically send heartbeat to orchestrator."""
-    while True:
-        await _send_heartbeat()
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
-
-
 # ── HTTP handlers ──────────────────────────────────────────────────────
 
 async def handle_run(request: web.Request) -> web.Response:
@@ -301,8 +268,6 @@ async def handle_register(request: web.Request) -> web.Response:
         )
         log.info(f"Registered session {session_id}: work_dir={work_dir}")
 
-    # Notify orchestrator immediately
-    asyncio.create_task(_send_heartbeat())
     return web.json_response({"ok": True, "session_id": session_id})
 
 
@@ -316,7 +281,6 @@ async def handle_unregister(request: web.Request) -> web.Response:
     removed = sessions.pop(session_id, None)
     if removed:
         log.info(f"Unregistered session {session_id}")
-        asyncio.create_task(_send_heartbeat())
         return web.json_response({"ok": True})
     return web.json_response({"ok": False, "reason": "Session not found"})
 
@@ -375,20 +339,6 @@ def main():
     app.router.add_get("/sessions", handle_sessions)
     app.router.add_post("/kill", handle_kill)
     app.router.add_get("/health", handle_health)
-
-    # Start heartbeat loop as background task
-    async def start_background(app):
-        app["heartbeat"] = asyncio.create_task(_heartbeat_loop())
-
-    async def stop_background(app):
-        app["heartbeat"].cancel()
-        try:
-            await app["heartbeat"]
-        except asyncio.CancelledError:
-            pass
-
-    app.on_startup.append(start_background)
-    app.on_cleanup.append(stop_background)
 
     web.run_app(app, host="127.0.0.1", port=args.port)
 

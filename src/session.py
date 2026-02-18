@@ -56,7 +56,7 @@ class SessionManager:
         self._servers = {s.name: s for s in servers}
         self._model = default_model
         self._http: aiohttp.ClientSession | None = None
-        # Dynamic sessions reported by broker heartbeats
+        # Sessions registered via register_session()
         # key: server_name → {session_id → RemoteSession}
         self._remote_sessions: dict[str, dict[str, RemoteSession]] = {}
 
@@ -83,37 +83,12 @@ class SessionManager:
     def _broker_url(self, server: ServerConfig) -> str:
         return f"http://127.0.0.1:{server.broker_port}"
 
-    # ── Dynamic session management ────────────────────────────────────
-
-    def update_sessions(self, server_name: str, sessions: list[dict]):
-        """Update session registry from broker heartbeat."""
-        self._remote_sessions[server_name] = {
-            s["session_id"]: RemoteSession(
-                session_id=s["session_id"],
-                work_dir=s["work_dir"],
-                description=s.get("description", ""),
-                status=s.get("status", "idle"),
-            )
-            for s in sessions
-        }
-        log.info(
-            f"Updated sessions for {server_name}: "
-            f"{[s['session_id'] for s in sessions]}"
-        )
-
-    def list_sessions(self) -> dict[str, list[RemoteSession]]:
-        """All known sessions across all servers."""
-        return {
-            name: list(sess.values())
-            for name, sess in self._remote_sessions.items()
-        }
+    # ── Session management ───────────────────────────────────────────
 
     def get_session(self, server_name: str, session_id: str) -> RemoteSession | None:
         """Look up a specific remote session."""
         server_sessions = self._remote_sessions.get(server_name, {})
         return server_sessions.get(session_id)
-
-    # ── Session registration ─────────────────────────────────────────
 
     async def register_session(
         self, server_name: str, session_id: str, work_dir: str, description: str = ""
@@ -126,7 +101,17 @@ class SessionManager:
         payload = {"session_id": session_id, "work_dir": work_dir, "description": description}
         try:
             async with self._http.post(url, json=payload) as resp:
-                return await resp.json()
+                result = await resp.json()
+                if result.get("ok"):
+                    # Update local registry so run_task can find work_dir
+                    if server_name not in self._remote_sessions:
+                        self._remote_sessions[server_name] = {}
+                    self._remote_sessions[server_name][session_id] = RemoteSession(
+                        session_id=session_id,
+                        work_dir=work_dir,
+                        description=description,
+                    )
+                return result
         except aiohttp.ClientError as e:
             log.error(f"Cannot register session on {server_name}: {e}")
             return {"ok": False, "error": f"Cannot reach broker for {server_name}: {e}"}

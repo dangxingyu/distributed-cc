@@ -1224,12 +1224,6 @@ class Orchestrator:
 
         return {"answers": decision.get("answers", {})}
 
-    def handle_heartbeat(self, data: dict):
-        """Handle /heartbeat from a remote broker — update session registry."""
-        server_name = data.get("server_name", "unknown")
-        broker_sessions = data.get("sessions", [])
-        self._session_mgr.update_sessions(server_name, broker_sessions)
-
     # ── Escalation to human ────────────────────────────────────────────
 
     async def _escalate_permission(
