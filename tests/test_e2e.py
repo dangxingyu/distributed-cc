@@ -16,10 +16,6 @@ from aiohttp import web, ClientSession, ClientTimeout
 from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 from claude_agent_sdk.types import PermissionResultAllow
 
-from src.session import SessionManager, ServerConfig, SessionResult
-from src.store import Store
-from src.orchestrator import Orchestrator
-
 
 def _clear_nesting_guard():
     """Remove CLAUDECODE env var to allow spawning Claude subprocesses."""
@@ -43,112 +39,47 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
         await done.wait()
 
 
-# ── Broker helpers ────────────────────────────────────────────────────
+# ── Daemon helpers ────────────────────────────────────────────────────
 
 
-def _setup_broker_app():
-    """Create a broker aiohttp app with all routes from remote_broker module."""
-    import tools.remote_broker as broker_mod
+def _setup_daemon_app():
+    """Create a daemon aiohttp app with all routes from orchestrator_daemon module."""
+    import tools.orchestrator_daemon as daemon_mod
     app = web.Application()
-    app.router.add_post("/run", broker_mod.handle_run)
-    app.router.add_post("/register", broker_mod.handle_register)
-    app.router.add_post("/unregister", broker_mod.handle_unregister)
-    app.router.add_get("/sessions", broker_mod.handle_sessions)
-    app.router.add_post("/kill", broker_mod.handle_kill)
-    app.router.add_get("/health", broker_mod.handle_health)
+    app.router.add_post("/register", daemon_mod.handle_register)
+    app.router.add_post("/task", daemon_mod.handle_task)
+    app.router.add_post("/interrupt", daemon_mod.handle_interrupt)
+    app.router.add_get("/status", daemon_mod.handle_status)
+    app.router.add_get("/stream", daemon_mod.handle_stream)
+    app.router.add_post("/stop", daemon_mod.handle_stop)
+    app.router.add_get("/health", daemon_mod.handle_health)
     return app
 
 
-def _patch_broker_globals(name: str, work_dir: str, orch_url: str):
-    """Patch broker module globals and return a restore function."""
-    import tools.remote_broker as broker_mod
+def _patch_daemon_globals(name: str, callback_url: str):
+    """Patch daemon module globals and return a restore function."""
+    import tools.orchestrator_daemon as daemon_mod
     orig = {
-        "SERVER_NAME": broker_mod.SERVER_NAME,
-        "DEFAULT_WORK_DIR": broker_mod.DEFAULT_WORK_DIR,
-        "ORCHESTRATOR_URL": broker_mod.ORCHESTRATOR_URL,
-        "sessions": dict(broker_mod.sessions),
+        "DAEMON_NAME": daemon_mod.DAEMON_NAME,
+        "CALLBACK_URL": daemon_mod.CALLBACK_URL,
+        "projects": dict(daemon_mod.projects),
+        "task_states": dict(daemon_mod.task_states),
+        "running_tasks": dict(daemon_mod.running_tasks),
     }
-    broker_mod.SERVER_NAME = name
-    broker_mod.DEFAULT_WORK_DIR = work_dir
-    broker_mod.ORCHESTRATOR_URL = orch_url
-    broker_mod.sessions.clear()
+    daemon_mod.DAEMON_NAME = name
+    daemon_mod.CALLBACK_URL = callback_url
 
     def restore():
-        broker_mod.SERVER_NAME = orig["SERVER_NAME"]
-        broker_mod.DEFAULT_WORK_DIR = orig["DEFAULT_WORK_DIR"]
-        broker_mod.ORCHESTRATOR_URL = orig["ORCHESTRATOR_URL"]
-        broker_mod.sessions.clear()
-        broker_mod.sessions.update(orig["sessions"])
+        daemon_mod.DAEMON_NAME = orig["DAEMON_NAME"]
+        daemon_mod.CALLBACK_URL = orig["CALLBACK_URL"]
+        daemon_mod.projects.clear()
+        daemon_mod.projects.update(orig["projects"])
+        daemon_mod.task_states.clear()
+        daemon_mod.task_states.update(orig["task_states"])
+        daemon_mod.running_tasks.clear()
+        daemon_mod.running_tasks.update(orig["running_tasks"])
 
     return restore
-
-
-# ── Full stack helper ─────────────────────────────────────────────────
-
-
-async def _setup_full_stack(broker_port: int, http_port: int):
-    """Boot broker + permission/clarification HTTP server + orchestrator.
-
-    Returns (orch, store, mgr, broker_runner, http_runner, restore, cleanup).
-    """
-    restore = _patch_broker_globals(
-        name="local",
-        work_dir="/tmp",
-        orch_url=f"http://127.0.0.1:{http_port}",
-    )
-
-    # Start broker
-    broker_app = _setup_broker_app()
-    broker_runner = web.AppRunner(broker_app)
-    await broker_runner.setup()
-    broker_site = web.TCPSite(broker_runner, "127.0.0.1", broker_port)
-    await broker_site.start()
-
-    # Orchestrator stack
-    store = Store(tempfile.mkdtemp())
-    await store.init()
-
-    cfg = ServerConfig(name="local", host=None, broker_port=broker_port)
-    mgr = SessionManager(servers=[cfg], default_model="haiku")
-    await mgr.init()
-
-    orch = Orchestrator(
-        session_mgr=mgr,
-        store=store,
-        model="haiku",
-        cwd=".",
-    )
-    await orch.init()
-
-    # HTTP callback server (permission + clarification endpoints)
-    http_app = web.Application()
-    http_app["orchestrator"] = orch
-
-    async def handle_perm(req):
-        data = await req.json()
-        result = await orch.handle_permission_request(data)
-        return web.json_response(result)
-
-    async def handle_clarification(req):
-        data = await req.json()
-        result = await orch.handle_clarification_request(data)
-        return web.json_response(result)
-
-    http_app.router.add_post("/permission", handle_perm)
-    http_app.router.add_post("/clarification", handle_clarification)
-    http_runner = web.AppRunner(http_app)
-    await http_runner.setup()
-    http_site = web.TCPSite(http_runner, "127.0.0.1", http_port)
-    await http_site.start()
-
-    async def cleanup():
-        await http_runner.cleanup()
-        await broker_runner.cleanup()
-        await mgr.close()
-        await store.close()
-        restore()
-
-    return orch, store, mgr, broker_runner, http_runner, restore, cleanup
 
 
 # ── T1: Agent SDK basic query ────────────────────────────────────────
@@ -207,256 +138,205 @@ async def test_e2e_sdk_resume():
             print(f"Resumed OK: {message.result[:100]}")
 
 
-# ── T3: Broker round trip ────────────────────────────────────────────
+# ── T3: Daemon health check ─────────────────────────────────────────
 
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_e2e_broker_round_trip():
-    """SessionManager -> broker /run -> real Claude -> result. No orchestrator."""
+async def test_e2e_daemon_health():
+    """Daemon health endpoint works when served."""
     _clear_nesting_guard()
 
-    restore = _patch_broker_globals(
-        name="test",
-        work_dir="/tmp",
-        orch_url="http://127.0.0.1:19999",  # dummy — won't trigger permission
-    )
-
-    app = _setup_broker_app()
+    restore = _patch_daemon_globals(name="test", callback_url="http://127.0.0.1:19999")
+    app = _setup_daemon_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 18200)
+    site = web.TCPSite(runner, "127.0.0.1", 18300)
     await site.start()
 
     try:
-        cfg = ServerConfig(name="test", host=None, broker_port=18200)
-        mgr = SessionManager(servers=[cfg], default_model="haiku")
-        await mgr.init()
-
-        # Health check
-        ok = await mgr.check_health("test")
-        assert ok, "Broker health check failed"
-
-        # Register session
-        reg_result = await mgr.register_session("test", "e2e-test", "/tmp", "e2e test session")
-        assert reg_result.get("ok"), f"Registration failed: {reg_result}"
-
-        # Run a task
-        result = await mgr.run_task(
-            "test", "e2e-test",
-            "Reply with exactly: E2E_SUCCESS",
-        )
-        print(f"E2E result: is_error={result.is_error}, text={result.result_text[:200]}")
-
-        assert not result.is_error, f"Task failed: {result.result_text}"
-        assert "E2E_SUCCESS" in result.result_text, f"Unexpected: {result.result_text[:200]}"
-
-        await mgr.close()
+        async with ClientSession() as http:
+            async with http.get("http://127.0.0.1:18300/health") as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "ok"
+                assert data["daemon"] == "test"
     finally:
         restore()
         await runner.cleanup()
 
 
-# ── T4: Worker permission callback ───────────────────────────────────
+# ── T4: Daemon register + task round trip ────────────────────────────
 
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_e2e_worker_permission_callback():
-    """Full stack: worker triggers a tool requiring permission.
-
-    Worker task writes a file -> broker POSTs to /permission -> orchestrator
-    auto-approves -> worker completes.
-    """
+async def test_e2e_daemon_task():
+    """Register a project on the daemon and start a task that runs RALPH loop."""
     _clear_nesting_guard()
 
-    permission_requests = []
-
-    orch, store, mgr, _, _, _, cleanup = await _setup_full_stack(
-        broker_port=18210, http_port=19130,
+    restore = _patch_daemon_globals(
+        name="e2e-test",
+        callback_url="http://127.0.0.1:19999",  # dummy — won't trigger escalation
     )
 
-    # Track and auto-approve all permission requests
-    async def tracking_handler(data):
-        permission_requests.append(data)
-        return {"approved": True, "reason": "test auto-approve"}
-
-    orch.handle_permission_request = tracking_handler
-
-    try:
-        # Register a session
-        reg = await mgr.register_session("local", "perm-test", "/tmp", "permission test")
-        assert reg.get("ok"), f"Registration failed: {reg}"
-
-        # Task that requires a tool permission (Write)
-        result = await mgr.run_task(
-            "local", "perm-test",
-            "Write the text 'PERM_TEST_OK' to the file /tmp/e2e_perm_test.txt. "
-            "Then read it back and reply with its contents.",
-        )
-
-        print(f"Permission test result: {result.result_text[:200]}")
-        print(f"Permission requests received: {len(permission_requests)}")
-        for pr in permission_requests:
-            print(f"  tool={pr.get('tool_name')}, session={pr.get('session_id')}")
-
-        assert not result.is_error, f"Task failed: {result.result_text}"
-        assert "PERM_TEST_OK" in result.result_text, f"Unexpected: {result.result_text[:200]}"
-        assert len(permission_requests) > 0, "No permission requests received"
-
-    finally:
-        # Clean up test file
-        try:
-            os.remove("/tmp/e2e_perm_test.txt")
-        except FileNotFoundError:
-            pass
-        await cleanup()
-
-
-# ── T5: Worker clarification callback ────────────────────────────────
-
-
-@pytest.mark.e2e
-@pytest.mark.asyncio
-async def test_e2e_worker_clarification_callback():
-    """Full stack: worker calls AskUserQuestion -> broker POSTs /clarification
-    -> orchestrator answers -> worker completes with answer.
-    """
-    _clear_nesting_guard()
-
-    clarification_requests = []
-
-    orch, store, mgr, _, _, _, cleanup = await _setup_full_stack(
-        broker_port=18211, http_port=19131,
-    )
-
-    # Track and auto-answer all clarification requests
-    async def tracking_clarification(data):
-        clarification_requests.append(data)
-        # Answer all questions with "blue"
-        answers = {}
-        for q in data.get("questions", []):
-            answers[q.get("question", "")] = "blue"
-        return {"answers": answers}
-
-    orch.handle_clarification_request = tracking_clarification
-
-    try:
-        reg = await mgr.register_session("local", "clarify-test", "/tmp", "clarification test")
-        assert reg.get("ok"), f"Registration failed: {reg}"
-
-        # Task that forces AskUserQuestion
-        result = await mgr.run_task(
-            "local", "clarify-test",
-            "Use the AskUserQuestion tool to ask the user: 'What is your favorite color?' "
-            "with options 'red', 'blue', 'green'. "
-            "After getting the answer, reply with: 'Your color is: <answer>'.",
-        )
-
-        print(f"Clarification test result: {result.result_text[:200]}")
-        print(f"Clarification requests received: {len(clarification_requests)}")
-
-        assert not result.is_error, f"Task failed: {result.result_text}"
-        # The worker should have received "blue" as the answer
-        assert "blue" in result.result_text.lower(), f"Answer not incorporated: {result.result_text[:200]}"
-        assert len(clarification_requests) > 0, "No clarification requests received"
-
-    finally:
-        await cleanup()
-
-
-# ── T6: Plan mode in worker ──────────────────────────────────────────
-
-
-@pytest.mark.e2e
-@pytest.mark.asyncio
-async def test_e2e_plan_mode_in_worker():
-    """Worker enters plan mode, plans, exits, and executes.
-
-    EnterPlanMode/ExitPlanMode are NOT blocked — worker can use them.
-    """
-    _clear_nesting_guard()
-
-    orch, store, mgr, _, _, _, cleanup = await _setup_full_stack(
-        broker_port=18212, http_port=19132,
-    )
-
-    # Auto-approve all permissions
-    async def auto_approve(data):
-        return {"approved": True, "reason": "auto-approve for plan mode test"}
-
-    orch.handle_permission_request = auto_approve
-
-    try:
-        reg = await mgr.register_session("local", "plan-test", "/tmp", "plan mode test")
-        assert reg.get("ok"), f"Registration failed: {reg}"
-
-        # Multi-step task — worker may use plan mode
-        result = await mgr.run_task(
-            "local", "plan-test",
-            "Create a file /tmp/e2e_plan_test.txt with the content 'step1'. "
-            "Then create /tmp/e2e_plan_test2.txt with 'step2'. "
-            "Finally, read both files and reply with their combined contents.",
-        )
-
-        print(f"Plan mode result: {result.result_text[:300]}")
-
-        assert not result.is_error, f"Task failed: {result.result_text}"
-        assert "step1" in result.result_text.lower(), f"step1 missing: {result.result_text[:200]}"
-        assert "step2" in result.result_text.lower(), f"step2 missing: {result.result_text[:200]}"
-
-    finally:
-        for f in ["/tmp/e2e_plan_test.txt", "/tmp/e2e_plan_test2.txt"]:
-            try:
-                os.remove(f)
-            except FileNotFoundError:
-                pass
-        await cleanup()
-
-
-# ── T7: Dynamic server registration ─────────────────────────────────
-
-
-@pytest.mark.e2e
-@pytest.mark.asyncio
-async def test_e2e_dynamic_server_registration():
-    """SessionManager.add_server() makes a new server immediately usable."""
-    _clear_nesting_guard()
-
-    restore = _patch_broker_globals(
-        name="dynamic",
-        work_dir="/tmp",
-        orch_url="http://127.0.0.1:19999",
-    )
-
-    app = _setup_broker_app()
+    app = _setup_daemon_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 18202)
+    site = web.TCPSite(runner, "127.0.0.1", 18301)
     await site.start()
 
     try:
-        # Start with NO servers
-        mgr = SessionManager(servers=[], default_model="haiku")
-        await mgr.init()
+        async with ClientSession() as http:
+            # Register project
+            async with http.post(
+                "http://127.0.0.1:18301/register",
+                json={
+                    "project_id": "e2e-test",
+                    "project_dir": "/tmp",
+                    "name": "E2E Test",
+                },
+            ) as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["ok"] is True
 
-        # Dynamically add a server
-        mgr.add_server(ServerConfig(name="dynamic", host=None, broker_port=18202))
+            # Start task
+            async with http.post(
+                "http://127.0.0.1:18301/task",
+                json={
+                    "project_id": "e2e-test",
+                    "task": "Reply with exactly 'TASK_OK' and include [TASK_COMPLETE] at the end.",
+                    "max_iterations": 3,
+                },
+            ) as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["ok"] is True
+                assert data["status"] == "started"
 
-        # Should now be reachable
-        ok = await mgr.check_health("dynamic")
-        assert ok, "Dynamic server health check failed"
+            # Wait for completion
+            for _ in range(60):
+                await asyncio.sleep(2)
+                async with http.get(
+                    "http://127.0.0.1:18301/status?project_id=e2e-test"
+                ) as resp:
+                    status = await resp.json()
+                    if status.get("status") in ("done", "error", "stuck"):
+                        break
+            else:
+                pytest.fail("Task did not complete within timeout")
 
-        # Register and run a task
-        reg_result = await mgr.register_session("dynamic", "dyn-test", "/tmp", "dynamic test")
-        assert reg_result.get("ok"), f"Registration failed: {reg_result}"
+            print(f"Task final status: {status}")
+            assert status["status"] == "done", f"Expected done, got {status['status']}: {status.get('error', '')}"
 
-        result = await mgr.run_task("dynamic", "dyn-test", "Reply with exactly: DYNAMIC_OK")
-        assert not result.is_error, f"Task failed: {result.result_text}"
-        assert "DYNAMIC_OK" in result.result_text
-        print(f"Dynamic server result: {result.result_text[:200]}")
-
-        await mgr.close()
     finally:
         restore()
         await runner.cleanup()
+
+
+# ── T5: Daemon interrupt flow ────────────────────────────────────────
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_daemon_interrupt():
+    """Interrupt a running daemon task — verify interrupt is queued."""
+    _clear_nesting_guard()
+
+    restore = _patch_daemon_globals(
+        name="e2e-int",
+        callback_url="http://127.0.0.1:19999",
+    )
+
+    app = _setup_daemon_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 18302)
+    await site.start()
+
+    try:
+        async with ClientSession() as http:
+            # Register
+            await http.post(
+                "http://127.0.0.1:18302/register",
+                json={"project_id": "int-test", "project_dir": "/tmp"},
+            )
+
+            # Start a longer task
+            await http.post(
+                "http://127.0.0.1:18302/task",
+                json={
+                    "project_id": "int-test",
+                    "task": "List all files in /tmp and summarize. Include [TASK_COMPLETE] when done.",
+                    "max_iterations": 5,
+                },
+            )
+
+            # Wait a moment then interrupt
+            await asyncio.sleep(1)
+            async with http.post(
+                "http://127.0.0.1:18302/interrupt",
+                json={"project_id": "int-test", "message": "Also check /tmp/test if it exists"},
+            ) as resp:
+                data = await resp.json()
+                assert data["ok"] is True
+                assert data["queued"] is True
+
+            # Wait for completion
+            for _ in range(60):
+                await asyncio.sleep(2)
+                async with http.get(
+                    "http://127.0.0.1:18302/status?project_id=int-test"
+                ) as resp:
+                    status = await resp.json()
+                    if status.get("status") in ("done", "error", "stuck"):
+                        break
+
+            print(f"Interrupt test final status: {status}")
+            # Task should finish (done or stuck, not error)
+            assert status["status"] in ("done", "stuck")
+
+    finally:
+        restore()
+        await runner.cleanup()
+
+
+# ── T6: SDK with can_use_tool ────────────────────────────────────────
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_sdk_can_use_tool():
+    """Agent SDK with can_use_tool callback and streaming prompt.
+
+    Validates the critical pattern: _prompt_stream + done event + can_use_tool.
+    """
+    _clear_nesting_guard()
+
+    tool_calls = []
+
+    async def track_tools(tool_name, input_data, context=None):
+        tool_calls.append(tool_name)
+        return PermissionResultAllow()
+
+    done_event = asyncio.Event()
+    options = ClaudeAgentOptions(
+        model="haiku",
+        cwd="/tmp",
+        can_use_tool=track_tools,
+        allowed_tools=["Read", "Glob"],
+    )
+
+    got_result = False
+    async for message in query(
+        prompt=_prompt_stream("List .py files in /tmp (if any). Reply with the count.", done_event),
+        options=options,
+    ):
+        if isinstance(message, ResultMessage):
+            got_result = True
+            done_event.set()
+            print(f"can_use_tool result: {message.result[:200]}")
+            print(f"Tools used: {tool_calls}")
+
+    assert got_result, "Never received a ResultMessage"

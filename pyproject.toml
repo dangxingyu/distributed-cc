@@ -9,8 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-broker = ["claude-agent-sdk", "aiohttp>=3.9.0"]
-telegram = ["python-telegram-bot>=21.0"]
+daemon = ["claude-agent-sdk", "aiohttp>=3.9.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-aiohttp>=1.0"]
 
 [tool.pytest.ini_options]

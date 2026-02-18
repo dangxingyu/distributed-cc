@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
-# Deploy remote broker to a server.
-# Usage: ./tools/deploy.sh user@host [server-name]
+# Deploy orchestrator daemon to a remote server.
+# Usage: ./tools/deploy.sh user@host [daemon-name]
 #
-# Alternative: the remote user can self-install with:
-#   curl -fsSL https://raw.githubusercontent.com/dangxingyu/distributed-cc/main/tools/install-broker.sh | bash
-#
-# This copies the broker + session scripts, installs uv, and sets up a venv with dependencies.
+# This copies the daemon script, installs uv, and sets up a venv with dependencies.
 # After deploying:
-#   1. Start the broker (once per server):
-#      ssh user@host "~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py --port 8200 --name server-a"
-#   2. Register sessions from project dirs:
-#      ssh user@host "cd /path/to/project && ~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/broker_session.py start"
+#   1. Start the daemon (once per server):
+#      ssh user@host "~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py --port 8200 --name server-a"
+#   2. Set up SSH tunnels from your laptop:
+#      ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@host
 
 set -euo pipefail
 
 REMOTE="$1"
-SERVER_NAME="${2:-unknown}"
+DAEMON_NAME="${2:-unknown}"
 REMOTE_DIR="~/.distributed-cc"
 
-echo "Deploying remote broker to $REMOTE:$REMOTE_DIR ..."
+echo "Deploying orchestrator daemon to $REMOTE:$REMOTE_DIR ..."
 
 ssh "$REMOTE" "mkdir -p $REMOTE_DIR"
-scp tools/remote_broker.py "$REMOTE:$REMOTE_DIR/remote_broker.py"
-scp tools/broker_session.py "$REMOTE:$REMOTE_DIR/broker_session.py"
+scp tools/orchestrator_daemon.py "$REMOTE:$REMOTE_DIR/orchestrator_daemon.py"
+
+# Keep remote_broker.py for backward compat during migration
+if [ -f tools/remote_broker.py ]; then
+    scp tools/remote_broker.py "$REMOTE:$REMOTE_DIR/remote_broker.py"
+fi
 
 echo "Installing uv (if not present) ..."
 ssh "$REMOTE" "command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -32,9 +33,8 @@ ssh "$REMOTE" "source \$HOME/.local/bin/env 2>/dev/null; uv venv $REMOTE_DIR/.ve
 
 echo ""
 echo "Done. Next steps on remote:"
-echo "  1. Start broker (once per server, e.g. in tmux):"
-echo "     $REMOTE_DIR/.venv/bin/python3 $REMOTE_DIR/remote_broker.py --port 8200 --name $SERVER_NAME"
+echo "  1. Start daemon (once per server, e.g. in tmux):"
+echo "     $REMOTE_DIR/.venv/bin/python3 $REMOTE_DIR/orchestrator_daemon.py --port 8200 --name $DAEMON_NAME"
 echo ""
-echo "  2. Register sessions from project directories:"
-echo "     cd /path/to/project"
-echo "     $REMOTE_DIR/.venv/bin/python3 $REMOTE_DIR/broker_session.py start"
+echo "  2. Set up SSH tunnels from your laptop:"
+echo "     ssh -N -L <local_port>:localhost:8200 -R 9120:localhost:9120 $REMOTE"

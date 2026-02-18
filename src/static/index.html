@@ -127,6 +127,26 @@ body {
   opacity: 1;
 }
 
+.channel-item .ch-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.channel-item .ch-status.running { background: var(--green); animation: pulse 2s infinite; }
+.channel-item .ch-status.idle { background: var(--text-muted); }
+.channel-item .ch-status.done { background: var(--blue); }
+.channel-item .ch-status.stuck { background: var(--yellow); }
+.channel-item .ch-status.error { background: var(--red); }
+.channel-item .ch-status.disconnected { background: var(--red); opacity: 0.5; }
+.channel-item .ch-status.unconnected { background: transparent; border: 1px dashed var(--text-muted); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
 .channel-item .ch-delete {
   display: none;
   background: none;
@@ -202,6 +222,32 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+#project-badge {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  display: none;
+}
+
+#project-badge.running {
+  border-color: rgba(166, 227, 161, 0.3);
+  color: var(--green);
+}
+
+#project-badge.stuck {
+  border-color: rgba(249, 226, 175, 0.3);
+  color: var(--yellow);
+}
+
+#project-badge.error {
+  border-color: rgba(243, 139, 168, 0.3);
+  color: var(--red);
 }
 
 #members-btn {
@@ -353,7 +399,6 @@ body {
 
 .msg-user .msg-sender { color: var(--blue); }
 .msg-orchestrator .msg-sender { color: var(--green); }
-.msg-worker .msg-sender { color: var(--orange); }
 .msg-system .msg-sender { color: var(--text-muted); }
 
 .msg-time {
@@ -476,11 +521,6 @@ body {
   border: 1px solid rgba(166, 227, 161, 0.1);
 }
 
-.msg-worker .msg-body {
-  background: var(--orange-dim);
-  border: 1px solid rgba(250, 179, 135, 0.1);
-}
-
 .msg-system .msg-body {
   background: transparent;
   border: none;
@@ -516,6 +556,7 @@ body {
   font-size: 13px;
   color: var(--text-secondary);
   line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .escalation-buttons {
@@ -673,56 +714,6 @@ body {
   filter: none;
 }
 
-/* ── @mention dropdown ──────────────────────────── */
-
-#mention-dropdown {
-  display: none;
-  position: absolute;
-  bottom: 100%;
-  left: 20px;
-  margin-bottom: 4px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-light);
-  border-radius: 10px;
-  min-width: 220px;
-  max-height: 180px;
-  overflow-y: auto;
-  z-index: 200;
-  box-shadow: 0 -6px 20px rgba(0,0,0,0.4);
-  padding: 4px 0;
-}
-
-#mention-dropdown.open {
-  display: block;
-}
-
-.mention-item {
-  padding: 8px 14px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-primary);
-  transition: background 0.08s ease;
-}
-
-.mention-item:hover,
-.mention-item.active {
-  background: var(--accent-dim);
-}
-
-.mention-item .mention-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.mention-item .mention-dot.orchestrator { background: var(--green); }
-.mention-item .mention-dot.worker { background: var(--orange); }
-
 /* ── Monitor panel ─────────────────────────────── */
 
 #monitor {
@@ -802,10 +793,9 @@ body {
   color: var(--red);
 }
 
-.log-entry-result {
-  color: var(--text-muted);
-  opacity: 0.7;
-  font-size: 11px;
+.log-entry-iteration {
+  color: var(--accent);
+  font-weight: 500;
 }
 
 .log-time {
@@ -853,6 +843,7 @@ body {
   <div id="header">
     <h1 id="channel-title">distributed-cc</h1>
     <div id="header-right">
+      <div id="project-badge"></div>
       <button id="monitor-btn" onclick="toggleMonitor()" title="Toggle monitor (Ctrl+M)">Monitor</button>
       <button id="members-btn" style="display:none">
         0 members
@@ -870,7 +861,6 @@ body {
 
   <div id="typing-indicator"></div>
   <div id="input-area">
-    <div id="mention-dropdown"></div>
     <textarea id="input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
     <button id="send-btn">Send</button>
   </div>
@@ -896,21 +886,20 @@ const channelTitle = document.getElementById('channel-title');
 const newChannelBtn = document.getElementById('new-channel-btn');
 const membersBtn = document.getElementById('members-btn');
 const membersPopover = document.getElementById('members-popover');
-const mentionDropdown = document.getElementById('mention-dropdown');
 const monitorEl = document.getElementById('monitor');
 const monitorLog = document.getElementById('monitor-log');
 const monitorBtn = document.getElementById('monitor-btn');
 const typingIndicator = document.getElementById('typing-indicator');
+const projectBadge = document.getElementById('project-badge');
 
 let ws = null;
 let reconnectTimer = null;
 let activeChannel = null;
 let channels = [];
 let channelMembers = [];
-
-// ── @mention state ──────────────────────────────────────────────────
-let mentionState = { active: false, startIndex: -1, query: '' };
-let mentionActiveIdx = 0;
+let currentProjectId = null;
+let currentProjectStatus = 'unknown';
+let currentIteration = 0;
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -923,177 +912,75 @@ function formatTime() {
   return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+// ── Status display ──────────────────────────────────────────────────
+
+function updateProjectBadge(status, iteration, data) {
+  if (!currentProjectId) {
+    projectBadge.style.display = 'none';
+    return;
+  }
+  projectBadge.style.display = '';
+  projectBadge.className = status || '';
+
+  if (status === 'running' || status === 'busy') {
+    projectBadge.textContent = iteration ? `Working (${iteration})` : 'Working...';
+    showTypingIndicator(data || 'working');
+  } else if (status === 'stuck') {
+    projectBadge.textContent = 'Needs input';
+    hideTypingIndicator();
+  } else if (status === 'done') {
+    projectBadge.textContent = 'Done';
+    hideTypingIndicator();
+  } else if (status === 'error') {
+    projectBadge.textContent = 'Error';
+    hideTypingIndicator();
+  } else if (status === 'idle') {
+    projectBadge.textContent = currentProjectId;
+    hideTypingIndicator();
+  } else {
+    projectBadge.textContent = currentProjectId;
+    hideTypingIndicator();
+  }
+}
+
 // ── Typing indicator ─────────────────────────────────────────────────
 
-const statusVerbs = [
-  'orchestrating', 'pondering', 'crafting', 'conjuring',
-  'brewing', 'weaving', 'scheming', 'composing',
-  'concocting', 'hatching', 'manifesting', 'channeling',
-];
-let _verbInterval = null;
 let _hideTimer = null;
 let _indicatorActive = false;
 
-function pickVerb() {
-  return statusVerbs[Math.floor(Math.random() * statusVerbs.length)];
-}
-
-function showTypingIndicator() {
-  // Cancel any pending hide
+function showTypingIndicator(label) {
   if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
-
-  // Don't rebuild DOM if already showing — just keep it
   if (_indicatorActive) return;
   _indicatorActive = true;
 
-  const verb = pickVerb();
   typingIndicator.innerHTML =
     '<span class="dot-pulse"><span></span><span></span><span></span></span>' +
-    '<span class="status-label">orchestrator is ' + verb + '</span>';
+    '<span class="status-label">orchestrator is working</span>';
   typingIndicator.classList.add('active');
-
-  // Rotate verb every few seconds for fun
-  if (_verbInterval) clearInterval(_verbInterval);
-  _verbInterval = setInterval(() => {
-    const label = typingIndicator.querySelector('.status-label');
-    if (label) label.textContent = 'orchestrator is ' + pickVerb();
-  }, 4000);
 }
 
 function hideTypingIndicator() {
-  // Debounce: wait a beat before hiding (avoids flicker between busy→idle→busy)
   if (_hideTimer) clearTimeout(_hideTimer);
   _hideTimer = setTimeout(() => {
     _indicatorActive = false;
     typingIndicator.classList.remove('active');
-    if (_verbInterval) { clearInterval(_verbInterval); _verbInterval = null; }
     _hideTimer = null;
   }, 800);
 }
 
-// ── Message text processing ──────────────────────────────────────────
-
-function processMessageText(text) {
-  // Extract reply text from JSON action blocks, strip all action blocks,
-  // and return clean text ready for markdown rendering.
-  let replyText = null;
-
-  // Find {"action": "reply", "text": "..."} and extract the text field
-  const replyRe = /\{[\s]*"action"[\s]*:[\s]*"reply"[\s]*,[\s]*"text"[\s]*:[\s]*"/;
-  const replyMatch = text.match(replyRe);
-  if (replyMatch) {
-    const jsonStart = text.indexOf(replyMatch[0]);
-    // Try to parse the JSON block starting from this position
-    try {
-      const jsonStr = extractJsonObject(text, jsonStart);
-      if (jsonStr) {
-        const obj = JSON.parse(jsonStr);
-        if (obj.action === 'reply' && obj.text) {
-          replyText = obj.text;
-        }
-      }
-    } catch (e) { /* ignore parse errors */ }
-  }
-
-  if (replyText) return replyText;
-
-  // No reply action found — strip all {"action": ...} JSON blocks from text
-  return stripJsonBlocks(text);
-}
-
-function extractJsonObject(text, startIdx) {
-  // Extract a JSON object string starting at startIdx by matching braces
-  if (text[startIdx] !== '{') return null;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = startIdx; i < text.length; i++) {
-    const ch = text[i];
-    if (escape) { escape = false; continue; }
-    if (ch === '\\' && inString) { escape = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === '{') depth++;
-    if (ch === '}') { depth--; if (depth === 0) return text.substring(startIdx, i + 1); }
-  }
-  return null;
-}
-
-function stripJsonBlocks(text) {
-  // Remove all {"action": ...} JSON blocks using brace matching
-  const actionPattern = /\{[\s]*"action"[\s]*:/g;
-  let result = text;
-  let match;
-  // Collect all JSON blocks to remove (work backwards to preserve indices)
-  const toRemove = [];
-  while ((match = actionPattern.exec(result)) !== null) {
-    const jsonStr = extractJsonObject(result, match.index);
-    if (jsonStr) {
-      try {
-        JSON.parse(jsonStr);
-        toRemove.push({ start: match.index, end: match.index + jsonStr.length });
-      } catch (e) { /* not valid JSON, skip */ }
-    }
-  }
-  // Remove in reverse order
-  for (let i = toRemove.length - 1; i >= 0; i--) {
-    const r = toRemove[i];
-    result = result.substring(0, r.start) + result.substring(r.end);
-  }
-  // Clean up leftover whitespace
-  return result.replace(/\n{3,}/g, '\n\n').trim();
-}
+// ── Message rendering ────────────────────────────────────────────────
 
 function renderMarkdown(text) {
   if (typeof marked !== 'undefined') {
-    // Configure marked for compact output
     marked.setOptions({ breaks: true, gfm: true });
     return marked.parse(text);
   }
-  // Fallback: plain text with HTML escaping
   return escapeHtml(text).replace(/\n/g, '<br>');
 }
 
-// ── Message parsing ─────────────────────────────────────────────────
-
-function parseMessage(text, cssClass) {
-  if (cssClass === 'msg-user') {
-    return { role: 'user', label: 'You', body: text };
-  }
-  if (cssClass === 'msg-system') {
-    return { role: 'system', label: 'System', body: text };
-  }
-
-  // orchestrator -> server/session: ...
-  let m = text.match(/^orchestrator\s*->\s*([\w./-]+):\s*([\s\S]*)$/);
-  if (m) {
-    return { role: 'orchestrator', label: 'Orchestrator', body: m[2] };
-  }
-
-  // orchestrator: ...
-  m = text.match(/^orchestrator:\s*([\s\S]*)$/);
-  if (m) {
-    return { role: 'orchestrator', label: 'Orchestrator', body: m[1] };
-  }
-
-  // server/session: ...  (worker)
-  m = text.match(/^([\w.-]+\/[\w.-]+):\s*([\s\S]*)$/);
-  if (m) {
-    return { role: 'worker', label: m[1], body: m[2] };
-  }
-
-  return { role: 'orchestrator', label: 'Orchestrator', body: text };
-}
-
 function classifyMessage(text) {
-  if (text.startsWith('(queued)') || text.startsWith('(noted)') || text.startsWith('(stop:')) {
+  if (text.startsWith('(queued') || text.startsWith('(stop')) {
     return 'system';
-  }
-  if (text.startsWith('orchestrator ->') || text.startsWith('orchestrator:')) {
-    return 'orchestrator';
-  }
-  if (text.match(/^[\w.-]+\/[\w.-]+:/)) {
-    return 'worker';
   }
   return 'orchestrator';
 }
@@ -1103,17 +990,14 @@ function scrollToBottom() {
 }
 
 function addMessage(text, cssClass) {
-  const parsed = parseMessage(text, cssClass);
+  let label = 'Orchestrator';
+  let body = text;
 
-  // For non-user messages, process JSON blocks + markdown.
-  // Skip if the result is empty (e.g. message was only JSON action blocks).
-  let displayHtml = '';
   if (cssClass === 'msg-user') {
-    displayHtml = escapeHtml(parsed.body);
-  } else {
-    const processed = processMessageText(parsed.body);
-    if (!processed.trim()) return;  // nothing to show after stripping JSON
-    displayHtml = renderMarkdown(processed);
+    label = 'You';
+    body = text;
+  } else if (cssClass === 'msg-system') {
+    label = 'System';
   }
 
   const div = document.createElement('div');
@@ -1124,7 +1008,7 @@ function addMessage(text, cssClass) {
 
   const sender = document.createElement('span');
   sender.className = 'msg-sender';
-  sender.textContent = parsed.label;
+  sender.textContent = label;
 
   const time = document.createElement('span');
   time.className = 'msg-time';
@@ -1133,16 +1017,16 @@ function addMessage(text, cssClass) {
   header.appendChild(sender);
   header.appendChild(time);
 
-  const body = document.createElement('div');
-  body.className = 'msg-body';
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'msg-body';
   if (cssClass === 'msg-user') {
-    body.textContent = parsed.body;
+    bodyEl.textContent = body;
   } else {
-    body.innerHTML = displayHtml;
+    bodyEl.innerHTML = renderMarkdown(body);
   }
 
   div.appendChild(header);
-  div.appendChild(body);
+  div.appendChild(bodyEl);
   messagesEl.appendChild(div);
   scrollToBottom();
 }
@@ -1154,28 +1038,10 @@ function addEscalationCard(data) {
 
   let html = '<div class="escalation-title">' + escapeHtml(data.title) + '</div>';
   html += '<div class="escalation-detail">' + escapeHtml(data.detail) + '</div>';
-
-  if (data.type === 'permission_request') {
-    html += '<div class="escalation-buttons">';
-    html += '<button class="approve" onclick="resolvePermission(\'' + escapeHtml(data.request_id) + '\', true)">Approve</button>';
-    html += '<button class="deny" onclick="resolvePermission(\'' + escapeHtml(data.request_id) + '\', false)">Deny</button>';
-    html += '</div>';
-  } else if (data.type === 'clarification_request') {
-    html += '<div class="escalation-buttons">';
-    const questions = data.questions || [];
-    for (let i = 0; i < questions.length; i++) {
-      const q = questions[i];
-      const options = q.options || [];
-      for (let j = 0; j < options.length; j++) {
-        const opt = options[j];
-        html += '<button onclick="resolveClarification(\'' + escapeHtml(data.request_id)
-          + '\', \'' + escapeHtml(q.question)
-          + '\', \'' + escapeHtml(opt.label) + '\')">'
-          + escapeHtml(opt.label) + '</button>';
-      }
-    }
-    html += '</div>';
-  }
+  html += '<div class="escalation-buttons">';
+  html += '<button class="approve" onclick="resolvePermission(\'' + escapeHtml(data.request_id) + '\', true)">Approve</button>';
+  html += '<button class="deny" onclick="resolvePermission(\'' + escapeHtml(data.request_id) + '\', false)">Deny</button>';
+  html += '</div>';
 
   div.innerHTML = html;
   messagesEl.appendChild(div);
@@ -1204,17 +1070,6 @@ function resolvePermission(requestId, approved) {
   markEscalationResolved(requestId, approved ? 'APPROVED' : 'DENIED');
 }
 
-function resolveClarification(requestId, question, answer) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
-    type: 'clarification_response',
-    request_id: requestId,
-    question: question,
-    answer: answer
-  }));
-  markEscalationResolved(requestId, answer);
-}
-
 // ── Channel management ──────────────────────────────────────────────
 
 function renderChannelList() {
@@ -1222,7 +1077,11 @@ function renderChannelList() {
   for (const ch of channels) {
     const item = document.createElement('div');
     item.className = 'channel-item' + (activeChannel === ch.id ? ' active' : '');
-    item.innerHTML = '<span class="hash">#</span><span class="ch-name">' + escapeHtml(ch.name) + '</span>';
+
+    const status = ch.project_status || 'unconnected';
+    item.innerHTML = '<span class="hash">#</span>'
+      + '<span class="ch-name">' + escapeHtml(ch.name) + '</span>'
+      + '<span class="ch-status ' + escapeHtml(status) + '"></span>';
     item.onclick = () => switchChannel(ch.id);
 
     const del = document.createElement('button');
@@ -1264,14 +1123,19 @@ function switchChannel(channelId) {
   loadLogs(channelId);
 }
 
-function onChannelSwitched(channelId) {
-  activeChannel = channelId;
-  localStorage.setItem('dcc_active_channel', String(channelId));
-  const ch = channels.find(c => c.id === channelId);
+function onChannelSwitched(data) {
+  activeChannel = data.channel_id;
+  currentProjectId = data.project_id || null;
+  currentProjectStatus = data.project_status || 'unknown';
+  localStorage.setItem('dcc_active_channel', String(activeChannel));
+
+  const ch = channels.find(c => c.id === activeChannel);
   channelTitle.textContent = ch ? '# ' + ch.name : 'distributed-cc';
   noChannelEl.style.display = 'none';
   messagesEl.style.display = 'flex';
   monitorLog.innerHTML = '';
+
+  updateProjectBadge(currentProjectStatus, 0);
   renderChannelList();
 }
 
@@ -1288,16 +1152,28 @@ function loadChannels() {
 function createChannel() {
   const name = prompt('Channel name:');
   if (!name || !name.trim()) return;
-  fetch('/api/channels', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name.trim() }),
-  })
+
+  // Ask which project to connect
+  fetch('/api/projects')
     .then(r => r.json())
-    .then(ch => {
-      channels.push(ch);
-      renderChannelList();
-      switchChannel(ch.id);
+    .then(projects => {
+      let projectId = '';
+      if (projects.length > 0) {
+        const choices = projects.map(p => p.project_id).join(', ');
+        projectId = prompt('Connect to project? (' + choices + ')\nLeave empty to connect later:') || '';
+      }
+
+      fetch('/api/channels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim(), project_id: projectId.trim() }),
+      })
+        .then(r => r.json())
+        .then(ch => {
+          channels.push(ch);
+          renderChannelList();
+          switchChannel(ch.id);
+        });
     });
 }
 
@@ -1353,7 +1229,6 @@ function sendMessage() {
   ws.send(JSON.stringify({ type: 'message', text: text }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
-  closeMentionDropdown();
 }
 
 function loadHistory(channelId) {
@@ -1385,112 +1260,12 @@ function loadLogs(channelId) {
     .catch(err => console.error('Failed to load logs:', err));
 }
 
-// ── @mention autocomplete ───────────────────────────────────────────
-
-function getMentionCandidates() {
-  return channelMembers
-    .filter(m => m.role !== 'user')
-    .map(m => ({ name: m.name.toLowerCase() === 'orchestrator' ? 'orchestrator' : m.name, role: m.role }));
-}
-
-function openMentionDropdown(candidates) {
-  mentionDropdown.innerHTML = '';
-  for (let i = 0; i < candidates.length; i++) {
-    const c = candidates[i];
-    const item = document.createElement('div');
-    item.className = 'mention-item' + (i === mentionActiveIdx ? ' active' : '');
-    item.innerHTML = '<div class="mention-dot ' + escapeHtml(c.role) + '"></div>'
-      + '<span>' + escapeHtml(c.name) + '</span>';
-    item.addEventListener('mousedown', function(e) {
-      e.preventDefault();
-      selectMention(c.name);
-    });
-    mentionDropdown.appendChild(item);
-  }
-  mentionDropdown.classList.add('open');
-}
-
-function closeMentionDropdown() {
-  mentionDropdown.classList.remove('open');
-  mentionDropdown.innerHTML = '';
-  mentionState = { active: false, startIndex: -1, query: '' };
-  mentionActiveIdx = 0;
-}
-
-function selectMention(name) {
-  const val = inputEl.value;
-  const before = val.substring(0, mentionState.startIndex);
-  const after = val.substring(inputEl.selectionStart);
-  inputEl.value = before + '@' + name + ' ' + after;
-  const cursorPos = before.length + 1 + name.length + 1;
-  inputEl.setSelectionRange(cursorPos, cursorPos);
-  closeMentionDropdown();
-  inputEl.focus();
-}
-
-function updateMentionHighlight(candidates) {
-  const items = mentionDropdown.querySelectorAll('.mention-item');
-  items.forEach((el, i) => {
-    el.classList.toggle('active', i === mentionActiveIdx);
-  });
-}
-
 inputEl.addEventListener('input', function() {
   this.style.height = 'auto';
   this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-
-  const val = this.value;
-  const cursor = this.selectionStart;
-  const textBefore = val.substring(0, cursor);
-  const atIdx = textBefore.lastIndexOf('@');
-
-  if (atIdx >= 0 && (atIdx === 0 || /\s/.test(textBefore[atIdx - 1]))) {
-    const query = textBefore.substring(atIdx + 1).toLowerCase();
-    const candidates = getMentionCandidates().filter(c =>
-      c.name.toLowerCase().startsWith(query)
-    );
-    if (candidates.length > 0) {
-      mentionState = { active: true, startIndex: atIdx, query: query };
-      mentionActiveIdx = Math.min(mentionActiveIdx, candidates.length - 1);
-      openMentionDropdown(candidates);
-      return;
-    }
-  }
-  closeMentionDropdown();
 });
 
 inputEl.addEventListener('keydown', function(e) {
-  if (mentionState.active && mentionDropdown.classList.contains('open')) {
-    const items = mentionDropdown.querySelectorAll('.mention-item');
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      mentionActiveIdx = (mentionActiveIdx + 1) % items.length;
-      updateMentionHighlight();
-      return;
-    }
-    if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      mentionActiveIdx = (mentionActiveIdx - 1 + items.length) % items.length;
-      updateMentionHighlight();
-      return;
-    }
-    if (e.key === 'Enter' || e.key === 'Tab') {
-      e.preventDefault();
-      const candidates = getMentionCandidates().filter(c =>
-        c.name.toLowerCase().startsWith(mentionState.query)
-      );
-      if (candidates[mentionActiveIdx]) {
-        selectMention(candidates[mentionActiveIdx].name);
-      }
-      return;
-    }
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      closeMentionDropdown();
-      return;
-    }
-  }
-
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendMessage();
@@ -1519,9 +1294,9 @@ let _monitorScrollPending = false;
 function addLogEntry(text, ts) {
   const entry = document.createElement('div');
   const isError = text.startsWith('[ERROR]');
-  const isResult = text.startsWith('[result]');
   const isToolCall = /^orchestrator\s*->/.test(text);
-  const cls = isError ? 'log-entry-error' : isResult ? 'log-entry-result' : isToolCall ? 'log-entry-tool' : 'log-entry-text';
+  const isIteration = /^Iteration\s+\d/.test(text);
+  const cls = isError ? 'log-entry-error' : isIteration ? 'log-entry-iteration' : isToolCall ? 'log-entry-tool' : 'log-entry-text';
   entry.className = 'log-entry ' + cls;
 
   const time = document.createElement('span');
@@ -1536,7 +1311,6 @@ function addLogEntry(text, ts) {
   entry.appendChild(content);
   monitorLog.appendChild(entry);
 
-  // Debounced scroll — batch rapid updates into one paint
   if (!_monitorScrollPending) {
     _monitorScrollPending = true;
     requestAnimationFrame(() => {
@@ -1597,21 +1371,43 @@ function connect() {
     const data = JSON.parse(event.data);
 
     if (data.type === 'channel_switched') {
-      onChannelSwitched(data.channel_id);
-    } else if (data.type === 'status') {
-      if (data.status === 'busy') showTypingIndicator();
-      else hideTypingIndicator();
+      onChannelSwitched(data);
+
+    } else if (data.type === 'project_connected') {
+      currentProjectId = data.project_id;
+      currentProjectStatus = data.project_status || 'idle';
+      updateProjectBadge(currentProjectStatus, 0);
+      loadChannels();  // refresh sidebar status dots
+
+    } else if (data.type === 'progress') {
+      const pStatus = data.status || data.type;
+      currentIteration = data.iteration || currentIteration;
+      if (pStatus === 'done' || pStatus === 'stuck' || pStatus === 'error') {
+        currentProjectStatus = pStatus;
+      } else {
+        currentProjectStatus = 'running';
+      }
+      updateProjectBadge(currentProjectStatus, currentIteration, data.data);
+
+      // Log iteration markers
+      if (data.data && !data.status) {
+        addLogEntry(data.data);
+      }
+
     } else if (data.type === 'log') {
       addLogEntry(data.text);
+
     } else if (data.type === 'reply') {
       const cls = classifyMessage(data.text);
       addMessage(data.text, 'msg-' + cls);
-      // Refresh members in case a worker was created
       if (activeChannel !== null) loadMembers(activeChannel);
-    } else if (data.type === 'permission_request' || data.type === 'clarification_request') {
+
+    } else if (data.type === 'permission_request') {
       addEscalationCard(data);
+
     } else if (data.type === 'escalation_resolved') {
       markEscalationResolved(data.request_id, data.resolution);
+
     } else if (data.type === 'error') {
       addMessage('Error: ' + data.text, 'msg-system');
     }

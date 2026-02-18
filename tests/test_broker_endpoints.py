@@ -1,184 +1,223 @@
-"""Test broker HTTP endpoints and SessionManager ↔ Broker communication.
+"""Test orchestrator daemon HTTP endpoints.
 
-Starts a real broker HTTP server (with mocked Agent SDK) to verify
-the HTTP interface is correct and SessionManager can talk to it.
+Starts a fake daemon app (same routes, mocked RALPH loop) to verify
+the HTTP interface is correct.
 """
 
 import asyncio
 import json
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
 from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase, TestServer
-
-from src.session import SessionManager, ServerConfig, SessionResult
 
 
-# ── Fake broker app (same routes, mocked SDK) ─────────────────────────
+# ── Fake daemon app ───────────────────────────────────────────────────
 
-def create_fake_broker_app(fake_result="Task done.", fake_cost=0.05):
-    """Create a broker-like aiohttp app that returns canned responses."""
-    sessions = {}
+def create_fake_daemon_app():
+    """Create a daemon-like aiohttp app with canned responses."""
+    projects = {}
+    task_states = {}
+    interrupt_queues = {}
 
-    async def handle_run(request):
+    async def handle_register(request):
         data = await request.json()
-        sid = data["session_id"]
+        pid = data.get("project_id")
+        if not pid or not data.get("project_dir"):
+            return web.json_response({"error": "project_id and project_dir required"}, status=400)
+        projects[pid] = data
+        return web.json_response({"ok": True, "project_id": pid})
 
-        if sid in sessions and sessions[sid] == "running":
+    async def handle_task(request):
+        data = await request.json()
+        pid = data.get("project_id")
+        task = data.get("task")
+        if not pid or not task:
+            return web.json_response({"error": "project_id and task required"}, status=400)
+        if pid not in projects:
+            return web.json_response({"error": f"Unknown project: {pid}"}, status=404)
+        if pid in task_states and task_states[pid] == "running":
             return web.json_response(
-                {"error": f"Session {sid} is already running"}, status=409
+                {"error": f"Project {pid} already has a running task"},
+                status=409,
             )
+        task_states[pid] = "running"
+        return web.json_response({"ok": True, "project_id": pid, "status": "started"})
 
-        sessions[sid] = "running"
-        await asyncio.sleep(0.1)  # simulate work
-        sessions[sid] = "idle"
+    async def handle_interrupt(request):
+        data = await request.json()
+        pid = data.get("project_id")
+        msg = data.get("message", "")
+        if pid not in interrupt_queues:
+            interrupt_queues[pid] = []
+        interrupt_queues[pid].append(msg)
+        return web.json_response({"ok": True, "queued": True})
 
+    async def handle_status(request):
+        pid = request.query.get("project_id")
+        if not pid:
+            return web.json_response({
+                p: {"status": s} for p, s in task_states.items()
+            })
+        if pid not in projects:
+            return web.json_response({"error": "Unknown project"}, status=404)
+        status = task_states.get(pid, "idle")
         return web.json_response({
-            "session_id": f"sdk-{sid}-abc123",
-            "result": fake_result,
-            "cost_usd": fake_cost,
-            "duration_secs": 0.1,
+            "project_id": pid,
+            "status": status,
+            "iteration": 3,
+            "max_iterations": 20,
         })
 
-    async def handle_health(request):
-        return web.json_response({"status": "ok", "server": "test"})
-
-    async def handle_sessions(request):
-        return web.json_response([
-            {"session_id": k, "status": v, "sdk_session_id": "", "started_at": 0}
-            for k, v in sessions.items()
-        ])
-
-    async def handle_kill(request):
+    async def handle_stop(request):
         data = await request.json()
-        sid = data.get("session_id")
-        if sid in sessions and sessions[sid] == "running":
-            sessions[sid] = "idle"
-            return web.json_response({"ok": True})
+        pid = data.get("project_id")
+        if pid in task_states and task_states[pid] == "running":
+            task_states[pid] = "stopped"
+            return web.json_response({"ok": True, "status": "stopping"})
         return web.json_response({"ok": False, "reason": "No running task"})
 
+    async def handle_health(request):
+        return web.json_response({"status": "ok", "daemon": "test", "projects": list(projects.keys())})
+
     app = web.Application()
-    app.router.add_post("/run", handle_run)
+    app.router.add_post("/register", handle_register)
+    app.router.add_post("/task", handle_task)
+    app.router.add_post("/interrupt", handle_interrupt)
+    app.router.add_get("/status", handle_status)
+    app.router.add_post("/stop", handle_stop)
     app.router.add_get("/health", handle_health)
-    app.router.add_get("/sessions", handle_sessions)
-    app.router.add_post("/kill", handle_kill)
     return app
 
 
 # ── Tests ──────────────────────────────────────────────────────────────
 
 @pytest.fixture
-async def broker_server(aiohttp_server):
-    app = create_fake_broker_app(fake_result="Hello from broker!")
-    server = await aiohttp_server(app)
-    yield server
-
-
-@pytest.fixture
-async def session_mgr(broker_server):
-    cfg = ServerConfig(
-        name="test-server",
-        host=None,
-        work_dir="/tmp",
-        broker_port=broker_server.port,
-    )
-    mgr = SessionManager(servers=[cfg], default_model="haiku")
-    await mgr.init()
-    yield mgr
-    await mgr.close()
-
-
-@pytest.mark.asyncio
-async def test_health_check(session_mgr):
-    ok = await session_mgr.check_health("test-server")
-    assert ok is True
-
-
-@pytest.mark.asyncio
-async def test_health_check_bad_server(session_mgr):
-    ok = await session_mgr.check_health("nonexistent")
-    assert ok is False
-
-
-@pytest.mark.asyncio
-async def test_run_task_success(session_mgr):
-    result = await session_mgr.run_task("test-server", "dev", "do something")
-    assert isinstance(result, SessionResult)
-    assert result.is_error is False
-    assert result.result_text == "Hello from broker!"
-    assert result.cost_usd == 0.05
-    assert result.duration_secs > 0
-    print(f"Result: {result}")
-
-
-@pytest.mark.asyncio
-async def test_run_task_unknown_server(session_mgr):
-    result = await session_mgr.run_task("nonexistent", "dev", "do something")
-    assert result.is_error is True
-    assert "Unknown server" in result.result_text
-
-
-@pytest.mark.asyncio
-async def test_cancel_task(session_mgr):
-    ok = await session_mgr.cancel_task("test-server", "dev")
-    # No task running, should return False
-    assert ok is False
-
-
-# ── Direct HTTP tests ──────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_broker_run_endpoint(aiohttp_client):
-    app = create_fake_broker_app(fake_result="Direct test")
+async def daemon_client(aiohttp_client):
+    app = create_fake_daemon_app()
     client = await aiohttp_client(app)
-
-    resp = await client.post("/run", json={
-        "session_id": "test-sess",
-        "prompt": "hello",
-        "model": "haiku",
-    })
-    assert resp.status == 200
-    data = await resp.json()
-    assert data["result"] == "Direct test"
-    assert "session_id" in data
-    assert "cost_usd" in data
-    assert "duration_secs" in data
+    return client
 
 
-@pytest.mark.asyncio
-async def test_broker_health_endpoint(aiohttp_client):
-    app = create_fake_broker_app()
-    client = await aiohttp_client(app)
-
-    resp = await client.get("/health")
+async def test_health(daemon_client):
+    resp = await daemon_client.get("/health")
     assert resp.status == 200
     data = await resp.json()
     assert data["status"] == "ok"
 
 
-@pytest.mark.asyncio
-async def test_broker_sessions_endpoint(aiohttp_client):
-    app = create_fake_broker_app()
-    client = await aiohttp_client(app)
-
-    # Run a task first to populate sessions
-    await client.post("/run", json={
-        "session_id": "s1", "prompt": "test", "model": "haiku"
+async def test_register_project(daemon_client):
+    resp = await daemon_client.post("/register", json={
+        "project_id": "test-proj",
+        "project_dir": "/tmp/test",
+        "name": "Test Project",
     })
-
-    resp = await client.get("/sessions")
     assert resp.status == 200
     data = await resp.json()
-    assert len(data) >= 1
-    assert any(s["session_id"] == "s1" for s in data)
+    assert data["ok"] is True
+    assert data["project_id"] == "test-proj"
 
 
-@pytest.mark.asyncio
-async def test_broker_kill_no_task(aiohttp_client):
-    app = create_fake_broker_app()
-    client = await aiohttp_client(app)
+async def test_register_missing_fields(daemon_client):
+    resp = await daemon_client.post("/register", json={"project_id": "test"})
+    assert resp.status == 400
 
-    resp = await client.post("/kill", json={"session_id": "nothing"})
+
+async def test_start_task(daemon_client):
+    # Register first
+    await daemon_client.post("/register", json={
+        "project_id": "proj",
+        "project_dir": "/tmp/proj",
+    })
+
+    resp = await daemon_client.post("/task", json={
+        "project_id": "proj",
+        "task": "fix the bug",
+    })
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ok"] is True
+    assert data["status"] == "started"
+
+
+async def test_start_task_unknown_project(daemon_client):
+    resp = await daemon_client.post("/task", json={
+        "project_id": "nonexistent",
+        "task": "do something",
+    })
+    assert resp.status == 404
+
+
+async def test_start_task_already_running(daemon_client):
+    await daemon_client.post("/register", json={
+        "project_id": "busy",
+        "project_dir": "/tmp/busy",
+    })
+    await daemon_client.post("/task", json={
+        "project_id": "busy",
+        "task": "first task",
+    })
+
+    resp = await daemon_client.post("/task", json={
+        "project_id": "busy",
+        "task": "second task",
+    })
+    assert resp.status == 409
+
+
+async def test_interrupt(daemon_client):
+    resp = await daemon_client.post("/interrupt", json={
+        "project_id": "proj",
+        "message": "also check tests",
+    })
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ok"] is True
+    assert data["queued"] is True
+
+
+async def test_status_all(daemon_client):
+    await daemon_client.post("/register", json={
+        "project_id": "p1",
+        "project_dir": "/tmp/p1",
+    })
+    resp = await daemon_client.get("/status")
+    assert resp.status == 200
+
+
+async def test_status_specific(daemon_client):
+    await daemon_client.post("/register", json={
+        "project_id": "p2",
+        "project_dir": "/tmp/p2",
+    })
+    resp = await daemon_client.get("/status?project_id=p2")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["project_id"] == "p2"
+    assert data["status"] == "idle"
+
+
+async def test_status_unknown(daemon_client):
+    resp = await daemon_client.get("/status?project_id=nope")
+    assert resp.status == 404
+
+
+async def test_stop_running(daemon_client):
+    await daemon_client.post("/register", json={
+        "project_id": "stopme",
+        "project_dir": "/tmp/stopme",
+    })
+    await daemon_client.post("/task", json={
+        "project_id": "stopme",
+        "task": "long task",
+    })
+
+    resp = await daemon_client.post("/stop", json={"project_id": "stopme"})
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ok"] is True
+
+
+async def test_stop_nothing_running(daemon_client):
+    resp = await daemon_client.post("/stop", json={"project_id": "nothing"})
     assert resp.status == 200
     data = await resp.json()
     assert data["ok"] is False

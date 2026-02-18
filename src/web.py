@@ -1,8 +1,8 @@
-"""Web chat frontend — talk to the orchestrator from localhost:8080.
+"""Web chat frontend — talk to the orchestrator daemon from localhost:8080.
 
-Multi-channel chat UI served over HTTP + WebSocket. Each channel has its
-own orchestrator session, workers, messages, and notes.  The left sidebar
-lists channels and lets users create / switch between them.
+Multi-channel chat UI served over HTTP + WebSocket. Each channel is connected
+to a remote orchestrator daemon via the Router. Progress events from daemons
+are streamed to the UI in real-time.
 """
 
 import asyncio
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from aiohttp import web, WSMsgType
 
-from .orchestrator import Orchestrator
+from .router import Router
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -23,12 +23,12 @@ STATIC_DIR = Path(__file__).parent / "static"
 class WebChat:
     def __init__(
         self,
-        orchestrator: Orchestrator,
+        router: Router,
         store: Store,
         host: str = "127.0.0.1",
         port: int = 8080,
     ):
-        self._orchestrator = orchestrator
+        self._router = router
         self._store = store
         self._host = host
         self._port = port
@@ -37,8 +37,9 @@ class WebChat:
         self._runner: web.AppRunner | None = None
         self._app: web.Application | None = None
 
-        # Wire escalation sender
-        self._orchestrator.set_send_telegram(self._send_escalation)
+        # Wire callbacks
+        self._router.set_escalation_callback(self._send_escalation)
+        self._router.set_progress_callback(self._handle_progress)
 
     async def start(self):
         self._app = web.Application()
@@ -49,6 +50,7 @@ class WebChat:
         self._app.router.add_delete("/api/channels/{id}", self._handle_channels_delete)
         self._app.router.add_get("/api/channels/{id}/members", self._handle_channels_members)
         self._app.router.add_get("/api/logs", self._handle_logs)
+        self._app.router.add_get("/api/projects", self._handle_projects_list)
         self._app.router.add_get("/ws", self._handle_ws)
 
         self._runner = web.AppRunner(self._app)
@@ -82,6 +84,11 @@ class WebChat:
 
     async def _handle_channels_list(self, request: web.Request) -> web.Response:
         channels = await self._store.get_channel_list()
+        # Enrich with project info
+        for ch in channels:
+            project_id = self._router.get_channel_project(ch["id"])
+            ch["project_id"] = project_id
+            ch["project_status"] = self._router.get_project_status(project_id) if project_id else "unconnected"
         return web.json_response(channels)
 
     async def _handle_channels_create(self, request: web.Request) -> web.Response:
@@ -90,7 +97,13 @@ class WebChat:
         if not name:
             return web.json_response({"error": "name is required"}, status=400)
         chat_id = await self._store.create_channel(name)
-        return web.json_response({"id": chat_id, "name": name})
+
+        # Auto-connect if project_id provided
+        project_id = body.get("project_id", "").strip()
+        if project_id:
+            await self._router.connect_channel(chat_id, project_id)
+
+        return web.json_response({"id": chat_id, "name": name, "project_id": project_id})
 
     async def _handle_channels_delete(self, request: web.Request) -> web.Response:
         try:
@@ -105,17 +118,20 @@ class WebChat:
             channel_id = int(request.match_info["id"])
         except (ValueError, KeyError):
             return web.json_response({"error": "invalid channel id"}, status=400)
+
         members = [
             {"name": "You", "role": "user"},
-            {"name": "Orchestrator", "role": "orchestrator"},
         ]
-        workers = await self._store.get_channel_workers(channel_id)
-        for w in workers:
-            members.append({
-                "name": f"{w.server}/{w.session_id}",
-                "role": "worker",
-                "detail": w.description,
-            })
+        project_id = self._router.get_channel_project(channel_id)
+        if project_id:
+            orch = self._router._orchestrators.get(project_id)
+            if orch:
+                members.append({
+                    "name": f"Orchestrator ({orch.name})",
+                    "role": "orchestrator",
+                    "detail": f"{project_id} — {orch.status}",
+                })
+
         return web.json_response(members)
 
     async def _handle_logs(self, request: web.Request) -> web.Response:
@@ -129,13 +145,25 @@ class WebChat:
         logs = await self._store.get_logs(channel_id)
         return web.json_response(logs)
 
+    async def _handle_projects_list(self, request: web.Request) -> web.Response:
+        """GET /api/projects — list configured orchestrator projects."""
+        result = []
+        for orch in self._router.list_orchestrators():
+            result.append({
+                "project_id": orch.project_id,
+                "name": orch.name,
+                "host": orch.host,
+                "status": orch.status,
+                "project_dir": orch.project_dir,
+            })
+        return web.json_response(result)
+
     # ── WebSocket handler ──────────────────────────────────────────────
 
     async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        # Replace any existing connection
         if self._ws and not self._ws.closed:
             await self._ws.close()
         self._ws = ws
@@ -152,7 +180,7 @@ class WebChat:
         finally:
             if self._ws is ws:
                 if self._active_channel is not None:
-                    self._orchestrator.remove_status_callback(self._active_channel)
+                    self._router.remove_channel_status_callback(self._active_channel)
                 self._ws = None
                 self._active_channel = None
             log.info("WebSocket client disconnected")
@@ -173,15 +201,24 @@ class WebChat:
             if channel_id is None:
                 await self._ws_send({"type": "error", "text": "missing channel_id"})
                 return
-            # Unregister status callback from old channel
             if self._active_channel is not None:
-                self._orchestrator.remove_status_callback(self._active_channel)
+                self._router.remove_channel_status_callback(self._active_channel)
             self._active_channel = int(channel_id)
-            # Register status callback for new channel
-            async def send_status(status: str):
-                await self._ws_send({"type": "status", "status": status})
-            self._orchestrator.set_status_callback(self._active_channel, send_status)
-            await self._ws_send({"type": "channel_switched", "channel_id": self._active_channel})
+
+            # Register status callback for this channel
+            async def send_status(event: dict):
+                await self._ws_send({"type": "progress", **event})
+            self._router.set_channel_status_callback(self._active_channel, send_status)
+
+            # Send current project status
+            project_id = self._router.get_channel_project(self._active_channel)
+            status = self._router.get_project_status(project_id) if project_id else "unconnected"
+            await self._ws_send({
+                "type": "channel_switched",
+                "channel_id": self._active_channel,
+                "project_id": project_id,
+                "project_status": status,
+            })
 
         elif msg_type == "message":
             if self._active_channel is None:
@@ -194,27 +231,52 @@ class WebChat:
 
             chat_id = self._active_channel
 
+            # Handle /connect command before routing
+            if text.strip().startswith("/connect"):
+                parts = text.strip().split(None, 1)
+                if len(parts) > 1:
+                    project_id = parts[1].strip()
+                    ok = await self._router.connect_channel(chat_id, project_id)
+                    if ok:
+                        orch = self._router._orchestrators.get(project_id)
+                        name = orch.name if orch else project_id
+                        await self._ws_send({"type": "reply", "text": f"Connected to **{name}** (`{project_id}`)"})
+                        await self._ws_send({
+                            "type": "project_connected",
+                            "project_id": project_id,
+                            "project_status": self._router.get_project_status(project_id),
+                        })
+                    else:
+                        available = ", ".join(o.project_id for o in self._router.list_orchestrators())
+                        await self._ws_send({"type": "reply", "text": f"Unknown project: `{project_id}`. Available: {available or '(none)'}"})
+                else:
+                    project_id = self._router.get_channel_project(chat_id)
+                    if project_id:
+                        await self._ws_send({"type": "reply", "text": f"Connected to `{project_id}`"})
+                    else:
+                        await self._ws_send({"type": "reply", "text": "Not connected. Use `/connect <project-id>`"})
+                return
+
             async def send_reply(msg: str):
+                await self._store.add_message(chat_id, "assistant", msg)
                 await self._ws_send({"type": "reply", "text": msg})
 
             async def send_log(msg: str):
                 await self._store.add_log(chat_id, msg)
                 await self._ws_send({"type": "log", "text": msg})
 
-            # Run in background so the WS handler can continue processing
-            # messages (e.g. permission_response) while the orchestrator runs.
+            # Save user message
+            await self._store.add_message(chat_id, "user", text)
+
             asyncio.create_task(
-                self._orchestrator.route_message(
-                    chat_id, text, send_reply, default_direct=True,
-                    send_log=send_log,
-                )
+                self._router.route_message(chat_id, text, send_reply, send_log)
             )
 
         elif msg_type == "permission_response":
             request_id = data.get("request_id", "")
             approved = data.get("approved", False)
             reason = data.get("reason", "Approved" if approved else "Denied")
-            ok = self._orchestrator.resolve_permission(request_id, approved=approved, reason=reason)
+            ok = self._router.resolve_permission(request_id, approved=approved, reason=reason)
             if ok:
                 resolution = "APPROVED" if approved else "DENIED"
                 await self._ws_send({
@@ -223,48 +285,83 @@ class WebChat:
                     "resolution": resolution,
                 })
 
-        elif msg_type == "clarification_response":
-            request_id = data.get("request_id", "")
-            question = data.get("question", "")
-            answer = data.get("answer", "")
-            ok = self._orchestrator.resolve_clarification(request_id, question, answer)
-            if ok:
-                await self._ws_send({
-                    "type": "escalation_resolved",
-                    "request_id": request_id,
-                    "resolution": answer,
-                })
-
         else:
             await self._ws_send({"type": "error", "text": f"Unknown message type: {msg_type}"})
 
-    # ── Escalation sender (wired to orchestrator) ──────────────────────
+    # ── Progress callback (from router) ───────────────────────────────
 
-    async def _send_escalation(
-        self,
-        request_id: str,
-        interaction_type: str,
-        title: str,
-        detail: str,
-    ):
-        """Send a permission or clarification card to the browser."""
-        if interaction_type == "permission":
-            await self._ws_send({
-                "type": "permission_request",
-                "request_id": request_id,
-                "title": title,
-                "detail": detail,
-            })
+    async def _handle_progress(self, project_id: str, event: dict):
+        """Handle a progress event from a daemon (via router)."""
+        # Find which channel this project is connected to
+        for chat_id, pid in self._router._channel_project.items():
+            if pid == project_id and chat_id == self._active_channel:
+                event_type = event.get("type", "")
+                data_text = event.get("data", "")
+                iteration = event.get("iteration", 0)
 
-        elif interaction_type == "clarification":
-            questions = self._orchestrator.get_pending_questions(request_id)
-            await self._ws_send({
-                "type": "clarification_request",
-                "request_id": request_id,
-                "title": title,
-                "detail": detail,
-                "questions": questions or [],
-            })
+                # Forward different event types to the UI
+                if event_type == "text":
+                    await self._ws_send({
+                        "type": "reply",
+                        "text": data_text,
+                    })
+                    await self._store.add_message(chat_id, "assistant", data_text)
+                elif event_type == "tool_use":
+                    await self._ws_send({"type": "log", "text": f"orchestrator -> {data_text}"})
+                    await self._store.add_log(chat_id, f"orchestrator -> {data_text}")
+                elif event_type == "tool_error":
+                    await self._ws_send({"type": "log", "text": f"[ERROR] {data_text}"})
+                    await self._store.add_log(chat_id, f"[ERROR] {data_text}")
+                elif event_type == "iteration":
+                    await self._ws_send({
+                        "type": "progress",
+                        "data": data_text,
+                        "iteration": iteration,
+                    })
+                elif event_type == "done":
+                    await self._ws_send({
+                        "type": "progress",
+                        "data": data_text,
+                        "iteration": iteration,
+                        "status": "done",
+                    })
+                    if data_text:
+                        await self._ws_send({"type": "reply", "text": f"Task complete: {data_text}"})
+                        await self._store.add_message(chat_id, "assistant", f"Task complete: {data_text}")
+                elif event_type == "stuck":
+                    await self._ws_send({
+                        "type": "progress",
+                        "data": data_text,
+                        "iteration": iteration,
+                        "status": "stuck",
+                    })
+                    if data_text:
+                        await self._ws_send({"type": "reply", "text": f"Needs input: {data_text}"})
+                        await self._store.add_message(chat_id, "assistant", f"Needs input: {data_text}")
+                elif event_type == "error":
+                    await self._ws_send({
+                        "type": "progress",
+                        "data": data_text,
+                        "iteration": iteration,
+                        "status": "error",
+                    })
+                break
+
+    # ── Escalation sender ─────────────────────────────────────────────
+
+    async def _send_escalation(self, request_id: str, data: dict):
+        """Send a permission escalation card to the browser."""
+        await self._ws_send({
+            "type": "permission_request",
+            "request_id": request_id,
+            "title": f"Permission: {data.get('tool_name', '?')}",
+            "detail": (
+                f"Daemon: {data.get('daemon_name', '?')}\n"
+                f"Project: {data.get('project_id', '?')}\n"
+                f"Tool: {data.get('tool_name', '?')}\n"
+                f"Input: {json.dumps(data.get('tool_input', {}), ensure_ascii=False)[:500]}"
+            ),
+        })
 
     # ── Helpers ────────────────────────────────────────────────────────
 
