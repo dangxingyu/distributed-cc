@@ -108,8 +108,9 @@ JSON object. No preamble, no commentary, no markdown fences — just the JSON.
 CRITICAL: Never output multiple JSON objects. Never wrap JSON in text. If you used tools, \
 your final text output must be the single JSON action and nothing else.
 
-Do NOT use AskUserQuestion or EnterPlanMode — they are disabled. To ask the user something, \
-use {{"action": "reply", "text": "your question"}}.
+You CAN use EnterPlanMode for complex tasks that need planning before execution. \
+You CAN use AskUserQuestion for structured questions (multiple-choice, preferences). \
+For simple questions, {{"action": "reply", "text": "your question"}} works too.
 
 === CHANNEL WORKERS ===
 
@@ -348,6 +349,14 @@ class Orchestrator:
         - No prefix + not default_direct → channel note
         """
         stripped = raw_text.strip()
+
+        # Check if this answers a pending orchestrator question (avoid deadlock:
+        # the queue processor is blocked awaiting the future, so the answer would
+        # never be dequeued — resolve it directly here instead).
+        pending = self._pending_answers.get(chat_id)
+        if pending and not pending.done():
+            pending.set_result(stripped)
+            return
 
         # @orchestrator /stop
         if _STOP_CMD_RE.match(stripped):
@@ -869,7 +878,7 @@ class Orchestrator:
             # AskUserQuestion is NOT listed so it still goes through can_use_tool.
             allowed_tools=list(self._auto_approve_tools),
             # Block tools the orchestrator shouldn't use (uses JSON actions instead)
-            disallowed_tools=["EnterPlanMode", "ExitPlanMode"],
+            disallowed_tools=[],
             # Disable sandbox so orchestrator can use SSH, curl, etc.
             sandbox={"enabled": False},
         )

@@ -479,6 +479,36 @@ async def test_channel_members(aiohttp_client):
         await store.close()
 
 
+# ── AskUserQuestion deadlock fix ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_route_message_resolves_pending_answer(aiohttp_client):
+    """route_message resolves a pending AskUserQuestion future directly,
+    breaking the deadlock where the queue processor is blocked on the future."""
+    client, web_chat, orch, store, mgr = await _make_web(aiohttp_client)
+    try:
+        ch_id = await store.create_channel("ask-ch")
+        future = asyncio.get_event_loop().create_future()
+        orch._pending_answers[ch_id] = future
+
+        send_reply = AsyncMock()
+        await orch.route_message(ch_id, "  my answer  ", send_reply, default_direct=True)
+
+        # Future should be resolved with the stripped answer
+        assert future.done()
+        assert future.result() == "my answer"
+
+        # Message should NOT be persisted (it's an answer, not a new message)
+        msgs = await store.get_recent_messages(ch_id)
+        assert len(msgs) == 0
+
+        # send_reply should NOT have been called
+        send_reply.assert_not_called()
+    finally:
+        await mgr.close()
+        await store.close()
+
+
 # ── Monitor log messages ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
