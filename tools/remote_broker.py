@@ -130,10 +130,19 @@ async def _handle_clarification(session_id: str, input_data: dict, http: ClientS
 
 # ── Agent SDK runner ───────────────────────────────────────────────────
 
-async def _prompt_stream(prompt: str):
+async def _prompt_stream(prompt: str, done: asyncio.Event | None = None):
     """Wrap a string prompt into an AsyncIterable for streaming mode.
 
     The SDK requires AsyncIterable when can_use_tool is set.
+
+    When `done` is provided, keeps the stream alive until the event is set.
+    This prevents the SDK from closing stdin before control protocol messages
+    (can_use_tool requests/responses) are exchanged. Without this, the SDK
+    calls end_input() immediately after the prompt is sent, which closes
+    stdin and prevents the CLI subprocess from sending can_use_tool control
+    requests back to the SDK.
+
+    The caller should set `done` after receiving the ResultMessage.
     """
     yield {
         "type": "user",
@@ -141,6 +150,8 @@ async def _prompt_stream(prompt: str):
         "message": {"role": "user", "content": prompt},
         "parent_tool_use_id": None,
     }
+    if done is not None:
+        await done.wait()
 
 
 async def run_agent_task(
@@ -176,12 +187,17 @@ async def run_agent_task(
         final_session_id = ""
         cost_usd = 0.0
 
+        # Keep prompt stream alive until result is received so the SDK
+        # doesn't close stdin before can_use_tool control messages finish.
+        done = asyncio.Event()
+
         # SDK requires AsyncIterable prompt when can_use_tool is set
-        async for message in query(prompt=_prompt_stream(prompt), options=options):
+        async for message in query(prompt=_prompt_stream(prompt, done), options=options):
             if isinstance(message, ResultMessage):
                 result_text = message.result or ""
                 final_session_id = message.session_id
                 cost_usd = message.total_cost_usd or 0.0
+                done.set()  # Signal prompt stream to close → stdin EOF → CLI exits
 
         # Save SDK session ID for future --resume
         if final_session_id and sess:

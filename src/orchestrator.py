@@ -59,10 +59,15 @@ _ORCH_PREFIX_RE = re.compile(r"^@orchestrator\s+", re.IGNORECASE)
 _STOP_CMD_RE = re.compile(r"^(?:@orchestrator\s+)?/stop\s*$", re.IGNORECASE)
 
 
-async def _prompt_stream(text: str):
+async def _prompt_stream(text: str, done: asyncio.Event | None = None):
     """Wrap a string prompt into an AsyncIterable for the Agent SDK.
 
     Required when can_use_tool is set — the SDK needs streaming mode.
+
+    When `done` is provided, keeps the stream alive until the event is set.
+    This prevents the SDK from closing stdin before control protocol messages
+    (can_use_tool requests/responses) are exchanged. The caller should set
+    `done` after receiving the ResultMessage.
     """
     yield {
         "type": "user",
@@ -70,6 +75,8 @@ async def _prompt_stream(text: str):
         "message": {"role": "user", "content": text},
         "parent_tool_use_id": None,
     }
+    if done is not None:
+        await done.wait()
 
 
 def _format_questions(questions: list[dict]) -> str:
@@ -896,8 +903,11 @@ class Orchestrator:
 
         try:
             result_text = ""
+            # Keep prompt stream alive until result is received so the SDK
+            # doesn't close stdin before can_use_tool control messages finish.
+            done = asyncio.Event()
             async for message in query(
-                prompt=_prompt_stream(text), options=options
+                prompt=_prompt_stream(text, done), options=options
             ):
                 if isinstance(message, AssistantMessage):
                     await self._forward_assistant_message(
@@ -906,6 +916,7 @@ class Orchestrator:
                 elif isinstance(message, ResultMessage):
                     result_text = message.result or ""
                     self._orchestrator_sessions[chat_id] = message.session_id
+                    done.set()  # Signal prompt stream to close
 
             # Parse JSON — strip markdown fences if present
             clean = result_text.strip()

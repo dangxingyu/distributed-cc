@@ -26,14 +26,24 @@ def _clear_nesting_guard():
     os.environ.pop("CLAUDECODE", None)
 
 
-async def _prompt_stream(text: str):
-    """Wrap a string prompt into AsyncIterable for streaming mode."""
+async def _prompt_stream(text: str, done: asyncio.Event | None = None):
+    """Wrap a string prompt into AsyncIterable for streaming mode.
+
+    When `done` is provided, keeps the stream alive until the event is set.
+    This prevents the SDK from closing stdin before can_use_tool control
+    protocol messages are exchanged.
+    """
     yield {
         "type": "user",
         "session_id": "",
         "message": {"role": "user", "content": text},
         "parent_tool_use_id": None,
     }
+    if done is not None:
+        await done.wait()
+
+
+# ── Broker helpers ────────────────────────────────────────────────────
 
 
 def _setup_broker_app():
@@ -73,10 +83,80 @@ def _patch_broker_globals(name: str, work_dir: str, orch_url: str):
     return restore
 
 
-# ── Agent SDK direct tests ─────────────────────────────────────────────
+# ── Full stack helper ─────────────────────────────────────────────────
 
+
+async def _setup_full_stack(broker_port: int, http_port: int):
+    """Boot broker + permission/clarification HTTP server + orchestrator.
+
+    Returns (orch, store, mgr, broker_runner, http_runner, restore, cleanup).
+    """
+    restore = _patch_broker_globals(
+        name="local",
+        work_dir="/tmp",
+        orch_url=f"http://127.0.0.1:{http_port}",
+    )
+
+    # Start broker
+    broker_app = _setup_broker_app()
+    broker_runner = web.AppRunner(broker_app)
+    await broker_runner.setup()
+    broker_site = web.TCPSite(broker_runner, "127.0.0.1", broker_port)
+    await broker_site.start()
+
+    # Orchestrator stack
+    store = Store(tempfile.mkdtemp())
+    await store.init()
+
+    cfg = ServerConfig(name="local", host=None, broker_port=broker_port)
+    mgr = SessionManager(servers=[cfg], default_model="haiku")
+    await mgr.init()
+
+    orch = Orchestrator(
+        session_mgr=mgr,
+        store=store,
+        model="haiku",
+        config_path="config.yaml",
+    )
+    await orch.init()
+
+    # HTTP callback server (permission + clarification endpoints)
+    http_app = web.Application()
+    http_app["orchestrator"] = orch
+
+    async def handle_perm(req):
+        data = await req.json()
+        result = await orch.handle_permission_request(data)
+        return web.json_response(result)
+
+    async def handle_clarification(req):
+        data = await req.json()
+        result = await orch.handle_clarification_request(data)
+        return web.json_response(result)
+
+    http_app.router.add_post("/permission", handle_perm)
+    http_app.router.add_post("/clarification", handle_clarification)
+    http_runner = web.AppRunner(http_app)
+    await http_runner.setup()
+    http_site = web.TCPSite(http_runner, "127.0.0.1", http_port)
+    await http_site.start()
+
+    async def cleanup():
+        await http_runner.cleanup()
+        await broker_runner.cleanup()
+        await mgr.close()
+        await store.close()
+        restore()
+
+    return orch, store, mgr, broker_runner, http_runner, restore, cleanup
+
+
+# ── T1: Agent SDK basic query ────────────────────────────────────────
+
+
+@pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_e2e_agent_sdk_query():
+async def test_e2e_sdk_basic():
     """Agent SDK query() works and returns a ResultMessage."""
     _clear_nesting_guard()
     options = ClaudeAgentOptions(
@@ -97,40 +177,16 @@ async def test_e2e_agent_sdk_query():
     assert got_result, "Never received a ResultMessage"
 
 
+# ── T2: Agent SDK session resume ─────────────────────────────────────
+
+
+@pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_e2e_agent_sdk_can_use_tool():
-    """canUseTool callback is invoked and can approve tools."""
+async def test_e2e_sdk_resume():
+    """Session resume works via Agent SDK — context persists across calls."""
     _clear_nesting_guard()
-    tool_calls = []
 
-    async def track_tools(tool_name, input_data, context=None):
-        tool_calls.append(tool_name)
-        return PermissionResultAllow(updated_input=input_data)
-
-    options = ClaudeAgentOptions(
-        model="haiku",
-        cwd="/tmp",
-        can_use_tool=track_tools,
-    )
-
-    # SDK requires AsyncIterable prompt when can_use_tool is set
-    async for message in query(
-        prompt=_prompt_stream("Read the file /tmp/.gitignore or any small file. If it doesn't exist, just say so."),
-        options=options,
-    ):
-        if isinstance(message, ResultMessage):
-            print(f"Tools called: {tool_calls}")
-            print(f"Result: {message.result[:200]}")
-
-    # The agent should have tried to use at least one tool
-    print(f"All tool calls: {tool_calls}")
-
-
-@pytest.mark.asyncio
-async def test_e2e_agent_sdk_resume():
-    """Session resume works via Agent SDK."""
-    _clear_nesting_guard()
-    # First query
+    # First query: establish context
     session_id = None
     options = ClaudeAgentOptions(model="haiku", cwd="/tmp")
 
@@ -140,7 +196,7 @@ async def test_e2e_agent_sdk_resume():
 
     assert session_id, "No session_id from first query"
 
-    # Resume
+    # Second query: resume and verify context
     options2 = ClaudeAgentOptions(model="haiku", cwd="/tmp", resume=session_id)
     async for message in query(
         prompt="What fruit did I mention? Reply with just the word.",
@@ -151,17 +207,19 @@ async def test_e2e_agent_sdk_resume():
             print(f"Resumed OK: {message.result[:100]}")
 
 
-# ── Broker + SessionManager integration ────────────────────────────────
+# ── T3: Broker round trip ────────────────────────────────────────────
 
+
+@pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_e2e_broker_round_trip():
-    """Start a real broker in-process, register a session, send a task via SessionManager."""
+    """SessionManager -> broker /run -> real Claude -> result. No orchestrator."""
     _clear_nesting_guard()
 
     restore = _patch_broker_globals(
         name="test",
         work_dir="/tmp",
-        orch_url="http://127.0.0.1:19999",  # dummy — won't trigger permission in this test
+        orch_url="http://127.0.0.1:19999",  # dummy — won't trigger permission
     )
 
     app = _setup_broker_app()
@@ -171,7 +229,6 @@ async def test_e2e_broker_round_trip():
     await site.start()
 
     try:
-        # Use SessionManager to talk to the broker
         cfg = ServerConfig(name="test", host=None, broker_port=18200)
         mgr = SessionManager(servers=[cfg], default_model="haiku")
         await mgr.init()
@@ -180,11 +237,11 @@ async def test_e2e_broker_round_trip():
         ok = await mgr.check_health("test")
         assert ok, "Broker health check failed"
 
-        # Register a session first (matching current broker flow)
+        # Register session
         reg_result = await mgr.register_session("test", "e2e-test", "/tmp", "e2e test session")
         assert reg_result.get("ok"), f"Registration failed: {reg_result}"
 
-        # Run a simple task
+        # Run a task
         result = await mgr.run_task(
             "test", "e2e-test",
             "Reply with exactly: E2E_SUCCESS",
@@ -200,89 +257,169 @@ async def test_e2e_broker_round_trip():
         await runner.cleanup()
 
 
-# ── Full stack: Orchestrator → SessionManager → Broker ──────────────────
+# ── T4: Worker permission callback ───────────────────────────────────
 
+
+@pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_e2e_full_stack():
-    """Orchestrator routes a message → broker executes → result comes back.
+async def test_e2e_worker_permission_callback():
+    """Full stack: worker triggers a tool requiring permission.
 
-    This is the full flow minus the frontend.
+    Worker task writes a file -> broker POSTs to /permission -> orchestrator
+    auto-approves -> worker completes.
     """
     _clear_nesting_guard()
 
-    restore = _patch_broker_globals(
-        name="local",
-        work_dir="/tmp",
-        orch_url="http://127.0.0.1:19121",
+    permission_requests = []
+
+    orch, store, mgr, _, _, _, cleanup = await _setup_full_stack(
+        broker_port=18210, http_port=19130,
     )
 
-    # Start broker
-    broker_app = _setup_broker_app()
-    broker_runner = web.AppRunner(broker_app)
-    await broker_runner.setup()
-    broker_site = web.TCPSite(broker_runner, "127.0.0.1", 18201)
-    await broker_site.start()
-
-    # Set up orchestrator stack
-    store = Store(tempfile.mkdtemp())
-    await store.init()
-
-    cfg = ServerConfig(name="local", host=None, broker_port=18201)
-    mgr = SessionManager(servers=[cfg], default_model="haiku")
-    await mgr.init()
-
-    orch = Orchestrator(
-        session_mgr=mgr,
-        store=store,
-        model="haiku",
-        config_path="config.yaml",
-    )
-    await orch.init()
-
-    # Auto-approve all worker permissions
-    async def approve_all(data):
+    # Track and auto-approve all permission requests
+    async def tracking_handler(data):
+        permission_requests.append(data)
         return {"approved": True, "reason": "test auto-approve"}
-    orch.handle_permission_request = approve_all
 
-    # Start permission callback server
-    perm_app = web.Application()
-    perm_app["orchestrator"] = orch
-
-    async def handle_perm(req):
-        data = await req.json()
-        result = await orch.handle_permission_request(data)
-        return web.json_response(result)
-
-    perm_app.router.add_post("/permission", handle_perm)
-    perm_runner = web.AppRunner(perm_app)
-    await perm_runner.setup()
-    perm_site = web.TCPSite(perm_runner, "127.0.0.1", 19121)
-    await perm_site.start()
+    orch.handle_permission_request = tracking_handler
 
     try:
-        # Register a session on the broker first
-        reg_result = await mgr.register_session("local", "fullstack-test", "/tmp", "full stack test")
-        assert reg_result.get("ok"), f"Registration failed: {reg_result}"
+        # Register a session
+        reg = await mgr.register_session("local", "perm-test", "/tmp", "permission test")
+        assert reg.get("ok"), f"Registration failed: {reg}"
 
-        # Directly execute a task (bypasses routing Claude)
-        result = await mgr.run_task("local", "fullstack-test", "Reply with exactly: FULLSTACK_OK")
+        # Task that requires a tool permission (Write)
+        result = await mgr.run_task(
+            "local", "perm-test",
+            "Write the text 'PERM_TEST_OK' to the file /tmp/e2e_perm_test.txt. "
+            "Then read it back and reply with its contents.",
+        )
 
-        print(f"Full stack result: {result.result_text[:200]}")
-        assert not result.is_error, f"Failed: {result.result_text}"
-        assert "FULLSTACK_OK" in result.result_text
+        print(f"Permission test result: {result.result_text[:200]}")
+        print(f"Permission requests received: {len(permission_requests)}")
+        for pr in permission_requests:
+            print(f"  tool={pr.get('tool_name')}, session={pr.get('session_id')}")
+
+        assert not result.is_error, f"Task failed: {result.result_text}"
+        assert "PERM_TEST_OK" in result.result_text, f"Unexpected: {result.result_text[:200]}"
+        assert len(permission_requests) > 0, "No permission requests received"
 
     finally:
-        await perm_runner.cleanup()
-        await broker_runner.cleanup()
-        await mgr.close()
-        await store.close()
-        restore()
+        # Clean up test file
+        try:
+            os.remove("/tmp/e2e_perm_test.txt")
+        except FileNotFoundError:
+            pass
+        await cleanup()
 
 
-# ── Dynamic server registration ────────────────────────────────────────
+# ── T5: Worker clarification callback ────────────────────────────────
 
+
+@pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_e2e_register_server_dynamic():
+async def test_e2e_worker_clarification_callback():
+    """Full stack: worker calls AskUserQuestion -> broker POSTs /clarification
+    -> orchestrator answers -> worker completes with answer.
+    """
+    _clear_nesting_guard()
+
+    clarification_requests = []
+
+    orch, store, mgr, _, _, _, cleanup = await _setup_full_stack(
+        broker_port=18211, http_port=19131,
+    )
+
+    # Track and auto-answer all clarification requests
+    async def tracking_clarification(data):
+        clarification_requests.append(data)
+        # Answer all questions with "blue"
+        answers = {}
+        for q in data.get("questions", []):
+            answers[q.get("question", "")] = "blue"
+        return {"answers": answers}
+
+    orch.handle_clarification_request = tracking_clarification
+
+    try:
+        reg = await mgr.register_session("local", "clarify-test", "/tmp", "clarification test")
+        assert reg.get("ok"), f"Registration failed: {reg}"
+
+        # Task that forces AskUserQuestion
+        result = await mgr.run_task(
+            "local", "clarify-test",
+            "Use the AskUserQuestion tool to ask the user: 'What is your favorite color?' "
+            "with options 'red', 'blue', 'green'. "
+            "After getting the answer, reply with: 'Your color is: <answer>'.",
+        )
+
+        print(f"Clarification test result: {result.result_text[:200]}")
+        print(f"Clarification requests received: {len(clarification_requests)}")
+
+        assert not result.is_error, f"Task failed: {result.result_text}"
+        # The worker should have received "blue" as the answer
+        assert "blue" in result.result_text.lower(), f"Answer not incorporated: {result.result_text[:200]}"
+        assert len(clarification_requests) > 0, "No clarification requests received"
+
+    finally:
+        await cleanup()
+
+
+# ── T6: Plan mode in worker ──────────────────────────────────────────
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_plan_mode_in_worker():
+    """Worker enters plan mode, plans, exits, and executes.
+
+    EnterPlanMode/ExitPlanMode are NOT blocked — worker can use them.
+    """
+    _clear_nesting_guard()
+
+    orch, store, mgr, _, _, _, cleanup = await _setup_full_stack(
+        broker_port=18212, http_port=19132,
+    )
+
+    # Auto-approve all permissions
+    async def auto_approve(data):
+        return {"approved": True, "reason": "auto-approve for plan mode test"}
+
+    orch.handle_permission_request = auto_approve
+
+    try:
+        reg = await mgr.register_session("local", "plan-test", "/tmp", "plan mode test")
+        assert reg.get("ok"), f"Registration failed: {reg}"
+
+        # Multi-step task — worker may use plan mode
+        result = await mgr.run_task(
+            "local", "plan-test",
+            "Create a file /tmp/e2e_plan_test.txt with the content 'step1'. "
+            "Then create /tmp/e2e_plan_test2.txt with 'step2'. "
+            "Finally, read both files and reply with their combined contents.",
+        )
+
+        print(f"Plan mode result: {result.result_text[:300]}")
+
+        assert not result.is_error, f"Task failed: {result.result_text}"
+        assert "step1" in result.result_text.lower(), f"step1 missing: {result.result_text[:200]}"
+        assert "step2" in result.result_text.lower(), f"step2 missing: {result.result_text[:200]}"
+
+    finally:
+        for f in ["/tmp/e2e_plan_test.txt", "/tmp/e2e_plan_test2.txt"]:
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+        await cleanup()
+
+
+# ── T7: Dynamic server registration ─────────────────────────────────
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_dynamic_server_registration():
     """SessionManager.add_server() makes a new server immediately usable."""
     _clear_nesting_guard()
 
@@ -303,7 +440,7 @@ async def test_e2e_register_server_dynamic():
         mgr = SessionManager(servers=[], default_model="haiku")
         await mgr.init()
 
-        # Dynamically add a server (like /setup would do)
+        # Dynamically add a server
         mgr.add_server(ServerConfig(name="dynamic", host=None, broker_port=18202))
 
         # Should now be reachable

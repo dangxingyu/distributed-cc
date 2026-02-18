@@ -43,7 +43,7 @@ async def test_route_direct_message():
     try:
         calls = []
 
-        async def mock_handle(chat_id, text, send_reply):
+        async def mock_handle(chat_id, text, send_reply, send_log=None):
             calls.append((chat_id, text))
             await send_reply("ok")
 
@@ -116,7 +116,7 @@ async def test_route_default_direct():
     try:
         calls = []
 
-        async def mock_handle(chat_id, text, send_reply):
+        async def mock_handle(chat_id, text, send_reply, send_log=None):
             calls.append((chat_id, text))
 
         orch.handle_message = mock_handle
@@ -230,7 +230,7 @@ async def test_queue_ack_when_busy():
 
         handle_called = asyncio.Event()
 
-        async def mock_handle(chat_id, text, send_fn):
+        async def mock_handle(chat_id, text, send_fn, send_log=None):
             handle_called.set()
 
         orch.handle_message = mock_handle
@@ -264,7 +264,7 @@ async def test_note_injection_in_send():
 
         captured_text = []
 
-        async def mock_unlocked(chat_id, text):
+        async def mock_unlocked(chat_id, text, send_reply=None, send_log=None):
             captured_text.append(text)
             return {"action": "reply", "text": "ok"}
 
@@ -293,7 +293,7 @@ async def test_note_injection_noop_when_empty():
     try:
         captured_text = []
 
-        async def mock_unlocked(chat_id, text):
+        async def mock_unlocked(chat_id, text, send_reply=None, send_log=None):
             captured_text.append(text)
             return {"action": "reply", "text": "ok"}
 
