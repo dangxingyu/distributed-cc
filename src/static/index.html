@@ -106,6 +106,14 @@ body {
   color: var(--accent);
 }
 
+.channel-item .ch-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .channel-item .hash {
   color: var(--text-muted);
   font-weight: 700;
@@ -116,6 +124,29 @@ body {
 .channel-item.active .hash {
   color: var(--accent);
   opacity: 1;
+}
+
+.channel-item .ch-delete {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color 0.1s ease;
+}
+
+.channel-item:hover .ch-delete {
+  display: block;
+}
+
+.channel-item .ch-delete:hover {
+  color: var(--red);
 }
 
 #new-channel-btn {
@@ -777,10 +808,38 @@ function renderChannelList() {
   for (const ch of channels) {
     const item = document.createElement('div');
     item.className = 'channel-item' + (activeChannel === ch.id ? ' active' : '');
-    item.innerHTML = '<span class="hash">#</span> ' + escapeHtml(ch.name);
+    item.innerHTML = '<span class="hash">#</span><span class="ch-name">' + escapeHtml(ch.name) + '</span>';
     item.onclick = () => switchChannel(ch.id);
+
+    const del = document.createElement('button');
+    del.className = 'ch-delete';
+    del.textContent = '\u00d7';
+    del.title = 'Delete channel';
+    del.onclick = (e) => { e.stopPropagation(); deleteChannel(ch.id, ch.name); };
+    item.appendChild(del);
+
     channelListEl.appendChild(item);
   }
+}
+
+function deleteChannel(channelId, name) {
+  if (!confirm('Delete #' + name + '? This cannot be undone.')) return;
+  fetch('/api/channels/' + channelId, { method: 'DELETE' })
+    .then(r => r.json())
+    .then(() => {
+      channels = channels.filter(c => c.id !== channelId);
+      if (activeChannel === channelId) {
+        activeChannel = null;
+        channelTitle.textContent = 'distributed-cc';
+        messagesEl.style.display = 'none';
+        noChannelEl.style.display = 'flex';
+        membersBtn.style.display = 'none';
+        if (channels.length > 0) {
+          switchChannel(channels[0].id);
+        }
+      }
+      renderChannelList();
+    });
 }
 
 function switchChannel(channelId) {
