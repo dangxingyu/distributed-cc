@@ -58,7 +58,7 @@ Instead of manually installing brokers and opening tunnels, you can let the orch
 /setup della at xd7812@della-gpu
 ```
 
-The orchestrator will SSH in, install the broker if needed, start it in a tmux session, open SSH tunnels, and verify connectivity. You can also just type `/setup` and it will read from `config.yaml` / `config.md`, or ask for clarification if info is missing.
+The orchestrator will SSH in, install the broker if needed, start it in a tmux session, open SSH tunnels, and verify connectivity. You can also just type `/setup` and it will read from `config.json` / `config.md`, or ask for clarification if info is missing.
 
 Works with servers not yet in your config — just describe them in the message.
 
@@ -141,24 +141,19 @@ git clone https://github.com/dangxingyu/distributed-cc.git
 cd distributed-cc
 uv sync --extra dev --extra telegram
 
-cp config.example.yaml config.yaml
+cp config.example.json config.json
 ```
 
-Edit `config.yaml` — the key section is `servers`, where each entry's `broker_port` must match the local side of your SSH tunnel:
+Edit `config.json` — the orchestrator reads this on startup to discover servers. Each entry's `broker_port` must match the local side of your SSH tunnel:
 
-```yaml
-servers:
-  - name: server-a
-    host: user@server-a.example.com
-    broker_port: 8201       # matches: ssh -L 8201:localhost:8200
-
-  - name: server-b
-    host: user@server-b.example.com
-    broker_port: 8202       # matches: ssh -L 8202:localhost:8200
-
-  - name: local
-    host: null              # no SSH needed
-    broker_port: 8200       # direct connection
+```json
+{
+  "servers": [
+    {"name": "server-a", "host": "user@server-a.example.com", "broker_port": 8201},
+    {"name": "server-b", "host": "user@server-b.example.com", "broker_port": 8202},
+    {"name": "local", "host": null, "broker_port": 8200}
+  ]
+}
 ```
 
 ### Step 5: Start the orchestrator
@@ -166,7 +161,7 @@ servers:
 ```bash
 make run              # Web app at localhost:8080 (default)
 make run-cli          # CLI mode (terminal REPL)
-make run-telegram     # Telegram bot mode
+make run-telegram     # Telegram bot mode (needs TELEGRAM_TOKEN env var)
 ```
 
 The web app is the recommended interface — it gives you channels, real-time streaming, and inline permission/clarification cards. The orchestrator also starts a callback HTTP server on `:9120` (for broker permission requests) and connects to brokers via the configured ports.
@@ -194,15 +189,14 @@ The broker and tunnels can be left running indefinitely. Only the orchestrator n
 
 ## Configuration
 
-See `config.example.yaml` for all options. Key sections:
+The orchestrator reads `config.json` from the working directory on startup to discover servers and preferences. See `config.example.json` for all options. Key sections:
 
 - **servers** — list of remote/local servers with broker ports (sessions register dynamically)
 - **orchestrator** — model selection, tool permission config (auto-approve, deny, escalate-to-human)
-- **http** — callback HTTP server port for broker permission/clarification requests
-- **telegram** — bot token and allowed user IDs (for Telegram mode)
-- **data** — directory for JSON persistence files
 
-Optionally, create a `config.md` alongside `config.yaml` for extra instructions
+Infrastructure settings (ports, data dir) use sensible defaults and can be overridden via CLI flags (`--http-port`, `--web-port`, `--web-host`, `--data-dir`). Telegram mode reads `TELEGRAM_TOKEN` and `TELEGRAM_ALLOWED_USERS` from environment variables.
+
+Optionally, create a `config.md` alongside `config.json` for extra instructions
 (server notes, rules, preferences). The orchestrator reads it for additional context.
 See `config.example.md` for an example.
 
@@ -236,7 +230,7 @@ tools/
   install-broker.sh  — one-line remote installer
   start_tunnels.sh   — SSH tunnel helper
 
-config.example.yaml  — example configuration (YAML)
+config.example.json  — example configuration (JSON)
 config.example.md    — example extra instructions (optional)
 ```
 

@@ -2,19 +2,19 @@
 
 # Run orchestrator with web chat frontend (default)
 run:
-	uv run python -m src --config config.yaml
+	uv run python -m src
 
 # Alias for `make run`
 run-web:
-	uv run python -m src --config config.yaml
+	uv run python -m src
 
 # Run orchestrator with CLI frontend
 run-cli:
-	uv run python -m src --config config.yaml --cli
+	uv run python -m src --cli
 
-# Run orchestrator with Telegram bot frontend
+# Run orchestrator with Telegram bot frontend (requires TELEGRAM_TOKEN env var)
 run-telegram:
-	uv run python -m src --config config.yaml --telegram
+	uv run python -m src --telegram
 
 # Run unit/integration tests (no real Claude calls)
 test:

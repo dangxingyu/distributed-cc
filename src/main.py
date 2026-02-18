@@ -3,10 +3,13 @@
 Supports three frontend modes:
   --web       Web chat UI on localhost (default)
   --cli       Terminal REPL
-  --telegram  Telegram bot (requires token in config)
+  --telegram  Telegram bot (requires TELEGRAM_TOKEN env var)
 
 Priority: --web (default) > --telegram > --cli.
 All modes start the HTTP callback server for broker permission/clarification.
+
+The orchestrator reads config.json from the working directory on init
+to discover servers, model preferences, and tool permissions.
 """
 
 import argparse
@@ -16,11 +19,10 @@ import os
 import signal
 import sys
 
-import yaml
 from aiohttp import web
 
 from .store import Store
-from .session import SessionManager, ServerConfig
+from .session import SessionManager
 from .orchestrator import Orchestrator
 
 logging.basicConfig(
@@ -28,24 +30,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
-
-
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def build_server_configs(cfg: dict) -> list[ServerConfig]:
-    servers = []
-    for s in cfg.get("servers", []):
-        servers.append(ServerConfig(
-            name=s["name"],
-            host=s.get("host"),
-            broker_port=s.get("broker_port", 8200),
-            ssh_options=s.get("ssh_options", ""),
-            work_dir=s.get("work_dir", ""),
-        ))
-    return servers
 
 
 # ── HTTP handlers for broker callbacks ─────────────────────────────────
@@ -88,60 +72,50 @@ async def start_http_server(app: web.Application, port: int):
 
 async def main():
     parser = argparse.ArgumentParser(description="Claude Code Orchestrator")
-    parser.add_argument("--config", default="config.yaml", help="Config file path")
     parser.add_argument("--web", action="store_true", default=True, help="Use web chat frontend (default)")
     parser.add_argument("--cli", action="store_true", help="Use CLI REPL frontend")
     parser.add_argument("--telegram", action="store_true", help="Use Telegram bot frontend")
+    parser.add_argument("--http-port", type=int, default=9120, help="Callback HTTP server port")
+    parser.add_argument("--web-port", type=int, default=8080, help="Web chat frontend port")
+    parser.add_argument("--web-host", default="127.0.0.1", help="Web chat frontend bind address")
+    parser.add_argument("--data-dir", default="./data", help="Data directory for persistence")
     args = parser.parse_args()
 
     # Priority: --cli/--telegram override web default
     use_web = not args.cli and not args.telegram
     use_telegram = args.telegram
 
-    cfg = load_config(args.config)
-
     # Store
-    store = Store(cfg.get("data", {}).get("dir", "./data"))
+    store = Store(args.data_dir)
     await store.init()
 
-    # Session manager
-    orch_cfg = cfg.get("orchestrator", {})
-    server_configs = build_server_configs(cfg)
-    session_mgr = SessionManager(
-        servers=server_configs,
-        default_model=orch_cfg.get("session_model", "claude-opus-4-6"),
-    )
+    # Session manager (starts empty — orchestrator registers servers from config.json)
+    session_mgr = SessionManager(servers=[])
     await session_mgr.init()
 
-    # Orchestrator
+    # Orchestrator (reads config.json from cwd for servers, model, permissions)
     orchestrator = Orchestrator(
         session_mgr=session_mgr,
         store=store,
-        model=orch_cfg.get("model", "claude-opus-4-6"),
-        cwd=os.path.dirname(os.path.abspath(args.config)) or ".",
-        orch_config=orch_cfg,
     )
     await orchestrator.init()
 
     # HTTP server for broker callbacks (always runs)
-    # Support both old "permission.port" and new "http.port" config keys
-    http_cfg = cfg.get("http", cfg.get("permission", {}))
     http_app = web.Application()
     http_app["orchestrator"] = orchestrator
     http_app.router.add_post("/permission", handle_permission)
     http_app.router.add_post("/clarification", handle_clarification)
-    http_runner = await start_http_server(http_app, http_cfg.get("port", 9120))
+    http_runner = await start_http_server(http_app, args.http_port)
 
     # Frontend
     frontend = None
     if use_web:
         from .web import WebChat
-        web_cfg = cfg.get("web", {})
         frontend = WebChat(
             orchestrator=orchestrator,
             store=store,
-            host=web_cfg.get("host", "127.0.0.1"),
-            port=web_cfg.get("port", 8080),
+            host=args.web_host,
+            port=args.web_port,
         )
         await frontend.start()
         log.info("Running with Web frontend. Ctrl+C to stop.")
@@ -155,13 +129,15 @@ async def main():
         await frontend.stop()
     elif use_telegram:
         from .bot import Bot
-        tg_cfg = cfg.get("telegram", {})
-        if not tg_cfg.get("token"):
-            log.error("Telegram mode requires telegram.token in config")
+        token = os.environ.get("TELEGRAM_TOKEN", "")
+        allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
+        if not token:
+            log.error("Telegram mode requires TELEGRAM_TOKEN env var")
             sys.exit(1)
+        allowed_users = [int(u) for u in allowed.split(",") if u.strip()]
         frontend = Bot(
-            token=tg_cfg["token"],
-            allowed_users=tg_cfg.get("allowed_users", []),
+            token=token,
+            allowed_users=allowed_users,
             orchestrator=orchestrator,
         )
         await frontend.start()

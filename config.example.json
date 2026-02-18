@@ -1,0 +1,33 @@
+{
+  "servers": [
+    {
+      "name": "server-a",
+      "host": "user@server-a.example.com",
+      "broker_port": 8201,
+      "ssh_options": "-o ConnectTimeout=10"
+    },
+    {
+      "name": "server-b",
+      "host": "user@server-b.example.com",
+      "broker_port": 8202,
+      "ssh_options": ""
+    },
+    {
+      "name": "local",
+      "host": null,
+      "broker_port": 8200
+    }
+  ],
+
+  "orchestrator": {
+    "model": "claude-opus-4-6",
+    "session_model": "claude-opus-4-6",
+    "permissions": {
+      "auto_approve": [
+        "Read", "Glob", "Grep", "WebSearch", "WebFetch",
+        "Bash", "Write", "Edit"
+      ],
+      "deny": []
+    }
+  }
+}

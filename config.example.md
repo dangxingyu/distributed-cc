@@ -1,7 +1,7 @@
 # Extra Instructions
 
 Optional notes for the orchestrator and permission evaluator.
-Put anything here that doesn't fit neatly into `config.yaml` — the AI agents
+Put anything here that doesn't fit neatly into `config.json` — the AI agents
 will read this file alongside the YAML config for additional context.
 
 ## Server Notes

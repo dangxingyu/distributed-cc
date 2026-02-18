@@ -100,7 +100,7 @@ next steps autonomously. If the professor doesn't respond, figure it out yoursel
 You are in a project channel. Each channel is one project.
 
 SETUP: At the start of a conversation, look for local config files in the working directory: \
-`config.md`, `setup.md`, `config.yaml`, or `config.json`. Read whichever exist for server \
+`config.md`, `setup.md`, or `config.json`. Read whichever exist for server \
 details, project context, and extra instructions.
 
 === RESPONSE FORMAT ===
@@ -209,7 +209,7 @@ direct requests. Acknowledge naturally within your response.
 SETUP_PROMPT = """\
 [SETUP TASK]
 Set up server connections. Use Bash to SSH in, install broker, start it, open tunnels, \
-and verify. Read local config files (`config.md`, `config.yaml`, etc.) for server details.
+and verify. Read local config files (`config.md`, `config.json`, etc.) for server details.
 
 For each remote server:
 1. Check/install broker: `ssh <host> 'test -f ~/.distributed-cc/remote_broker.py && echo ok || \
@@ -233,7 +233,6 @@ class Orchestrator:
         store: Store,
         model: str = "claude-opus-4-6",
         cwd: str = ".",
-        orch_config: dict | None = None,
     ):
         self._session_mgr = session_mgr
         self._store = store
@@ -244,12 +243,11 @@ class Orchestrator:
         # Per-chat orchestrator session IDs for --resume
         self._orchestrator_sessions: dict[int, str] = {}
 
-        # Tool permission config (from orchestrator.permissions in config)
-        perm_cfg = (orch_config or {}).get("permissions", {})
-        self._auto_approve_tools: set[str] = set(
-            perm_cfg.get("auto_approve", ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", "Write", "Edit"])
-        )
-        self._denied_tools: set[str] = set(perm_cfg.get("deny", []))
+        # Tool permission defaults (overridden by config.json orchestrator.permissions)
+        self._auto_approve_tools: set[str] = {
+            "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", "Write", "Edit"
+        }
+        self._denied_tools: set[str] = set()
 
         # AskUserQuestion routing: store send_reply per chat during _send_to_orchestrator
         self._active_reply_fns: dict[int, callable] = {}
@@ -280,11 +278,50 @@ class Orchestrator:
         self._chat_status: dict[int, str] = {}  # "busy" | "idle"
 
     async def init(self):
-        """Initialize: populate worker-to-chat reverse index from store."""
+        """Initialize: read config.json from cwd, register servers, populate indexes."""
+        self._load_config()
+
         for chat_id in await self._store.get_all_channel_ids():
             workers = await self._store.get_channel_workers(chat_id)
             for w in workers:
                 self._worker_to_chat[(w.server, w.session_id)] = chat_id
+
+    def _load_config(self):
+        """Read config.json from working directory if it exists.
+
+        Discovers servers, model preferences, and tool permissions.
+        """
+        config_path = os.path.join(self._cwd, "config.json")
+        if not os.path.exists(config_path):
+            log.info("No config.json in %s, using defaults", self._cwd)
+            return
+
+        with open(config_path) as f:
+            cfg = json.load(f)
+        log.info("Loaded config.json from %s", self._cwd)
+
+        # Register servers
+        from .session import ServerConfig
+        for s in cfg.get("servers", []):
+            self._session_mgr.add_server(ServerConfig(
+                name=s["name"],
+                host=s.get("host"),
+                broker_port=s.get("broker_port", 8200),
+                ssh_options=s.get("ssh_options", ""),
+                work_dir=s.get("work_dir", ""),
+            ))
+
+        # Orchestrator preferences
+        orch_cfg = cfg.get("orchestrator", {})
+        if "model" in orch_cfg:
+            self._model = orch_cfg["model"]
+        if "session_model" in orch_cfg:
+            self._session_mgr._model = orch_cfg["session_model"]
+        perm_cfg = orch_cfg.get("permissions", {})
+        if "auto_approve" in perm_cfg:
+            self._auto_approve_tools = set(perm_cfg["auto_approve"])
+        if "deny" in perm_cfg:
+            self._denied_tools = set(perm_cfg["deny"])
 
     def set_send_telegram(self, fn):
         """Inject the Telegram send function (set by Bot after wiring)."""
