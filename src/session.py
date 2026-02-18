@@ -72,6 +72,11 @@ class SessionManager:
     def get_server(self, name: str) -> ServerConfig | None:
         return self._servers.get(name)
 
+    def add_server(self, config: ServerConfig):
+        """Dynamically register a new server (e.g. from /setup)."""
+        self._servers[config.name] = config
+        log.info(f"Registered server: {config.name} (port {config.broker_port})")
+
     def list_servers(self) -> list[ServerConfig]:
         return list(self._servers.values())
 

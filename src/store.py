@@ -37,7 +37,10 @@ class Task:
     finished_at: float | None = None
 
 
-_EMPTY_CHANNEL = {"messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1}
+_EMPTY_CHANNEL = {
+    "meta": {"name": ""},
+    "messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1,
+}
 
 
 class Store:
@@ -70,12 +73,17 @@ class Store:
     def _load(self, chat_id: int) -> dict:
         path = self._channel_path(chat_id)
         if not os.path.exists(path):
-            return {"messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1}
+            return {
+                "meta": {"name": ""},
+                "messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1,
+            }
         with open(path, "r") as f:
             data = json.load(f)
-        # Backward compat: old channels may lack "notes"
+        # Backward compat: old channels may lack these fields
         if "notes" not in data:
             data["notes"] = []
+        if "meta" not in data:
+            data["meta"] = {"name": f"Channel {chat_id}"}
         return data
 
     def _save(self, chat_id: int, data: dict):
@@ -192,6 +200,41 @@ class Store:
             if fname.endswith(".json"):
                 ids.append(int(fname[:-5]))
         return ids
+
+    # ---- channel management ----
+
+    async def create_channel(self, name: str) -> int:
+        """Create a new channel with auto-incremented ID. Returns the chat_id."""
+        existing = await self.get_all_channel_ids()
+        chat_id = max(existing, default=0) + 1
+        data = {
+            "meta": {"name": name},
+            "messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1,
+        }
+        self._save(chat_id, data)
+        return chat_id
+
+    async def get_channel_list(self) -> list[dict]:
+        """Return list of {id, name} for all channels, sorted by id."""
+        result = []
+        for chat_id in await self.get_all_channel_ids():
+            data = self._load(chat_id)
+            name = data.get("meta", {}).get("name", "") or f"Channel {chat_id}"
+            result.append({"id": chat_id, "name": name})
+        result.sort(key=lambda c: c["id"])
+        return result
+
+    async def set_channel_name(self, chat_id: int, name: str):
+        """Update the name of a channel."""
+        data = self._load(chat_id)
+        data.setdefault("meta", {})["name"] = name
+        self._save(chat_id, data)
+
+    async def delete_channel(self, chat_id: int):
+        """Delete a channel's JSON file."""
+        path = self._channel_path(chat_id)
+        if os.path.exists(path):
+            os.remove(path)
 
     async def remove_channel_worker(self, chat_id: int, server: str, session_id: str):
         data = self._load(chat_id)

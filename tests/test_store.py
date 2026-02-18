@@ -265,3 +265,68 @@ async def test_json_file_structure(store, tmp_path):
     assert data["messages"][0]["content"] == "hi"
     assert data["tasks"][0]["server_name"] == "srv"
     assert data["workers"][0]["description"] == "desc"
+
+
+# ---- channel management ----
+
+
+@pytest.mark.asyncio
+async def test_create_channel(store):
+    """create_channel returns a valid ID and persists the channel."""
+    ch_id = await store.create_channel("my-project")
+    assert ch_id >= 1
+    channels = await store.get_channel_list()
+    assert any(c["id"] == ch_id and c["name"] == "my-project" for c in channels)
+
+
+@pytest.mark.asyncio
+async def test_channel_list_sorted(store):
+    """get_channel_list returns channels sorted by id."""
+    id1 = await store.create_channel("alpha")
+    id2 = await store.create_channel("beta")
+    id3 = await store.create_channel("gamma")
+    channels = await store.get_channel_list()
+    assert len(channels) == 3
+    assert channels[0]["id"] == id1
+    assert channels[1]["id"] == id2
+    assert channels[2]["id"] == id3
+
+
+@pytest.mark.asyncio
+async def test_channel_list_empty(store):
+    """get_channel_list returns [] when no channels exist."""
+    channels = await store.get_channel_list()
+    assert channels == []
+
+
+@pytest.mark.asyncio
+async def test_set_channel_name(store):
+    """set_channel_name updates the channel's name."""
+    ch_id = await store.create_channel("old-name")
+    await store.set_channel_name(ch_id, "new-name")
+    channels = await store.get_channel_list()
+    assert channels[0]["name"] == "new-name"
+
+
+@pytest.mark.asyncio
+async def test_delete_channel(store):
+    """delete_channel removes the channel file."""
+    ch_id = await store.create_channel("temp")
+    await store.delete_channel(ch_id)
+    channels = await store.get_channel_list()
+    assert len(channels) == 0
+
+
+@pytest.mark.asyncio
+async def test_channel_name_backward_compat(store, tmp_path):
+    """Channels without meta field get a default name."""
+    import json
+    # Manually create an old-format channel file (no meta field)
+    path = tmp_path / "data" / "channels" / "99.json"
+    with open(path, "w") as f:
+        json.dump({"messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1}, f)
+
+    channels = await store.get_channel_list()
+    ch = [c for c in channels if c["id"] == 99]
+    assert len(ch) == 1
+    assert ch[0]["name"] == "Channel 99"

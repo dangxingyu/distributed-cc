@@ -1,10 +1,12 @@
 """Entry point: wire everything together and run.
 
-Supports two frontend modes:
-  --cli       Terminal REPL (default, no Telegram needed)
+Supports three frontend modes:
+  --web       Web chat UI on localhost (default)
+  --cli       Terminal REPL
   --telegram  Telegram bot (requires token in config)
 
-Both modes start the HTTP callback server for broker permission/clarification.
+Priority: --web (default) > --telegram > --cli.
+All modes start the HTTP callback server for broker permission/clarification.
 """
 
 import argparse
@@ -19,7 +21,6 @@ from aiohttp import web
 from .store import Store
 from .session import SessionManager, ServerConfig
 from .orchestrator import Orchestrator
-from .permission import PermissionEvaluator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,11 +98,13 @@ async def start_http_server(app: web.Application, port: int):
 async def main():
     parser = argparse.ArgumentParser(description="Claude Code Orchestrator")
     parser.add_argument("--config", default="config.yaml", help="Config file path")
+    parser.add_argument("--web", action="store_true", default=True, help="Use web chat frontend (default)")
+    parser.add_argument("--cli", action="store_true", help="Use CLI REPL frontend")
     parser.add_argument("--telegram", action="store_true", help="Use Telegram bot frontend")
-    parser.add_argument("--cli", action="store_true", default=True, help="Use CLI REPL frontend (default)")
     args = parser.parse_args()
 
-    # --telegram overrides --cli
+    # Priority: --cli/--telegram override web default
+    use_web = not args.cli and not args.telegram
     use_telegram = args.telegram
 
     cfg = load_config(args.config)
@@ -110,15 +113,8 @@ async def main():
     store = Store(cfg.get("data", {}).get("dir", "./data"))
     await store.init()
 
-    # Permission evaluator
-    orch_cfg = cfg.get("orchestrator", {})
-    perm_cfg = cfg.get("permission", {})
-    permission_evaluator = PermissionEvaluator(
-        model=orch_cfg.get("model", "claude-opus-4-6"),
-        config_path=args.config,
-    )
-
     # Session manager
+    orch_cfg = cfg.get("orchestrator", {})
     server_configs = build_server_configs(cfg)
     session_mgr = SessionManager(
         servers=server_configs,
@@ -130,23 +126,44 @@ async def main():
     orchestrator = Orchestrator(
         session_mgr=session_mgr,
         store=store,
-        permission_evaluator=permission_evaluator,
         model=orch_cfg.get("model", "claude-opus-4-6"),
         config_path=args.config,
         orch_config=orch_cfg,
     )
+    await orchestrator.init()
 
     # HTTP server for broker callbacks (always runs)
+    # Support both old "permission.port" and new "http.port" config keys
+    http_cfg = cfg.get("http", cfg.get("permission", {}))
     http_app = web.Application()
     http_app["orchestrator"] = orchestrator
     http_app.router.add_post("/permission", handle_permission)
     http_app.router.add_post("/clarification", handle_clarification)
     http_app.router.add_post("/heartbeat", handle_heartbeat)
-    http_runner = await start_http_server(http_app, perm_cfg.get("port", 9120))
+    http_runner = await start_http_server(http_app, http_cfg.get("port", 9120))
 
     # Frontend
     frontend = None
-    if use_telegram:
+    if use_web:
+        from .web import WebChat
+        web_cfg = cfg.get("web", {})
+        frontend = WebChat(
+            orchestrator=orchestrator,
+            store=store,
+            host=web_cfg.get("host", "127.0.0.1"),
+            port=web_cfg.get("port", 8080),
+        )
+        await frontend.start()
+        log.info("Running with Web frontend. Ctrl+C to stop.")
+
+        # Wait for signal
+        stop_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+        await stop_event.wait()
+        await frontend.stop()
+    elif use_telegram:
         from .bot import Bot
         tg_cfg = cfg.get("telegram", {})
         if not tg_cfg.get("token"):
@@ -156,7 +173,6 @@ async def main():
             token=tg_cfg["token"],
             allowed_users=tg_cfg.get("allowed_users", []),
             orchestrator=orchestrator,
-            permission_evaluator=permission_evaluator,
         )
         await frontend.start()
         log.info("Running with Telegram frontend. Ctrl+C to stop.")
@@ -170,7 +186,7 @@ async def main():
         await frontend.stop()
     else:
         from .cli import CLI
-        frontend = CLI(orchestrator=orchestrator, permission_evaluator=permission_evaluator)
+        frontend = CLI(orchestrator=orchestrator)
         try:
             await frontend.run()
         except (KeyboardInterrupt, EOFError):

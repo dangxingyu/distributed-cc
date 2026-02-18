@@ -38,10 +38,14 @@ orchestrator:
       - WebSearch
       - WebFetch
     deny: []                # Tools the orchestrator may never use
-    # Everything else goes through PermissionEvaluator (Claude judgment → escalate)
+    # Everything else → escalated directly to human (no Claude intermediary)
 
-permission:
-  port: 9120                # HTTP server for broker callbacks
+web:
+  host: "127.0.0.1"        # Web chat frontend bind address
+  port: 8080                # Web chat frontend port (make run-web)
+
+http:
+  port: 9120                # HTTP server for broker permission/clarification callbacks
 
 data:
   dir: ./data

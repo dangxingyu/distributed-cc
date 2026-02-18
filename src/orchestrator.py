@@ -236,6 +236,44 @@ Messages tagged [STOP REQUESTED] mean the user wants to halt current work. Ackno
 the stop and summarize what was in progress. Do NOT continue dispatching tasks.
 
 {{"action": "reply", "text": "<summary of what was stopped>"}}
+
+=== WHEN RECEIVING /setup ===
+
+The user wants to set up remote server connections. Use your Bash tool to execute \
+all steps — SSH in, install broker, start it, open tunnels, verify.
+
+Sources of server info (check in order):
+1. `{config_path}` — servers already configured
+2. `config.md` — may have additional server descriptions
+3. The user's /setup message — may describe new servers (e.g. "/setup della at xd7812@della-gpu")
+
+If you don't have enough info (hostname, SSH user), ask via {{"action": "reply", "text": "..."}}.
+
+Steps for each server:
+
+1. Check broker installed:
+   ssh <host> 'test -f ~/.distributed-cc/remote_broker.py && echo installed || echo missing'
+
+2. Install if missing:
+   ssh <host> 'curl -fsSL https://raw.githubusercontent.com/dangxingyu/distributed-cc/main/tools/install-broker.sh | bash'
+
+3. Check if broker already running:
+   ssh <host> 'tmux has-session -t dcc-broker 2>/dev/null && echo running || echo stopped'
+
+4. Start broker in tmux if not running:
+   ssh <host> "tmux new-session -d -s dcc-broker '~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py --port 8200 --name <server_name>'"
+
+5. Open SSH tunnel (skip for local servers with host: null):
+   ssh -fN -L <local_port>:localhost:8200 -R 9120:localhost:9120 <host>
+   Port allocation: first server gets 8201, second 8202, etc. Check what's already in use.
+
+6. Verify health:
+   curl -sf http://localhost:<local_port>/health
+
+After setup, register the server so it's immediately usable:
+{{"action": "register_server", "name": "<server_name>", "host": "<user@host>", "broker_port": <local_port>}}
+
+Then summarize what was done.
 """
 
 
@@ -519,6 +557,9 @@ class Orchestrator:
             await self._reply(chat_id, send_reply, format_channel_plan_created(plan))
             asyncio.create_task(self._execute_plan(plan, send_reply))
 
+        elif action == "register_server":
+            await self._handle_register_server(chat_id, decision, send_reply)
+
         else:
             await self._reply(chat_id, send_reply, format_channel_orchestrator(f"Unknown action: {action}"))
 
@@ -564,6 +605,33 @@ class Orchestrator:
         follow_up = await self._send_to_orchestrator(chat_id, confirmation, send_reply)
         if follow_up:
             await self._handle_decision(chat_id, user_text, follow_up, send_reply)
+
+    async def _handle_register_server(
+        self, chat_id: int, decision: dict, send_reply: callable,
+    ):
+        """Handle register_server action: dynamically add a server to SessionManager."""
+        name = decision.get("name", "")
+        host = decision.get("host")
+        broker_port = decision.get("broker_port", 8200)
+
+        if not name:
+            await self._reply(chat_id, send_reply, format_channel_orchestrator("Cannot register server: missing name."))
+            return
+
+        from .session import ServerConfig
+        config = ServerConfig(
+            name=name,
+            host=host,
+            broker_port=broker_port,
+        )
+        self._session_mgr.add_server(config)
+
+        # Verify health
+        healthy = await self._session_mgr.check_health(name)
+        status = "healthy" if healthy else "unreachable"
+        await self._reply(chat_id, send_reply, format_channel_orchestrator(
+            f"Server `{name}` registered (broker port {broker_port}, {status}). Ready for workers."
+        ))
 
     # ── Plan execution ─────────────────────────────────────────────────
 

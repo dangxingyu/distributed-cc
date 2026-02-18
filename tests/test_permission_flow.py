@@ -1,144 +1,340 @@
 """Test the permission and clarification callback flow.
 
-Verifies the HTTP callback server (main.py) can receive broker callbacks
-and the PermissionEvaluator's escalation/resolution mechanism works.
+Verifies that:
+- Worker safe tools are auto-approved (fast path)
+- Orchestrator-routed permission approve/deny/escalate works
+- Clarification answered by orchestrator vs escalated works
+- Human resolution plumbing (pending_count, resolve, get_pending_questions)
+- HTTP callback integration
 """
 
 import asyncio
+import json
 import pytest
+import tempfile
+from unittest.mock import AsyncMock, patch
 from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase
 
-from src.permission import PermissionEvaluator
+from src.orchestrator import Orchestrator
+from src.session import SessionManager, ServerConfig
+from src.store import Store
 
 
-@pytest.fixture
-def evaluator():
-    return PermissionEvaluator(model="haiku", config_path="config.yaml")
+async def _make_orchestrator(workers=None):
+    """Create an Orchestrator with mocked _send_to_orchestrator for testing."""
+    store = Store(tempfile.mkdtemp())
+    await store.init()
+
+    mgr = SessionManager(servers=[], default_model="haiku")
+    await mgr.init()
+
+    orch = Orchestrator(
+        session_mgr=mgr,
+        store=store,
+        model="haiku",
+        config_path="config.yaml",
+    )
+
+    # Register workers in the reverse index
+    if workers:
+        for server, session, chat_id in workers:
+            orch._worker_to_chat[(server, session)] = chat_id
+
+    return orch, mgr, store
 
 
 # ── Fast-path permission tests ─────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_auto_approve_safe_tools(evaluator):
-    """Read, Grep, Glob etc. should be auto-approved without calling Claude."""
-    for tool in ["Read", "Grep", "Glob", "WebSearch", "WebFetch", "Explore"]:
-        result = await evaluator.evaluate_permission(
-            server_name="local",
-            session_id="dev",
-            tool_name=tool,
-            tool_input={"file_path": "/tmp/test.py"},
-            send_escalation=AsyncNoop(),
-        )
-        assert result["approved"] is True, f"{tool} should be auto-approved"
-        assert "Auto-approved" in result["reason"]
+async def test_auto_approve_safe_tools():
+    """Read, Grep, Glob etc. should be auto-approved without calling orchestrator."""
+    orch, mgr, store = await _make_orchestrator()
+    try:
+        for tool in ["Read", "Grep", "Glob", "WebSearch", "WebFetch", "Explore"]:
+            result = await orch.handle_permission_request({
+                "server_name": "local",
+                "session_id": "dev",
+                "tool_name": tool,
+                "tool_input": {"file_path": "/tmp/test.py"},
+            })
+            assert result["approved"] is True, f"{tool} should be auto-approved"
+            assert "Auto-approved" in result["reason"]
+    finally:
+        await mgr.close()
+        await store.close()
 
-
-# ── Escalation mechanism tests ─────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_permission_escalation_approve():
-    """Permission escalation → human approves → future resolves."""
-    evaluator = PermissionEvaluator(model="haiku", config_path="config.yaml")
-    escalated = {}
+async def test_unknown_worker_denied():
+    """Permission request from unknown worker should be denied."""
+    orch, mgr, store = await _make_orchestrator()
+    try:
+        result = await orch.handle_permission_request({
+            "server_name": "unknown",
+            "session_id": "unknown",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+        })
+        assert result["approved"] is False
+        assert "Unknown worker" in result["reason"]
+    finally:
+        await mgr.close()
+        await store.close()
 
-    async def capture_escalation(request_id, interaction_type, title, detail):
-        escalated["request_id"] = request_id
-        escalated["type"] = interaction_type
-        # Simulate human approving after a short delay
-        await asyncio.sleep(0.1)
-        evaluator.resolve_permission(request_id, approved=True, reason="User approved")
 
-    # Force escalation by making _call_claude return "escalate"
-    async def mock_call_claude(prompt):
-        return {"decision": "escalate", "reason": "unsure"}
+# ── Orchestrator-routed permission tests ───────────────────────────────
 
-    evaluator._call_claude = mock_call_claude
-
-    result = await evaluator.evaluate_permission(
-        server_name="local",
-        session_id="dev",
-        tool_name="Bash",
-        tool_input={"command": "npm install"},
-        send_escalation=capture_escalation,
+@pytest.mark.asyncio
+async def test_orchestrator_approves_permission():
+    """Orchestrator session approves a permission request."""
+    orch, mgr, store = await _make_orchestrator(
+        workers=[("local", "dev", 1)]
     )
-    assert result["approved"] is True
-    assert escalated["type"] == "permission"
+    try:
+        # Mock _send_to_orchestrator to return approve
+        async def mock_send(chat_id, text):
+            assert "[PERMISSION REQUEST]" in text
+            assert "Bash" in text
+            return {
+                "action": "permission_decision",
+                "approved": True,
+                "reason": "Aligns with task",
+            }
+        orch._send_to_orchestrator = mock_send
+
+        result = await orch.handle_permission_request({
+            "server_name": "local",
+            "session_id": "dev",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm install"},
+        })
+        assert result["approved"] is True
+        assert result["reason"] == "Aligns with task"
+    finally:
+        await mgr.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
-async def test_permission_escalation_deny():
-    """Permission escalation → human denies."""
-    evaluator = PermissionEvaluator(model="haiku", config_path="config.yaml")
-
-    async def deny_escalation(request_id, interaction_type, title, detail):
-        await asyncio.sleep(0.1)
-        evaluator.resolve_permission(request_id, approved=False, reason="Too risky")
-
-    async def mock_call_claude(prompt):
-        return {"decision": "escalate", "reason": "unsure"}
-
-    evaluator._call_claude = mock_call_claude
-
-    result = await evaluator.evaluate_permission(
-        server_name="local",
-        session_id="dev",
-        tool_name="Bash",
-        tool_input={"command": "rm -rf /tmp/stuff"},
-        send_escalation=deny_escalation,
+async def test_orchestrator_denies_permission():
+    """Orchestrator session denies a permission request."""
+    orch, mgr, store = await _make_orchestrator(
+        workers=[("local", "dev", 1)]
     )
-    assert result["approved"] is False
+    try:
+        async def mock_send(chat_id, text):
+            return {
+                "action": "permission_decision",
+                "approved": False,
+                "reason": "Destructive action",
+            }
+        orch._send_to_orchestrator = mock_send
+
+        result = await orch.handle_permission_request({
+            "server_name": "local",
+            "session_id": "dev",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /"},
+        })
+        assert result["approved"] is False
+        assert "Destructive" in result["reason"]
+    finally:
+        await mgr.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
-async def test_clarification_escalation():
-    """Clarification escalation → human picks an option."""
-    evaluator = PermissionEvaluator(model="haiku", config_path="config.yaml")
-
-    questions = [{
-        "question": "Which database should we use?",
-        "header": "Database",
-        "options": [
-            {"label": "PostgreSQL", "description": "Relational DB"},
-            {"label": "MongoDB", "description": "Document DB"},
-        ],
-        "multiSelect": False,
-    }]
-
-    async def answer_escalation(request_id, interaction_type, title, detail):
-        assert interaction_type == "clarification"
-        await asyncio.sleep(0.1)
-        # Human picks PostgreSQL
-        evaluator.resolve_clarification(
-            request_id,
-            question="Which database should we use?",
-            answer="PostgreSQL",
-        )
-
-    # Make Claude say it can't answer
-    async def mock_call_claude(prompt):
-        return {"can_answer": False, "reason": "Design decision"}
-
-    evaluator._call_claude = mock_call_claude
-
-    result = await evaluator.evaluate_clarification(
-        server_name="local",
-        session_id="dev",
-        questions=questions,
-        send_escalation=answer_escalation,
+async def test_orchestrator_escalates_permission():
+    """Orchestrator escalates → human approves → resolved."""
+    orch, mgr, store = await _make_orchestrator(
+        workers=[("local", "dev", 1)]
     )
-    assert result["answers"] is not None
-    assert result["answers"]["Which database should we use?"] == "PostgreSQL"
+    try:
+        escalated = {}
+
+        async def mock_send(chat_id, text):
+            if "[PERMISSION REQUEST]" in text and "(FORCED)" not in text:
+                return {
+                    "action": "permission_decision",
+                    "escalate": True,
+                    "reason": "Ambiguous",
+                }
+            # Shouldn't reach forced fallback in this test
+            return {"action": "permission_decision", "approved": True, "reason": "forced"}
+
+        orch._send_to_orchestrator = mock_send
+
+        # Wire escalation sender to capture and auto-approve
+        async def capture_escalation(request_id, interaction_type, title, detail):
+            escalated["request_id"] = request_id
+            escalated["type"] = interaction_type
+            await asyncio.sleep(0.05)
+            orch.resolve_permission(request_id, approved=True, reason="User approved")
+
+        orch.set_send_telegram(capture_escalation)
+
+        result = await orch.handle_permission_request({
+            "server_name": "local",
+            "session_id": "dev",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm install"},
+        })
+        assert result["approved"] is True
+        assert escalated["type"] == "permission"
+    finally:
+        await mgr.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
-async def test_pending_count(evaluator):
-    assert evaluator.pending_count == 0
+async def test_orchestrator_escalates_permission_denied():
+    """Orchestrator escalates → human denies."""
+    orch, mgr, store = await _make_orchestrator(
+        workers=[("local", "dev", 1)]
+    )
+    try:
+        async def mock_send(chat_id, text):
+            return {
+                "action": "permission_decision",
+                "escalate": True,
+                "reason": "Ambiguous",
+            }
+        orch._send_to_orchestrator = mock_send
+
+        async def deny_escalation(request_id, interaction_type, title, detail):
+            await asyncio.sleep(0.05)
+            orch.resolve_permission(request_id, approved=False, reason="Too risky")
+
+        orch.set_send_telegram(deny_escalation)
+
+        result = await orch.handle_permission_request({
+            "server_name": "local",
+            "session_id": "dev",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /tmp/stuff"},
+        })
+        assert result["approved"] is False
+    finally:
+        await mgr.close()
+        await store.close()
+
+
+# ── Clarification tests ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_orchestrator_answers_clarification():
+    """Orchestrator answers a clarification question directly."""
+    orch, mgr, store = await _make_orchestrator(
+        workers=[("local", "dev", 1)]
+    )
+    try:
+        async def mock_send(chat_id, text):
+            assert "[CLARIFICATION REQUEST]" in text
+            return {
+                "action": "clarification_answer",
+                "answers": {"Which database should we use?": "PostgreSQL"},
+                "reason": "Config specifies PostgreSQL",
+            }
+        orch._send_to_orchestrator = mock_send
+
+        result = await orch.handle_clarification_request({
+            "server_name": "local",
+            "session_id": "dev",
+            "questions": [{
+                "question": "Which database should we use?",
+                "header": "Database",
+                "options": [
+                    {"label": "PostgreSQL", "description": "Relational DB"},
+                    {"label": "MongoDB", "description": "Document DB"},
+                ],
+                "multiSelect": False,
+            }],
+        })
+        assert result["answers"]["Which database should we use?"] == "PostgreSQL"
+    finally:
+        await mgr.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
-async def test_get_pending_questions_none(evaluator):
-    assert evaluator.get_pending_questions("nonexistent") is None
+async def test_orchestrator_escalates_clarification():
+    """Orchestrator escalates clarification → human answers."""
+    orch, mgr, store = await _make_orchestrator(
+        workers=[("local", "dev", 1)]
+    )
+    try:
+        questions = [{
+            "question": "Which database should we use?",
+            "header": "Database",
+            "options": [
+                {"label": "PostgreSQL", "description": "Relational DB"},
+                {"label": "MongoDB", "description": "Document DB"},
+            ],
+            "multiSelect": False,
+        }]
+
+        async def mock_send(chat_id, text):
+            return {
+                "action": "clarification_answer",
+                "escalate": True,
+                "reason": "Design decision",
+            }
+        orch._send_to_orchestrator = mock_send
+
+        async def answer_escalation(request_id, interaction_type, title, detail):
+            assert interaction_type == "clarification"
+            await asyncio.sleep(0.05)
+            orch.resolve_clarification(
+                request_id,
+                question="Which database should we use?",
+                answer="PostgreSQL",
+            )
+
+        orch.set_send_telegram(answer_escalation)
+
+        result = await orch.handle_clarification_request({
+            "server_name": "local",
+            "session_id": "dev",
+            "questions": questions,
+        })
+        assert result["answers"]["Which database should we use?"] == "PostgreSQL"
+    finally:
+        await mgr.close()
+        await store.close()
+
+
+# ── Resolution plumbing tests ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_pending_count():
+    orch, mgr, store = await _make_orchestrator()
+    try:
+        assert orch.pending_count == 0
+    finally:
+        await mgr.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_get_pending_questions_none():
+    orch, mgr, store = await _make_orchestrator()
+    try:
+        assert orch.get_pending_questions("nonexistent") is None
+    finally:
+        await mgr.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_permission_expired():
+    """Resolving a non-existent request returns False."""
+    orch, mgr, store = await _make_orchestrator()
+    try:
+        ok = orch.resolve_permission("nonexistent", approved=True)
+        assert ok is False
+    finally:
+        await mgr.close()
+        await store.close()
 
 
 # ── HTTP callback integration ──────────────────────────────────────────
@@ -146,31 +342,18 @@ async def test_get_pending_questions_none(evaluator):
 @pytest.mark.asyncio
 async def test_http_permission_callback(aiohttp_client):
     """Simulate broker calling POST /permission on the orchestrator."""
-    from src.orchestrator import Orchestrator
-    from src.session import SessionManager, ServerConfig
-    from src.store import Store
-
-    import tempfile
-    store = Store(tempfile.mkdtemp())
-    await store.init()
-
-    mgr = SessionManager(servers=[], default_model="haiku")
-    await mgr.init()
-
-    perm = PermissionEvaluator(model="haiku", config_path="config.yaml")
-
-    # Mock Claude to auto-approve via evaluation
-    async def mock_call_claude(prompt):
-        return {"decision": "approve", "reason": "Looks safe"}
-    perm._call_claude = mock_call_claude
-
-    orch = Orchestrator(
-        session_mgr=mgr,
-        store=store,
-        permission_evaluator=perm,
-        model="haiku",
-        config_path="config.yaml",
+    orch, mgr, store = await _make_orchestrator(
+        workers=[("local", "dev", 1)]
     )
+
+    # Mock orchestrator session to approve non-safe tools
+    async def mock_send(chat_id, text):
+        return {
+            "action": "permission_decision",
+            "approved": True,
+            "reason": "Looks safe",
+        }
+    orch._send_to_orchestrator = mock_send
 
     # Build HTTP app like main.py does
     app = web.Application()
@@ -191,35 +374,28 @@ async def test_http_permission_callback(aiohttp_client):
 
     client = await aiohttp_client(app)
 
-    # Simulate broker calling /permission for a Read tool (fast-path)
-    resp = await client.post("/permission", json={
-        "server_name": "local",
-        "session_id": "dev",
-        "tool_name": "Read",
-        "tool_input": {"file_path": "/tmp/test.py"},
-    })
-    assert resp.status == 200
-    data = await resp.json()
-    assert data["approved"] is True
+    try:
+        # Simulate broker calling /permission for a Read tool (fast-path)
+        resp = await client.post("/permission", json={
+            "server_name": "local",
+            "session_id": "dev",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/tmp/test.py"},
+        })
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["approved"] is True
 
-    # Simulate broker calling /permission for Bash (Claude evaluates)
-    resp = await client.post("/permission", json={
-        "server_name": "local",
-        "session_id": "dev",
-        "tool_name": "Bash",
-        "tool_input": {"command": "echo hello"},
-    })
-    assert resp.status == 200
-    data = await resp.json()
-    assert data["approved"] is True  # mock returns approve
-
-    await mgr.close()
-    await store.close()
-
-
-# ── Helpers ────────────────────────────────────────────────────────────
-
-class AsyncNoop:
-    """Callable that does nothing, for send_escalation placeholder."""
-    async def __call__(self, *args, **kwargs):
-        pass
+        # Simulate broker calling /permission for Bash (orchestrator evaluates)
+        resp = await client.post("/permission", json={
+            "server_name": "local",
+            "session_id": "dev",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+        })
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["approved"] is True  # mock returns approve
+    finally:
+        await mgr.close()
+        await store.close()

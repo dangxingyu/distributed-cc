@@ -6,7 +6,7 @@ Distribute Claude Code sessions across multiple servers from a single orchestrat
 ┌─────────────────────────────────────────────┐
 │  Orchestrator (your laptop)                 │
 │                                             │
-│  src/main.py ──→ Web, CLI, or Telegram       │
+│  src/main.py ──→ Web (default), CLI, Telegram │
 │       │                                     │
 │  Permission/Clarification HTTP server :9120 │
 └──────┬──────────────────────────────────────┘
@@ -27,48 +27,44 @@ Each project works like a Slack channel: the user talks to the orchestrator, the
 
 Remote servers each run a broker daemon that drives Claude Code via the Agent SDK. Permission requests and clarification questions are forwarded back to the orchestrator through SSH reverse tunnels.
 
-## Message Routing
+## Usage
 
-Messages are routed based on prefix. This lets you interact with a busy orchestrator without blocking.
+The default interface is the **web app** at `http://localhost:8080`. It provides a Slack-like chat UI with channels, message bubbles, a members panel, and @mention autocomplete. Orchestrator replies, worker dispatches, and task results stream back over WebSocket in real-time. Permission and clarification escalations appear as inline cards with action buttons.
 
-### Web mode
+Just type your message — it goes directly to the orchestrator. Use `@orchestrator /stop` to cancel all running worker tasks.
 
-In web mode (`make run-web`), the chat runs at `http://localhost:8080` over WebSocket. Behaves like CLI mode — unprefixed messages go directly to the orchestrator. Orchestrator replies, worker dispatches, and task results stream back in real-time. Permission and clarification escalations appear as inline cards with action buttons.
+### Alternative interfaces
 
-### CLI mode
+**CLI mode** (`make run`) — terminal REPL, same direct-message behavior as web.
 
-In CLI mode, unprefixed messages go directly to the orchestrator (single-user ergonomics). You can still use the `@orchestrator` prefix, but it's optional.
+**Telegram mode** (`make run-telegram`) — unprefixed messages become **channel notes** (ambient observations auto-injected into the orchestrator's next interaction). Use `@orchestrator` prefix for direct messages.
 
-```
-you> fix the auth bug in login.py          # → direct to orchestrator
-you> @orchestrator check the test results  # → same thing, explicit prefix
-you> @orchestrator /stop                   # → cancel all running worker tasks
-```
-
-### Telegram mode
-
-In Telegram, unprefixed messages become **channel notes** — ambient observations stored and auto-injected into the orchestrator's next interaction. Use `@orchestrator` to send direct messages.
-
-```
-the CI is failing on server-b              # → stored as channel note
-@orchestrator deploy the fix to staging    # → direct message to orchestrator
-@orchestrator /stop                        # → cancel all running worker tasks
-```
-
-### How it works
+### Message routing details
 
 | Input | Behavior |
 |---|---|
-| `@orchestrator <text>` | Direct message. Queued non-blocking if orchestrator is busy (you get a "(queued)" ack). |
+| `<text>` (web/CLI) | Direct message to orchestrator. Queued non-blocking if busy. |
+| `@orchestrator <text>` | Explicit direct message (required in Telegram, optional elsewhere). |
 | `@orchestrator /stop` | Cancels all running worker tasks for the channel. |
-| `<text>` (CLI) | Direct message (CLI defaults to direct mode). |
-| `<text>` (Telegram) | Channel note — stored and prepended as `[CHANNEL NOTES]` to the next orchestrator message. You get a "(noted)" ack. |
+| `<text>` (Telegram only) | Channel note — stored and prepended as `[CHANNEL NOTES]` to the next orchestrator message. |
 
-**Channel notes** are useful for leaving context while the orchestrator is busy evaluating a worker result. For example, "I noticed the linting config uses tabs not spaces" gets picked up on the next orchestrator interaction without interrupting current work.
+**Non-blocking queue**: When the orchestrator is busy (e.g., evaluating a worker result), messages are queued and processed in order once the lock is released. No messages are lost.
 
-**Non-blocking queue**: When the orchestrator session lock is held (e.g., evaluating a worker result), direct messages are queued and processed in order once the lock is released. No messages are lost.
+### `/setup` — automated server bootstrap
+
+Instead of manually installing brokers and opening tunnels, you can let the orchestrator do it:
+
+```
+/setup della at xd7812@della-gpu
+```
+
+The orchestrator will SSH in, install the broker if needed, start it in a tmux session, open SSH tunnels, and verify connectivity. You can also just type `/setup` and it will read from `config.yaml` / `config.md`, or ask for clarification if info is missing.
+
+Works with servers not yet in your config — just describe them in the message.
 
 ## Setup
+
+The manual setup below is for reference. For most cases, `/setup` handles everything automatically.
 
 There are three components to get running: the **broker** on each remote server, **SSH tunnels** connecting them, and the **orchestrator** on your laptop.
 
@@ -81,7 +77,7 @@ Orchestrator (:9120 callback)        Broker daemon (:8200)
      │  -L 8201:localhost:8200  ──────►   │  runs tasks in project dirs
      │  -R 9120:localhost:9120  ◄──────   │  callbacks for permissions
      │                                    │
-Web UI (:8080) / CLI / Telegram      Session: /path/to/project
+Web app (:8080)                     Session: /path/to/project
 ```
 
 ### Step 1: Install the broker on each remote server
@@ -168,12 +164,12 @@ servers:
 ### Step 5: Start the orchestrator
 
 ```bash
-make run-web          # Web chat at localhost:8080
-make run              # CLI mode (terminal REPL)
+make run              # Web app at localhost:8080 (default)
+make run-cli          # CLI mode (terminal REPL)
 make run-telegram     # Telegram bot mode
 ```
 
-The orchestrator starts a callback HTTP server on `:9120` (for broker permission requests) and connects to brokers via the configured ports.
+The web app is the recommended interface — it gives you channels, real-time streaming, and inline permission/clarification cards. The orchestrator also starts a callback HTTP server on `:9120` (for broker permission requests) and connects to brokers via the configured ports.
 
 ### Step 6: Register project sessions (optional)
 

@@ -1,8 +1,16 @@
-.PHONY: run run-telegram test test-e2e deploy tunnels install-dev
+.PHONY: run run-web run-cli run-telegram test test-e2e deploy tunnels install-dev
 
-# Run orchestrator with CLI frontend
+# Run orchestrator with web chat frontend (default)
 run:
 	uv run python -m src --config config.yaml
+
+# Alias for `make run`
+run-web:
+	uv run python -m src --config config.yaml
+
+# Run orchestrator with CLI frontend
+run-cli:
+	uv run python -m src --config config.yaml --cli
 
 # Run orchestrator with Telegram bot frontend
 run-telegram:
