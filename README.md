@@ -68,81 +68,133 @@ the CI is failing on server-b              # → stored as channel note
 
 **Non-blocking queue**: When the orchestrator session lock is held (e.g., evaluating a worker result), direct messages are queued and processed in order once the lock is released. No messages are lost.
 
-## Quick Start
+## Setup
 
-### 1. Orchestrator (main node)
+There are three components to get running: the **broker** on each remote server, **SSH tunnels** connecting them, and the **orchestrator** on your laptop.
 
-```bash
-# Clone and install
-git clone https://github.com/dangxingyu/distributed-cc.git
-cd distributed-cc
-uv sync --extra dev --extra telegram
-
-# Configure
-cp config.example.yaml config.yaml
-# Edit config.yaml with your servers, paths, and settings
-
-# Run
-make run              # CLI mode
-make run-web          # Web chat mode (localhost:8080)
-make run-telegram     # Telegram bot mode
+```
+Your laptop                          Remote server (e.g. server-a)
+──────────                           ─────────────────────────────
+Orchestrator (:9120 callback)        Broker daemon (:8200)
+     │                                    │
+     │  SSH tunnel                        │  Claude Code Agent SDK
+     │  -L 8201:localhost:8200  ──────►   │  runs tasks in project dirs
+     │  -R 9120:localhost:9120  ◄──────   │  callbacks for permissions
+     │                                    │
+Web UI (:8080) / CLI / Telegram      Session: /path/to/project
 ```
 
-### 2. Remote Nodes (broker)
+### Step 1: Install the broker on each remote server
 
-Three options to install the broker on each remote server:
+The broker is a lightweight daemon that receives tasks from the orchestrator and runs Claude Code via the Agent SDK. Install it once per server.
 
-**Option A — One-line installer** (easiest):
+**Option A — One-line installer** (on the remote server):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dangxingyu/distributed-cc/main/tools/install-broker.sh | bash
 ```
 
-**Option B — Deploy script** (from orchestrator):
+**Option B — Deploy from your laptop**:
 ```bash
 make deploy HOST=user@server-a NAME=server-a
 ```
 
-**Option C — Manual**:
+Both options install to `~/.distributed-cc/` on the remote, set up a venv, and install dependencies (`claude-agent-sdk`, `aiohttp`).
+
+**Prerequisite**: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and authenticated on each remote server (`claude` command available and logged in).
+
+### Step 2: Start the broker daemon
+
+On the remote server, start the broker in a persistent session (tmux/screen):
+
 ```bash
-ssh user@server-a
-mkdir -p ~/.distributed-cc
-# Copy tools/remote_broker.py and tools/broker_session.py to ~/.distributed-cc/
-curl -LsSf https://astral.sh/uv/install.sh | sh  # install uv if needed
-uv venv ~/.distributed-cc/.venv
-uv pip install --python ~/.distributed-cc/.venv/bin/python3 claude-agent-sdk aiohttp
+# In tmux on server-a:
+~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py \
+    --port 8200 --name server-a
 ```
 
-Then start the broker daemon (once per server, e.g. in tmux):
-```bash
-~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/remote_broker.py --port 8200 --name server-a
-```
+The broker listens on `:8200` and manages Claude Code sessions. One broker per server — it handles multiple projects/sessions.
 
-Register sessions from each project directory:
-```bash
-cd /path/to/your/project
-~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/broker_session.py start
-# Optional: --name custom-name --desc "Description"
-```
+### Step 3: Open SSH tunnels
 
-The broker heartbeats to the orchestrator, so sessions are discovered automatically.
+Each remote server needs two tunnels from your laptop:
 
-### 3. SSH Tunnels
-
-Each remote server needs two tunnels — one forward (orchestrator → broker) and one reverse (broker → orchestrator):
+- **Forward tunnel** (`-L`): lets the orchestrator send tasks to the remote broker
+- **Reverse tunnel** (`-R`): lets the remote broker send permission/clarification callbacks back to the orchestrator
 
 ```bash
+# One command per server (run from your laptop, e.g. in a tmux pane):
 ssh -N \
     -L 8201:localhost:8200 \
     -R 9120:localhost:9120 \
     user@server-a
 ```
 
-Or use the helper script:
+For multiple servers, use different local ports (`-L 8201`, `-L 8202`, etc.). The reverse tunnel port (`9120`) is the same for all servers — it's the orchestrator's callback port.
+
+**Helper script**: Edit `tools/start_tunnels.sh` with your servers, then run:
 ```bash
-make tunnels
+make tunnels   # starts all tunnels in background, Ctrl+C to stop
 ```
 
-Edit `tools/start_tunnels.sh` to configure your servers.
+**Local broker** (same machine): No tunnels needed. The orchestrator connects directly to `localhost:8200`.
+
+### Step 4: Configure the orchestrator
+
+```bash
+git clone https://github.com/dangxingyu/distributed-cc.git
+cd distributed-cc
+uv sync --extra dev --extra telegram
+
+cp config.example.yaml config.yaml
+```
+
+Edit `config.yaml` — the key section is `servers`, where each entry's `broker_port` must match the local side of your SSH tunnel:
+
+```yaml
+servers:
+  - name: server-a
+    host: user@server-a.example.com
+    broker_port: 8201       # matches: ssh -L 8201:localhost:8200
+
+  - name: server-b
+    host: user@server-b.example.com
+    broker_port: 8202       # matches: ssh -L 8202:localhost:8200
+
+  - name: local
+    host: null              # no SSH needed
+    broker_port: 8200       # direct connection
+```
+
+### Step 5: Start the orchestrator
+
+```bash
+make run-web          # Web chat at localhost:8080
+make run              # CLI mode (terminal REPL)
+make run-telegram     # Telegram bot mode
+```
+
+The orchestrator starts a callback HTTP server on `:9120` (for broker permission requests) and connects to brokers via the configured ports.
+
+### Step 6: Register project sessions (optional)
+
+Workers are created dynamically by the orchestrator when you ask it to do work — it calls the broker's `/register` endpoint automatically. You can also pre-register sessions manually on the remote server:
+
+```bash
+# On server-a, from a project directory:
+cd /path/to/your/project
+~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/broker_session.py start
+# Optional: --name custom-name --desc "Training run"
+```
+
+The broker heartbeats registered sessions to the orchestrator, so they appear automatically.
+
+### Startup order summary
+
+1. **Broker** on each remote server (persistent — start once)
+2. **SSH tunnels** from your laptop (persistent — start once per server)
+3. **Orchestrator** on your laptop (start per work session)
+
+The broker and tunnels can be left running indefinitely. Only the orchestrator needs restarting between sessions.
 
 ## Configuration
 
