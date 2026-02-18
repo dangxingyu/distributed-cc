@@ -1216,6 +1216,8 @@ function toggleMonitor() {
   }
 }
 
+let _monitorScrollPending = false;
+
 function addLogEntry(text) {
   const entry = document.createElement('div');
   const isError = text.startsWith('[ERROR]');
@@ -1235,7 +1237,15 @@ function addLogEntry(text) {
   entry.appendChild(time);
   entry.appendChild(content);
   monitorLog.appendChild(entry);
-  monitorLog.scrollTop = monitorLog.scrollHeight;
+
+  // Debounced scroll — batch rapid updates into one paint
+  if (!_monitorScrollPending) {
+    _monitorScrollPending = true;
+    requestAnimationFrame(() => {
+      monitorLog.scrollTop = monitorLog.scrollHeight;
+      _monitorScrollPending = false;
+    });
+  }
 }
 
 // Restore monitor state from localStorage

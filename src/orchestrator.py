@@ -1006,13 +1006,10 @@ class Orchestrator:
                 await log_fn(tool_msg)
 
             elif isinstance(block, ToolResultBlock):
-                # Show tool results in monitor (especially errors)
-                content = block.content if isinstance(block.content, str) else str(block.content or "")
+                # Only show errors in monitor (success results are too noisy)
                 if block.is_error:
+                    content = block.content if isinstance(block.content, str) else str(block.content or "")
                     await log_fn(f"[ERROR] {content[:500]}")
-                else:
-                    preview = content[:200] if content else "(empty)"
-                    await log_fn(f"[result] {preview}")
 
     def _make_can_use_tool(self, chat_id: int):
         """Create a can_use_tool callback for the orchestrator session.
