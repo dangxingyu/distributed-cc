@@ -1,9 +1,9 @@
-"""Test SQLite store — messages and tasks."""
+"""Test SQLite store — messages, tasks, and channel workers."""
 
 import asyncio
 import os
 import pytest
-from src.store import Store, TaskStatus
+from src.store import Store, TaskStatus, ChannelWorker
 
 
 @pytest.fixture
@@ -89,3 +89,56 @@ async def test_task_failed(store):
     await store.finish_task(task_id, TaskStatus.FAILED, "timeout")
     running = await store.get_running_tasks(1)
     assert len(running) == 0
+
+
+# ---- channel workers ----
+
+
+@pytest.mark.asyncio
+async def test_channel_worker_round_trip(store):
+    """Add a worker and retrieve it."""
+    await store.add_channel_worker(1, "server-a", "ml-pipeline", "/home/user/ml-pipeline", "ML training")
+    workers = await store.get_channel_workers(1)
+    assert len(workers) == 1
+    assert workers[0].server == "server-a"
+    assert workers[0].session_id == "ml-pipeline"
+    assert workers[0].work_dir == "/home/user/ml-pipeline"
+    assert workers[0].description == "ML training"
+
+
+@pytest.mark.asyncio
+async def test_channel_workers_per_chat(store):
+    """Workers are isolated per chat_id."""
+    await store.add_channel_worker(1, "server-a", "proj-1", "/home/user/proj-1")
+    await store.add_channel_worker(2, "server-b", "proj-2", "/home/user/proj-2")
+
+    w1 = await store.get_channel_workers(1)
+    w2 = await store.get_channel_workers(2)
+    assert len(w1) == 1
+    assert len(w2) == 1
+    assert w1[0].session_id == "proj-1"
+    assert w2[0].session_id == "proj-2"
+
+
+@pytest.mark.asyncio
+async def test_channel_worker_upsert(store):
+    """INSERT OR REPLACE updates description on conflict."""
+    await store.add_channel_worker(1, "srv", "sess", "/dir", "old")
+    await store.add_channel_worker(1, "srv", "sess", "/dir", "new")
+    workers = await store.get_channel_workers(1)
+    assert len(workers) == 1
+    assert workers[0].description == "new"
+
+
+@pytest.mark.asyncio
+async def test_remove_channel_worker(store):
+    await store.add_channel_worker(1, "srv", "sess", "/dir")
+    await store.remove_channel_worker(1, "srv", "sess")
+    workers = await store.get_channel_workers(1)
+    assert len(workers) == 0
+
+
+@pytest.mark.asyncio
+async def test_channel_workers_empty(store):
+    workers = await store.get_channel_workers(999)
+    assert workers == []

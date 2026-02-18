@@ -17,3 +17,6 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-aiohttp>=1.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "e2e: end-to-end tests that call real Claude API (cost money)",
+]

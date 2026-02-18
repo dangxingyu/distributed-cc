@@ -28,6 +28,17 @@ servers:
 orchestrator:
   model: claude-opus-4-6          # Model for routing decisions
   session_model: claude-opus-4-6  # Model for remote Claude Code sessions
+  # Tool permissions for the orchestrator's own Claude session.
+  # Similar to .claude/settings.local.json but in our config.
+  permissions:
+    auto_approve:           # Tools the orchestrator can use freely
+      - Read
+      - Glob
+      - Grep
+      - WebSearch
+      - WebFetch
+    deny: []                # Tools the orchestrator may never use
+    # Everything else goes through PermissionEvaluator (Claude judgment → escalate)
 
 permission:
   port: 9120                # HTTP server for broker callbacks

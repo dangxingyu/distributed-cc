@@ -108,6 +108,24 @@ class SessionManager:
         server_sessions = self._remote_sessions.get(server_name, {})
         return server_sessions.get(session_id)
 
+    # ── Session registration ─────────────────────────────────────────
+
+    async def register_session(
+        self, server_name: str, session_id: str, work_dir: str, description: str = ""
+    ) -> dict:
+        """Register a new session on a remote broker via POST /register."""
+        server = self._servers.get(server_name)
+        if not server:
+            return {"ok": False, "error": f"Unknown server: {server_name}"}
+        url = f"{self._broker_url(server)}/register"
+        payload = {"session_id": session_id, "work_dir": work_dir, "description": description}
+        try:
+            async with self._http.post(url, json=payload) as resp:
+                return await resp.json()
+        except aiohttp.ClientError as e:
+            log.error(f"Cannot register session on {server_name}: {e}")
+            return {"ok": False, "error": f"Cannot reach broker for {server_name}: {e}"}
+
     # ── Task execution ────────────────────────────────────────────────
 
     async def run_task(

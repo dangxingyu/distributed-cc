@@ -17,6 +17,14 @@ class TaskStatus(str, Enum):
 
 
 @dataclass
+class ChannelWorker:
+    server: str
+    session_id: str
+    work_dir: str
+    description: str
+
+
+@dataclass
 class Task:
     id: int
     telegram_chat_id: int
@@ -37,6 +45,17 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL,          -- 'user' or 'assistant'
     content TEXT NOT NULL,
     ts REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS channel_workers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    server TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    work_dir TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    created_at REAL NOT NULL,
+    UNIQUE(chat_id, server, session_id)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -129,3 +148,33 @@ class Store:
             created_at=row["created_at"],
             finished_at=row["finished_at"],
         )
+
+    # ---- channel workers ----
+
+    async def add_channel_worker(
+        self, chat_id: int, server: str, session_id: str, work_dir: str, description: str = ""
+    ):
+        await self._db.execute(
+            "INSERT OR REPLACE INTO channel_workers (chat_id, server, session_id, work_dir, description, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, server, session_id, work_dir, description, time.time()),
+        )
+        await self._db.commit()
+
+    async def get_channel_workers(self, chat_id: int) -> list[ChannelWorker]:
+        cursor = await self._db.execute(
+            "SELECT server, session_id, work_dir, description FROM channel_workers WHERE chat_id = ? ORDER BY created_at",
+            (chat_id,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            ChannelWorker(server=r["server"], session_id=r["session_id"], work_dir=r["work_dir"], description=r["description"])
+            for r in rows
+        ]
+
+    async def remove_channel_worker(self, chat_id: int, server: str, session_id: str):
+        await self._db.execute(
+            "DELETE FROM channel_workers WHERE chat_id = ? AND server = ? AND session_id = ?",
+            (chat_id, server, session_id),
+        )
+        await self._db.commit()

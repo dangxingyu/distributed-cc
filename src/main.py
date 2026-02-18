@@ -133,6 +133,7 @@ async def main():
         permission_evaluator=permission_evaluator,
         model=orch_cfg.get("model", "claude-opus-4-6"),
         config_path=args.config,
+        orch_config=orch_cfg,
     )
 
     # HTTP server for broker callbacks (always runs)

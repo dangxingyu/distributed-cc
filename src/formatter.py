@@ -52,6 +52,11 @@ def format_channel_orchestrator(text: str) -> str:
     return f"orchestrator: {text}"
 
 
+def format_channel_worker_created(server: str, session_id: str, work_dir: str) -> str:
+    """Format worker creation in channel style."""
+    return f"orchestrator: Created worker {server}/{session_id} at {work_dir}"
+
+
 def format_channel_dispatch(server: str, session: str, prompt: str) -> str:
     """Format orchestrator dispatching work to a worker."""
     return f"orchestrator -> {server}/{session}: {prompt}"
