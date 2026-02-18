@@ -33,6 +33,7 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     TextBlock,
     ToolUseBlock,
+    ToolResultBlock,
 )
 
 from .session import SessionManager, SessionResult
@@ -996,6 +997,15 @@ class Orchestrator:
                     tool_msg += f": {snippet}"
                 await log_fn(tool_msg)
 
+            elif isinstance(block, ToolResultBlock):
+                # Show tool results in monitor (especially errors)
+                content = block.content if isinstance(block.content, str) else str(block.content or "")
+                if block.is_error:
+                    await log_fn(f"[ERROR] {content[:500]}")
+                else:
+                    preview = content[:200] if content else "(empty)"
+                    await log_fn(f"[result] {preview}")
+
     def _make_can_use_tool(self, chat_id: int):
         """Create a can_use_tool callback for the orchestrator session.
 
@@ -1009,19 +1019,23 @@ class Orchestrator:
         async def can_use_tool(tool_name: str, input_data: dict, context=None):
             # AskUserQuestion → route through channel
             if tool_name == "AskUserQuestion":
+                log.info("[can_use_tool] %s → routing question", tool_name)
                 return await self._handle_orchestrator_question(chat_id, input_data)
 
             # Config-based auto-approve
             if tool_name in self._auto_approve_tools:
+                log.info("[can_use_tool] %s → auto-approve", tool_name)
                 return PermissionResultAllow()
 
             # Config-based deny
             if tool_name in self._denied_tools:
+                log.info("[can_use_tool] %s → deny (config)", tool_name)
                 return PermissionResultDeny(
                     message=f"Tool {tool_name} not allowed for orchestrator"
                 )
 
             # Escalate directly to human (the orchestrator IS the Claude session)
+            log.info("[can_use_tool] %s → escalate to human", tool_name)
             return await self._escalate_orchestrator_permission(
                 chat_id, tool_name, input_data
             )
