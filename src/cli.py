@@ -9,15 +9,13 @@ import logging
 import sys
 
 from .orchestrator import Orchestrator
-from .permission import PermissionEvaluator
 
 log = logging.getLogger(__name__)
 
 
 class CLI:
-    def __init__(self, orchestrator: Orchestrator, permission_evaluator: PermissionEvaluator):
+    def __init__(self, orchestrator: Orchestrator):
         self._orchestrator = orchestrator
-        self._permission = permission_evaluator
         self._chat_id = 0  # Dummy chat_id for CLI mode
         # Queue for permission/clarification prompts that interrupt the REPL
         self._interrupt_queue: asyncio.Queue = asyncio.Queue()
@@ -53,7 +51,7 @@ class CLI:
             async def send_reply(msg: str):
                 print(f"\n\033[36m{msg}\033[0m\n")  # Cyan for responses
 
-            await self._orchestrator.handle_message(self._chat_id, line, send_reply)
+            await self._orchestrator.route_message(self._chat_id, line, send_reply, default_direct=True)
 
     def _read_input(self) -> str:
         try:
@@ -93,14 +91,14 @@ class CLI:
                     None, lambda: input("\033[31mApprove? (y/n): \033[0m")
                 )
                 approved = answer.strip().lower() in ("y", "yes")
-                self._permission.resolve_permission(
+                self._orchestrator.resolve_permission(
                     request_id, approved=approved,
                     reason="Approved by user" if approved else "Denied by user",
                 )
                 print(f">> {'APPROVED' if approved else 'DENIED'}\n")
 
             elif itype == "clarification":
-                questions = self._permission.get_pending_questions(request_id)
+                questions = self._orchestrator.get_pending_questions(request_id)
                 print(f"\n\033[35m[CLARIFICATION] {item['title']}\033[0m")
                 print(f"{item['detail']}")
 
@@ -120,11 +118,11 @@ class CLI:
                     except (ValueError, IndexError):
                         answer = choice  # Free-text answer
 
-                    self._permission.resolve_clarification(request_id, q["question"], answer)
+                    self._orchestrator.resolve_clarification(request_id, q["question"], answer)
                     print(f">> {answer}\n")
                 else:
                     answer = await loop.run_in_executor(
                         None, lambda: input("\033[35mYour answer: \033[0m")
                     )
-                    self._permission.resolve_clarification(request_id, "", answer.strip())
+                    self._orchestrator.resolve_clarification(request_id, "", answer.strip())
                     print(f">> {answer.strip()}\n")

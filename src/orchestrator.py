@@ -9,19 +9,21 @@ orchestrator needs them (via create_worker → broker /register). The
 orchestrator session handles both user messages (assign/create_worker)
 and worker results (verdicts).
 
+Permission and clarification requests from remote workers are routed through
+the orchestrator session, which has full task context. The orchestrator
+decides approve/deny/escalate; escalations go to the human via Telegram/CLI.
+
 The orchestrator's own Claude session uses `can_use_tool` callbacks for:
 - AskUserQuestion → routed through the channel to the user
 - Auto-approved tools (Read, Glob, Grep, etc.) → allowed immediately
-- Everything else → PermissionEvaluator (Claude judgment → escalate to human)
-
-Remote workers use the same pattern via the broker's canUseTool → HTTP
-callbacks to this orchestrator's /permission and /clarification endpoints.
+- Everything else → escalated directly to human (no Claude intermediary)
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 
 from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
@@ -30,7 +32,6 @@ from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from .session import SessionManager, SessionResult
 from .store import Store, TaskStatus, ChannelWorker
 from .models import WorkItem, WorkPlan
-from .permission import PermissionEvaluator
 from .formatter import (
     format_task_status,
     format_channel_orchestrator,
@@ -42,6 +43,13 @@ from .formatter import (
 )
 
 log = logging.getLogger(__name__)
+
+# Safe tools that are auto-approved for worker permission requests
+WORKER_SAFE_TOOLS = {"Read", "Grep", "Glob", "WebSearch", "WebFetch", "Explore"}
+
+# Message routing patterns
+_ORCH_PREFIX_RE = re.compile(r"^@orchestrator\s+", re.IGNORECASE)
+_STOP_CMD_RE = re.compile(r"^@orchestrator\s+/stop\s*$", re.IGNORECASE)
 
 
 async def _prompt_stream(text: str):
@@ -158,6 +166,70 @@ Verdict rules:
 - "escalate": you genuinely need the user's judgment.
 - "new_tasks": only for genuinely separate workstreams discovered during execution.
 - "suggestions": only when results naturally suggest follow-up work the user might want.
+
+=== WHEN RECEIVING A PERMISSION REQUEST ===
+
+Messages tagged [PERMISSION REQUEST] are tool permission requests from a worker. \
+The worker wants to use a specific tool. Based on your knowledge of what task the worker \
+is working on and the project context, decide:
+
+Approve — the action aligns with the assigned task:
+{{"action": "permission_decision", "approved": true, "reason": "brief explanation"}}
+
+Deny — clearly destructive or off-task:
+{{"action": "permission_decision", "approved": false, "reason": "brief explanation"}}
+
+Escalate — ambiguous, human should decide:
+{{"action": "permission_decision", "escalate": true, "reason": "why human should decide"}}
+
+Guidelines:
+- approve: Actions that clearly align with the task you assigned to this worker
+- deny: Clearly destructive actions (rm -rf /, DROP TABLE, force-push to main) or unrelated to the task
+- escalate: Ambiguous cases — writing to unexpected files, unfamiliar commands, network operations
+
+=== WHEN RECEIVING A PERMISSION REQUEST (FORCED) ===
+
+Same as above but the human was asked and did not respond in time. \
+There is NO "escalate" option — you MUST approve or deny. \
+When in doubt, lean towards approve if it looks like normal development work.
+
+{{"action": "permission_decision", "approved": true/false, "reason": "brief explanation"}}
+
+=== WHEN RECEIVING A CLARIFICATION REQUEST ===
+
+Messages tagged [CLARIFICATION REQUEST] are questions from a worker that needs guidance. \
+Based on your knowledge of the task and project context:
+
+Answer the question:
+{{"action": "clarification_answer", "answers": {{"<question_text>": "<chosen_option_label>"}}, "reason": "why"}}
+
+Escalate — you need the human's preference:
+{{"action": "clarification_answer", "escalate": true, "reason": "why human should decide"}}
+
+Guidelines:
+- Answer if the choice is obvious from the task context or project setup
+- Escalate if it's a design/preference decision that only the human should make
+
+=== WHEN RECEIVING A CLARIFICATION REQUEST (FORCED) ===
+
+Same as above but the human did not respond. You MUST answer — no escalate option. \
+Pick the most reasonable option based on project context.
+
+{{"action": "clarification_answer", "answers": {{"<question_text>": "<chosen_option_label>"}}, "reason": "why"}}
+
+=== WHEN RECEIVING CHANNEL NOTES ===
+
+Messages may include a [CHANNEL NOTES] block at the top. These are ambient observations \
+from the user (professor) — things they noticed, preferences, reminders. They are NOT \
+direct requests. Acknowledge them naturally within your response to whatever primary \
+message follows. Don't reply ONLY about the notes unless there's nothing else in the message.
+
+=== WHEN RECEIVING A STOP REQUEST ===
+
+Messages tagged [STOP REQUESTED] mean the user wants to halt current work. Acknowledge \
+the stop and summarize what was in progress. Do NOT continue dispatching tasks.
+
+{{"action": "reply", "text": "<summary of what was stopped>"}}
 """
 
 
@@ -166,14 +238,12 @@ class Orchestrator:
         self,
         session_mgr: SessionManager,
         store: Store,
-        permission_evaluator: PermissionEvaluator,
         model: str = "claude-opus-4-6",
         config_path: str = "config.yaml",
         orch_config: dict | None = None,
     ):
         self._session_mgr = session_mgr
         self._store = store
-        self._permission = permission_evaluator
         self._model = model
         self._config_path = config_path
         self._send_telegram: callable = None
@@ -193,9 +263,149 @@ class Orchestrator:
         # Pending answers: chat_id -> asyncio.Future for user responses to orchestrator questions
         self._pending_answers: dict[int, asyncio.Future] = {}
 
+        # Escalation plumbing (absorbed from PermissionEvaluator)
+        # request_id -> asyncio.Future for pending human decisions
+        self._pending: dict[str, asyncio.Future] = {}
+        # request_id -> question metadata (for clarification buttons)
+        self._pending_meta: dict[str, dict] = {}
+
+        # Reverse index: (server, session_id) → chat_id
+        self._worker_to_chat: dict[tuple[str, str], int] = {}
+
+        # Per-chat session locks to prevent concurrent orchestrator access
+        self._session_locks: dict[int, asyncio.Lock] = {}
+
+        # Per-chat message queues and queue processor tasks
+        self._message_queues: dict[int, asyncio.Queue] = {}
+        self._queue_tasks: dict[int, asyncio.Task] = {}
+
+    async def init(self):
+        """Initialize: populate worker-to-chat reverse index from store."""
+        for chat_id in await self._store.get_all_channel_ids():
+            workers = await self._store.get_channel_workers(chat_id)
+            for w in workers:
+                self._worker_to_chat[(w.server, w.session_id)] = chat_id
+
     def set_send_telegram(self, fn):
         """Inject the Telegram send function (set by Bot after wiring)."""
         self._send_telegram = fn
+
+    # ── Human resolution (moved from PermissionEvaluator) ──────────────
+
+    def resolve_permission(self, request_id: str, approved: bool, reason: str = "") -> bool:
+        """Resolve a pending permission escalation."""
+        future = self._pending.pop(request_id, None)
+        self._pending_meta.pop(request_id, None)
+        if future and not future.done():
+            future.set_result({"approved": approved, "reason": reason})
+            return True
+        return False
+
+    def resolve_clarification(self, request_id: str, question: str, answer: str) -> bool:
+        """Resolve a pending clarification with a specific answer."""
+        future = self._pending.pop(request_id, None)
+        self._pending_meta.pop(request_id, None)
+        if future and not future.done():
+            answers = {question: answer}
+            future.set_result({"answers": answers})
+            return True
+        return False
+
+    def get_pending_questions(self, request_id: str) -> list[dict] | None:
+        """Get the questions metadata for a pending clarification."""
+        meta = self._pending_meta.get(request_id)
+        return meta["questions"] if meta else None
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    # ── Message routing ─────────────────────────────────────────────────
+
+    async def route_message(
+        self,
+        chat_id: int,
+        raw_text: str,
+        send_reply: callable,
+        default_direct: bool = False,
+    ):
+        """Route an incoming message based on prefix.
+
+        - @orchestrator /stop  → cancel running tasks
+        - @orchestrator <text> → direct message (queued if busy)
+        - No prefix + default_direct → direct message
+        - No prefix + not default_direct → channel note
+        """
+        stripped = raw_text.strip()
+
+        # @orchestrator /stop
+        if _STOP_CMD_RE.match(stripped):
+            await self._handle_stop(chat_id, send_reply)
+            return
+
+        # @orchestrator <text>
+        m = _ORCH_PREFIX_RE.match(stripped)
+        if m:
+            text = stripped[m.end():]
+            await self._enqueue_direct_message(chat_id, text, send_reply)
+            return
+
+        # No prefix
+        if default_direct:
+            await self._enqueue_direct_message(chat_id, stripped, send_reply)
+        else:
+            await self._store.add_note(chat_id, stripped)
+            await send_reply("(noted)")
+
+    async def _enqueue_direct_message(
+        self, chat_id: int, text: str, send_reply: callable
+    ):
+        """Queue a direct message for the orchestrator. Ack if lock is held."""
+        if chat_id not in self._message_queues:
+            self._message_queues[chat_id] = asyncio.Queue()
+
+        self._message_queues[chat_id].put_nowait((text, send_reply))
+
+        # If the session lock is currently held, ack that we queued it
+        lock = self._get_session_lock(chat_id)
+        if lock.locked():
+            await send_reply("(queued)")
+
+        self._ensure_queue_processor(chat_id)
+
+    def _ensure_queue_processor(self, chat_id: int):
+        """Start the queue processor task if not already running."""
+        task = self._queue_tasks.get(chat_id)
+        if task is None or task.done():
+            self._queue_tasks[chat_id] = asyncio.create_task(
+                self._process_queue(chat_id)
+            )
+
+    async def _process_queue(self, chat_id: int):
+        """Drain the message queue, sending each to handle_message."""
+        queue = self._message_queues.get(chat_id)
+        if queue is None:
+            return
+        while not queue.empty():
+            text, send_reply = queue.get_nowait()
+            await self.handle_message(chat_id, text, send_reply)
+
+    async def _handle_stop(self, chat_id: int, send_reply: callable):
+        """Cancel running worker tasks and notify the orchestrator."""
+        tasks = await self._store.get_running_tasks(chat_id)
+        cancelled = 0
+        for t in tasks:
+            ok = await self._session_mgr.cancel_task(t.server_name, t.session_id)
+            if ok:
+                cancelled += 1
+                await self._store.finish_task(t.id, TaskStatus.FAILED, "Stopped by user")
+
+        await send_reply(f"(stop: cancelled {cancelled}/{len(tasks)} running tasks)")
+
+        # Fire-and-forget notification to orchestrator session
+        asyncio.create_task(
+            self._send_to_orchestrator(chat_id, "[STOP REQUESTED]\nThe user has stopped all running tasks.")
+        )
 
     # ── User message handling ──────────────────────────────────────────
 
@@ -330,6 +540,8 @@ class Orchestrator:
 
         # Store in DB
         await self._store.add_channel_worker(chat_id, server_name, session_id, work_dir, description)
+        # Update reverse index
+        self._worker_to_chat[(server_name, session_id)] = chat_id
         await send_reply(format_channel_worker_created(server_name, session_id, work_dir))
 
         # Confirm back to orchestrator session so it can continue
@@ -515,13 +727,33 @@ class Orchestrator:
 
     # ── Orchestrator session (Agent SDK) ──────────────────────────────
 
+    def _get_session_lock(self, chat_id: int) -> asyncio.Lock:
+        """Get or create a per-chat session lock."""
+        if chat_id not in self._session_locks:
+            self._session_locks[chat_id] = asyncio.Lock()
+        return self._session_locks[chat_id]
+
     async def _send_to_orchestrator(self, chat_id: int, text: str) -> dict | None:
         """Send a message to the orchestrator Claude session and parse the JSON response.
 
         Uses Agent SDK query() with can_use_tool for permission handling
         and AskUserQuestion routing. Resumes the existing session for this
         chat, or starts a new one with the system prompt.
+
+        Serialized per-chat via session lock. Injects unchecked notes before sending.
         """
+        async with self._get_session_lock(chat_id):
+            # Inject unchecked channel notes
+            notes = await self._store.get_unchecked_notes(chat_id)
+            if notes:
+                note_lines = "\n".join(f"- {n['content']}" for n in notes)
+                text = f"[CHANNEL NOTES]\n{note_lines}\n\n{text}"
+                await self._store.mark_notes_checked(chat_id)
+
+            return await self._send_to_orchestrator_unlocked(chat_id, text)
+
+    async def _send_to_orchestrator_unlocked(self, chat_id: int, text: str) -> dict | None:
+        """Inner implementation of _send_to_orchestrator (no lock)."""
         # Clear nested-session guard so SDK can spawn claude subprocess
         os.environ.pop("CLAUDECODE", None)
 
@@ -568,7 +800,7 @@ class Orchestrator:
         - AskUserQuestion → route through channel to user
         - Auto-approved tools → allow immediately
         - Denied tools → deny immediately
-        - Everything else → PermissionEvaluator (Claude judgment → escalate)
+        - Everything else → escalate directly to human (no Claude intermediary)
         """
 
         async def can_use_tool(tool_name: str, input_data: dict, context=None):
@@ -586,18 +818,9 @@ class Orchestrator:
                     message=f"Tool {tool_name} not allowed for orchestrator"
                 )
 
-            # Default: use PermissionEvaluator (same pipeline as workers)
-            result = await self._permission.evaluate_permission(
-                server_name="orchestrator",
-                session_id=f"orch-{chat_id}",
-                tool_name=tool_name,
-                tool_input=input_data,
-                send_escalation=self._make_escalation_sender(),
-            )
-            if result.get("approved"):
-                return PermissionResultAllow()
-            return PermissionResultDeny(
-                message=result.get("reason", "Denied by permission evaluator")
+            # Escalate directly to human (the orchestrator IS the Claude session)
+            return await self._escalate_orchestrator_permission(
+                chat_id, tool_name, input_data
             )
 
         return can_use_tool
@@ -639,6 +862,285 @@ class Orchestrator:
             return PermissionResultDeny(message="No answer from user (timeout)")
         finally:
             self._pending_answers.pop(chat_id, None)
+
+    async def _escalate_orchestrator_permission(
+        self, chat_id: int, tool_name: str, tool_input: dict,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        """Escalate the orchestrator's own tool use directly to human.
+
+        No Claude intermediary — the orchestrator IS the Claude session.
+        Timeout → deny (conservative).
+        """
+        request_id = uuid.uuid4().hex[:12]
+        future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = future
+
+        detail = (
+            f"Orchestrator (chat {chat_id})\n"
+            f"Tool: {tool_name}\n"
+            f"Input: {json.dumps(tool_input, ensure_ascii=False)[:500]}"
+        )
+
+        if self._send_telegram:
+            await self._send_telegram(
+                request_id, "permission", f"Permission: {tool_name}", detail
+            )
+
+        try:
+            result = await asyncio.wait_for(future, timeout=300)
+            if result.get("approved"):
+                return PermissionResultAllow()
+            return PermissionResultDeny(
+                message=result.get("reason", "Denied by user")
+            )
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            return PermissionResultDeny(
+                message="No response from user (timeout)"
+            )
+
+    # ── Broker callbacks (called by HTTP endpoints in main.py) ─────────
+
+    async def handle_permission_request(self, data: dict) -> dict:
+        """Handle /permission callback from remote broker.
+
+        Routes through the orchestrator session which has full task context.
+        """
+        server = data.get("server_name", "unknown")
+        session = data.get("session_id", "unknown")
+        tool = data.get("tool_name", "unknown")
+        tool_input = data.get("tool_input", {})
+
+        # Fast-path: auto-approve safe tools
+        if tool in WORKER_SAFE_TOOLS:
+            return {"approved": True, "reason": f"Auto-approved: {tool}"}
+
+        # Find chat_id for this worker
+        chat_id = self._worker_to_chat.get((server, session))
+        if chat_id is None:
+            log.warning(f"No chat for worker {server}/{session}, auto-denying")
+            return {"approved": False, "reason": "Unknown worker"}
+
+        # Ask orchestrator session (which knows the task context)
+        msg = (
+            f"[PERMISSION REQUEST]\n"
+            f"Worker: {server}/{session}\n"
+            f"Tool: {tool}\n"
+            f"Input: {json.dumps(tool_input, ensure_ascii=False)[:2000]}"
+        )
+        decision = await self._send_to_orchestrator(chat_id, msg)
+
+        if decision is None:
+            return {"approved": False, "reason": "Orchestrator error"}
+
+        if decision.get("action") != "permission_decision":
+            log.warning(
+                "Unexpected orchestrator response for permission: %s",
+                decision.get("action"),
+            )
+            return {"approved": False, "reason": "Unexpected orchestrator response"}
+
+        if decision.get("escalate"):
+            return await self._escalate_permission(
+                server, session, tool, tool_input,
+                decision.get("reason", "Orchestrator unsure"),
+            )
+
+        return {
+            "approved": decision.get("approved", False),
+            "reason": decision.get("reason", ""),
+        }
+
+    async def handle_clarification_request(self, data: dict) -> dict:
+        """Handle /clarification callback from remote broker (AskUserQuestion).
+
+        Routes through the orchestrator session which has full task context.
+        """
+        server = data.get("server_name", "unknown")
+        session = data.get("session_id", "unknown")
+        questions = data.get("questions", [])
+
+        # Find chat_id for this worker
+        chat_id = self._worker_to_chat.get((server, session))
+        if chat_id is None:
+            log.warning(f"No chat for worker {server}/{session}")
+            return {"answers": None, "reason": "Unknown worker"}
+
+        # Format questions for orchestrator
+        q_lines = []
+        for i, q in enumerate(questions, 1):
+            opts = ", ".join(o.get("label", "?") for o in q.get("options", []))
+            q_lines.append(
+                f"Q{i} [{q.get('header', '')}]: {q['question']}\n    Options: {opts}"
+            )
+        questions_formatted = "\n".join(q_lines)
+
+        msg = (
+            f"[CLARIFICATION REQUEST]\n"
+            f"Worker: {server}/{session}\n\n"
+            f"{questions_formatted}"
+        )
+        decision = await self._send_to_orchestrator(chat_id, msg)
+
+        if decision is None:
+            return {"answers": None, "reason": "Orchestrator error"}
+
+        if decision.get("action") != "clarification_answer":
+            log.warning(
+                "Unexpected orchestrator response for clarification: %s",
+                decision.get("action"),
+            )
+            return {"answers": None, "reason": "Unexpected orchestrator response"}
+
+        if decision.get("escalate"):
+            return await self._escalate_clarification_to_human(
+                server, session, questions,
+                decision.get("reason", "Orchestrator unsure"),
+            )
+
+        return {"answers": decision.get("answers", {})}
+
+    def handle_heartbeat(self, data: dict):
+        """Handle /heartbeat from a remote broker — update session registry."""
+        server_name = data.get("server_name", "unknown")
+        broker_sessions = data.get("sessions", [])
+        self._session_mgr.update_sessions(server_name, broker_sessions)
+
+    # ── Escalation to human ────────────────────────────────────────────
+
+    async def _escalate_permission(
+        self,
+        server: str,
+        session: str,
+        tool: str,
+        tool_input: dict,
+        reason: str,
+    ) -> dict:
+        """Escalate worker permission to human. Forced fallback on timeout."""
+        request_id = uuid.uuid4().hex[:12]
+        future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = future
+
+        detail = (
+            f"Server: {server}/{session}\n"
+            f"Tool: {tool}\n"
+            f"Input: {json.dumps(tool_input, ensure_ascii=False)[:500]}\n"
+            f"Reason: {reason}"
+        )
+
+        if self._send_telegram:
+            await self._send_telegram(
+                request_id, "permission", f"Permission: {tool}", detail
+            )
+
+        try:
+            result = await asyncio.wait_for(future, timeout=300)
+            return result
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            log.info(
+                f"Permission timeout for {server}/{session}/{tool}, "
+                f"falling back to forced orchestrator decision"
+            )
+            return await self._forced_permission_decision(
+                server, session, tool, tool_input
+            )
+
+    async def _escalate_clarification_to_human(
+        self,
+        server: str,
+        session: str,
+        questions: list[dict],
+        reason: str,
+    ) -> dict:
+        """Escalate worker clarification to human. Forced fallback on timeout."""
+        request_id = uuid.uuid4().hex[:12]
+        future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = future
+        self._pending_meta[request_id] = {"questions": questions}
+
+        detail_lines = [f"Server: {server}/{session}", f"Reason: {reason}", ""]
+        for q in questions:
+            detail_lines.append(f"  {q['question']}")
+
+        if self._send_telegram:
+            await self._send_telegram(
+                request_id, "clarification",
+                "Clarification needed", "\n".join(detail_lines),
+            )
+
+        try:
+            result = await asyncio.wait_for(future, timeout=300)
+            self._pending_meta.pop(request_id, None)
+            return result
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            self._pending_meta.pop(request_id, None)
+            log.info(
+                f"Clarification timeout for {server}/{session}, "
+                f"falling back to forced orchestrator decision"
+            )
+            return await self._forced_clarification_decision(
+                server, session, questions
+            )
+
+    # ── Forced fallback (human didn't respond) ────────────────────────
+
+    async def _forced_permission_decision(
+        self, server: str, session: str, tool: str, tool_input: dict,
+    ) -> dict:
+        """Send [PERMISSION REQUEST (FORCED)] to orchestrator — no escalate option."""
+        chat_id = self._worker_to_chat.get((server, session))
+        if chat_id is None:
+            return {"approved": False, "reason": "Unknown worker"}
+
+        msg = (
+            f"[PERMISSION REQUEST (FORCED)]\n"
+            f"Worker: {server}/{session}\n"
+            f"Tool: {tool}\n"
+            f"Input: {json.dumps(tool_input, ensure_ascii=False)[:2000]}\n\n"
+            f"Human did not respond in time. You MUST approve or deny — no escalate."
+        )
+        decision = await self._send_to_orchestrator(chat_id, msg)
+
+        if decision and decision.get("approved"):
+            return {
+                "approved": True,
+                "reason": f"[fallback] {decision.get('reason', '')}",
+            }
+        reason = (
+            decision.get("reason", "Forced deny after timeout")
+            if decision
+            else "Orchestrator error"
+        )
+        return {"approved": False, "reason": f"[fallback] {reason}"}
+
+    async def _forced_clarification_decision(
+        self, server: str, session: str, questions: list[dict],
+    ) -> dict:
+        """Send [CLARIFICATION REQUEST (FORCED)] to orchestrator — must answer."""
+        chat_id = self._worker_to_chat.get((server, session))
+        if chat_id is None:
+            return {"answers": None, "reason": "Unknown worker"}
+
+        q_lines = []
+        for i, q in enumerate(questions, 1):
+            opts = ", ".join(o.get("label", "?") for o in q.get("options", []))
+            q_lines.append(
+                f"Q{i} [{q.get('header', '')}]: {q['question']}\n    Options: {opts}"
+            )
+
+        msg = (
+            f"[CLARIFICATION REQUEST (FORCED)]\n"
+            f"Worker: {server}/{session}\n\n"
+            f"{chr(10).join(q_lines)}\n\n"
+            f"Human did not respond in time. You MUST answer — no escalate."
+        )
+        decision = await self._send_to_orchestrator(chat_id, msg)
+
+        if decision and decision.get("answers"):
+            return {"answers": decision["answers"]}
+        return {"answers": None, "reason": "Orchestrator could not answer"}
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -707,36 +1209,3 @@ class Orchestrator:
                 status_label = "PENDING"
             lines.append(f"  [{item.id}] ({status_label}) {item.description}")
         return "\n".join(lines)
-
-    # ── Broker callbacks (called by HTTP endpoints in main.py) ─────────
-
-    async def handle_permission_request(self, data: dict) -> dict:
-        """Handle /permission callback from remote broker."""
-        return await self._permission.evaluate_permission(
-            server_name=data.get("server_name", "unknown"),
-            session_id=data.get("session_id", "unknown"),
-            tool_name=data.get("tool_name", "unknown"),
-            tool_input=data.get("tool_input", {}),
-            send_escalation=self._make_escalation_sender(),
-        )
-
-    async def handle_clarification_request(self, data: dict) -> dict:
-        """Handle /clarification callback from remote broker (AskUserQuestion)."""
-        return await self._permission.evaluate_clarification(
-            server_name=data.get("server_name", "unknown"),
-            session_id=data.get("session_id", "unknown"),
-            questions=data.get("questions", []),
-            send_escalation=self._make_escalation_sender(),
-        )
-
-    def handle_heartbeat(self, data: dict):
-        """Handle /heartbeat from a remote broker — update session registry."""
-        server_name = data.get("server_name", "unknown")
-        broker_sessions = data.get("sessions", [])
-        self._session_mgr.update_sessions(server_name, broker_sessions)
-
-    def _make_escalation_sender(self):
-        async def send_escalation(request_id, interaction_type, title, detail):
-            if self._send_telegram:
-                await self._send_telegram(request_id, interaction_type, title, detail)
-        return send_escalation

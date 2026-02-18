@@ -37,7 +37,7 @@ class Task:
     finished_at: float | None = None
 
 
-_EMPTY_CHANNEL = {"messages": [], "workers": [], "tasks": [], "next_task_id": 1}
+_EMPTY_CHANNEL = {"messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1}
 
 
 class Store:
@@ -70,9 +70,13 @@ class Store:
     def _load(self, chat_id: int) -> dict:
         path = self._channel_path(chat_id)
         if not os.path.exists(path):
-            return {"messages": [], "workers": [], "tasks": [], "next_task_id": 1}
+            return {"messages": [], "workers": [], "tasks": [], "notes": [], "next_task_id": 1}
         with open(path, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Backward compat: old channels may lack "notes"
+        if "notes" not in data:
+            data["notes"] = []
+        return data
 
     def _save(self, chat_id: int, data: dict):
         path = self._channel_path(chat_id)
@@ -181,6 +185,14 @@ class Store:
             for w in sorted(data["workers"], key=lambda w: w.get("created_at", 0))
         ]
 
+    async def get_all_channel_ids(self) -> list[int]:
+        """Return all chat_ids that have channel files."""
+        ids = []
+        for fname in os.listdir(self._channels_dir):
+            if fname.endswith(".json"):
+                ids.append(int(fname[:-5]))
+        return ids
+
     async def remove_channel_worker(self, chat_id: int, server: str, session_id: str):
         data = self._load(chat_id)
         data["workers"] = [
@@ -188,3 +200,27 @@ class Store:
             if not (w["server"] == server and w["session_id"] == session_id)
         ]
         self._save(chat_id, data)
+
+    # ---- notes ----
+
+    async def add_note(self, chat_id: int, content: str):
+        """Append a channel note (unchecked by default)."""
+        data = self._load(chat_id)
+        data["notes"].append({"content": content, "ts": time.time(), "checked": False})
+        self._save(chat_id, data)
+
+    async def get_unchecked_notes(self, chat_id: int) -> list[dict]:
+        """Return all unchecked notes for a channel."""
+        data = self._load(chat_id)
+        return [n for n in data["notes"] if not n.get("checked")]
+
+    async def mark_notes_checked(self, chat_id: int):
+        """Mark all unchecked notes as checked."""
+        data = self._load(chat_id)
+        changed = False
+        for n in data["notes"]:
+            if not n.get("checked"):
+                n["checked"] = True
+                changed = True
+        if changed:
+            self._save(chat_id, data)
