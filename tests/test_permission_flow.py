@@ -32,7 +32,7 @@ async def _make_orchestrator(workers=None):
         session_mgr=mgr,
         store=store,
         model="haiku",
-        config_path="config.yaml",
+        cwd=".",
     )
 
     # Register workers in the reverse index

@@ -23,7 +23,7 @@ async def _make_orchestrator(workers=None, servers=None):
         session_mgr=mgr,
         store=store,
         model="haiku",
-        config_path="config.yaml",
+        cwd=".",
     )
 
     if workers:

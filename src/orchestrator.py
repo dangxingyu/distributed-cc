@@ -99,14 +99,15 @@ next steps autonomously. If the professor doesn't respond, figure it out yoursel
 
 You are in a project channel. Each channel is one project.
 
-SETUP: At the start of a conversation, read `{config_path}` for available servers. Also \
-check for `config.md` and `setup.md` in the same directory for extra context.
+SETUP: At the start of a conversation, look for local config files in the working directory: \
+`config.md`, `setup.md`, `config.yaml`, or `config.json`. Read whichever exist for server \
+details, project context, and extra instructions.
 
 === RESPONSE FORMAT ===
 
 You have two modes:
 
-**Tool mode** — Use your tools (Bash, Read, etc.) freely for /setup and any investigation \
+**Tool mode** — Use your tools (Bash, Read, etc.) freely for investigation \
 you need (checking server status, reading files, etc.). When done, emit a SINGLE JSON action.
 
 **JSON mode** — For all decisions (assign, reply, verdict, etc.), respond with EXACTLY ONE \
@@ -202,10 +203,13 @@ direct requests. Acknowledge naturally within your response.
 [STOP REQUESTED] — halt work and summarize what was in progress.
 {{"action": "reply", "text": "<summary of what was stopped>"}}
 
-=== /setup ===
+"""
 
+
+SETUP_PROMPT = """\
+[SETUP TASK]
 Set up server connections. Use Bash to SSH in, install broker, start it, open tunnels, \
-and verify. Read `{config_path}` and `config.md` for server details.
+and verify. Read local config files (`config.md`, `config.yaml`, etc.) for server details.
 
 For each remote server:
 1. Check/install broker: `ssh <host> 'test -f ~/.distributed-cc/remote_broker.py && echo ok || \
@@ -216,9 +220,9 @@ curl -fsSL https://raw.githubusercontent.com/dangxingyu/distributed-cc/main/tool
 `ssh -fN -L <local_port>:localhost:8200 -R 9120:localhost:9120 <host>` \
 Port allocation: 8201, 8202, etc.
 4. Verify: `curl -sf http://localhost:<local_port>/health`
-5. Register: {{"action": "register_server", "name": "...", "host": "...", "broker_port": ...}}
+5. Register: {"action": "register_server", "name": "...", "host": "...", "broker_port": ...}
 
-Then summarize with {{"action": "reply", "text": "..."}}.
+Then summarize with {"action": "reply", "text": "..."}.
 """
 
 
@@ -228,19 +232,19 @@ class Orchestrator:
         session_mgr: SessionManager,
         store: Store,
         model: str = "claude-opus-4-6",
-        config_path: str = "config.yaml",
+        cwd: str = ".",
         orch_config: dict | None = None,
     ):
         self._session_mgr = session_mgr
         self._store = store
         self._model = model
-        self._config_path = config_path
+        self._cwd = os.path.abspath(cwd)
         self._send_telegram: callable = None
-        self._system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(config_path=config_path)
+        self._system_prompt = ORCHESTRATOR_SYSTEM_PROMPT
         # Per-chat orchestrator session IDs for --resume
         self._orchestrator_sessions: dict[int, str] = {}
 
-        # Tool permission config (from config.yaml orchestrator.permissions)
+        # Tool permission config (from orchestrator.permissions in config)
         perm_cfg = (orch_config or {}).get("permissions", {})
         self._auto_approve_tools: set[str] = set(
             perm_cfg.get("auto_approve", ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", "Write", "Edit"])
@@ -493,10 +497,18 @@ class Orchestrator:
 
         await self._store.add_message(chat_id, "user", user_text)
 
+        # Inject task prompts for slash commands
+        task_prompt = ""
+        if user_text.strip().startswith("/setup"):
+            args = user_text.strip()[len("/setup"):].strip()
+            task_prompt = SETUP_PROMPT
+            if args:
+                task_prompt += f"\nUser specified: {args}\n"
+
         # Prepend channel workers context
         workers = await self._store.get_channel_workers(chat_id)
         context = self._format_channel_workers(workers)
-        augmented_text = f"{context}\n[USER MESSAGE]\n{user_text}"
+        augmented_text = f"{context}\n{task_prompt}[USER MESSAGE]\n{user_text}"
 
         # Store send_reply so the can_use_tool callback can route questions
         self._active_reply_fns[chat_id] = send_reply
@@ -884,7 +896,7 @@ class Orchestrator:
         options = ClaudeAgentOptions(
             can_use_tool=self._make_can_use_tool(chat_id),
             model=self._model,
-            cwd=os.path.dirname(os.path.abspath(self._config_path)),
+            cwd=self._cwd,
             # Auto-approve common tools at the CLI level (bypasses permission
             # prompt entirely — faster than round-tripping through can_use_tool).
             # AskUserQuestion is NOT listed so it still goes through can_use_tool.

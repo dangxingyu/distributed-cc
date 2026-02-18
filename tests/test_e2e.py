@@ -116,7 +116,7 @@ async def _setup_full_stack(broker_port: int, http_port: int):
         session_mgr=mgr,
         store=store,
         model="haiku",
-        config_path="config.yaml",
+        cwd=".",
     )
     await orch.init()
 

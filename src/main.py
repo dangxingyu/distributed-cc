@@ -12,6 +12,7 @@ All modes start the HTTP callback server for broker permission/clarification.
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -117,7 +118,7 @@ async def main():
         session_mgr=session_mgr,
         store=store,
         model=orch_cfg.get("model", "claude-opus-4-6"),
-        config_path=args.config,
+        cwd=os.path.dirname(os.path.abspath(args.config)) or ".",
         orch_config=orch_cfg,
     )
     await orchestrator.init()

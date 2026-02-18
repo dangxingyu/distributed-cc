@@ -4,7 +4,7 @@ Makes HTTP calls to remote brokers (tools/remote_broker.py) which use
 the Agent SDK to run tasks. Brokers are reachable via SSH port forwarding.
 
 Sessions can be:
-  - Pre-configured in config.yaml (static)
+  - Pre-configured in config (static)
   - Registered dynamically via broker heartbeats (dynamic)
 """
 

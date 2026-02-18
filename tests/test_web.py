@@ -35,7 +35,7 @@ async def _make_web(aiohttp_client):
         session_mgr=mgr,
         store=store,
         model="haiku",
-        config_path="config.yaml",
+        cwd=".",
     )
 
     web_chat = WebChat(orchestrator=orch, store=store)
