@@ -48,6 +48,7 @@ class WebChat:
         self._app.router.add_post("/api/channels", self._handle_channels_create)
         self._app.router.add_delete("/api/channels/{id}", self._handle_channels_delete)
         self._app.router.add_get("/api/channels/{id}/members", self._handle_channels_members)
+        self._app.router.add_get("/api/logs", self._handle_logs)
         self._app.router.add_get("/ws", self._handle_ws)
 
         self._runner = web.AppRunner(self._app)
@@ -117,6 +118,17 @@ class WebChat:
             })
         return web.json_response(members)
 
+    async def _handle_logs(self, request: web.Request) -> web.Response:
+        channel_str = request.query.get("channel")
+        if not channel_str:
+            return web.json_response({"error": "missing channel param"}, status=400)
+        try:
+            channel_id = int(channel_str)
+        except ValueError:
+            return web.json_response({"error": "invalid channel id"}, status=400)
+        logs = await self._store.get_logs(channel_id)
+        return web.json_response(logs)
+
     # ── WebSocket handler ──────────────────────────────────────────────
 
     async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
@@ -139,6 +151,8 @@ class WebChat:
                     log.error(f"WebSocket error: {ws.exception()}")
         finally:
             if self._ws is ws:
+                if self._active_channel is not None:
+                    self._orchestrator.remove_status_callback(self._active_channel)
                 self._ws = None
                 self._active_channel = None
             log.info("WebSocket client disconnected")
@@ -159,7 +173,14 @@ class WebChat:
             if channel_id is None:
                 await self._ws_send({"type": "error", "text": "missing channel_id"})
                 return
+            # Unregister status callback from old channel
+            if self._active_channel is not None:
+                self._orchestrator.remove_status_callback(self._active_channel)
             self._active_channel = int(channel_id)
+            # Register status callback for new channel
+            async def send_status(status: str):
+                await self._ws_send({"type": "status", "status": status})
+            self._orchestrator.set_status_callback(self._active_channel, send_status)
             await self._ws_send({"type": "channel_switched", "channel_id": self._active_channel})
 
         elif msg_type == "message":
@@ -177,6 +198,7 @@ class WebChat:
                 await self._ws_send({"type": "reply", "text": msg})
 
             async def send_log(msg: str):
+                await self._store.add_log(chat_id, msg)
                 await self._ws_send({"type": "log", "text": msg})
 
             # Run in background so the WS handler can continue processing

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>distributed-cc</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
@@ -231,7 +232,7 @@ body {
   background: var(--bg-surface);
   border: 1px solid var(--border-light);
   border-radius: 10px;
-  min-width: 220px;
+  min-width: 320px;
   padding: 6px 0;
   z-index: 100;
   box-shadow: 0 8px 24px rgba(0,0,0,0.5);
@@ -268,13 +269,14 @@ body {
 .member-name {
   color: var(--text-primary);
   font-weight: 500;
+  white-space: nowrap;
 }
 
 .member-detail {
   color: var(--text-muted);
   font-size: 11px;
   margin-left: auto;
-  max-width: 100px;
+  max-width: 160px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -363,10 +365,104 @@ body {
 .msg-body {
   padding: 8px 14px;
   border-radius: 8px;
-  white-space: pre-wrap;
   word-wrap: break-word;
   font-size: 13.5px;
   line-height: 1.55;
+}
+
+/* ── Rendered markdown in messages ───────────── */
+
+.msg-body p { margin: 0 0 8px 0; }
+.msg-body p:last-child { margin-bottom: 0; }
+
+.msg-body strong { font-weight: 600; }
+
+.msg-body code {
+  background: rgba(0, 0, 0, 0.25);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', monospace;
+  font-size: 12.5px;
+}
+
+.msg-body pre {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  overflow-x: auto;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.msg-body pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+
+.msg-body table {
+  border-collapse: collapse;
+  margin: 6px 0;
+  width: 100%;
+  font-size: 13px;
+}
+
+.msg-body th,
+.msg-body td {
+  border: 1px solid var(--border-light);
+  padding: 5px 10px;
+  text-align: left;
+}
+
+.msg-body th {
+  background: rgba(0, 0, 0, 0.2);
+  font-weight: 600;
+}
+
+.msg-body tr:nth-child(even) {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.msg-body ul, .msg-body ol {
+  margin: 4px 0;
+  padding-left: 22px;
+}
+
+.msg-body li { margin-bottom: 2px; }
+
+.msg-body blockquote {
+  border-left: 3px solid var(--border-light);
+  padding-left: 12px;
+  margin: 6px 0;
+  color: var(--text-secondary);
+}
+
+.msg-body a {
+  color: var(--blue);
+  text-decoration: none;
+}
+
+.msg-body a:hover {
+  text-decoration: underline;
+}
+
+.msg-body h1, .msg-body h2, .msg-body h3, .msg-body h4 {
+  margin: 8px 0 4px;
+  font-weight: 600;
+}
+
+.msg-body h1 { font-size: 1.2em; }
+.msg-body h2 { font-size: 1.1em; }
+.msg-body h3 { font-size: 1.05em; }
+
+.msg-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 8px 0;
 }
 
 .msg-user .msg-body {
@@ -468,6 +564,46 @@ body {
   color: var(--text-muted);
   font-style: italic;
   font-size: 12.5px;
+}
+
+/* ── Typing indicator ───────────────────────────── */
+
+#typing-indicator {
+  height: 0;
+  overflow: hidden;
+  padding: 0 24px;
+  font-size: 12.5px;
+  color: var(--green);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: height 0.15s ease, padding 0.15s ease;
+}
+
+#typing-indicator.active {
+  height: 28px;
+  padding: 2px 24px;
+}
+
+#typing-indicator .dot-pulse {
+  display: inline-flex;
+  gap: 3px;
+}
+
+#typing-indicator .dot-pulse span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: dotPulse 1.4s ease-in-out infinite;
+}
+
+#typing-indicator .dot-pulse span:nth-child(2) { animation-delay: 0.2s; }
+#typing-indicator .dot-pulse span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes dotPulse {
+  0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1); }
 }
 
 /* ── Input area ─────────────────────────────────── */
@@ -732,6 +868,7 @@ body {
   <div id="no-channel-msg">Select or create a channel to start</div>
   <div id="messages" style="display:none"></div>
 
+  <div id="typing-indicator"></div>
   <div id="input-area">
     <div id="mention-dropdown"></div>
     <textarea id="input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
@@ -763,6 +900,7 @@ const mentionDropdown = document.getElementById('mention-dropdown');
 const monitorEl = document.getElementById('monitor');
 const monitorLog = document.getElementById('monitor-log');
 const monitorBtn = document.getElementById('monitor-btn');
+const typingIndicator = document.getElementById('typing-indicator');
 
 let ws = null;
 let reconnectTimer = null;
@@ -783,6 +921,137 @@ function escapeHtml(text) {
 function formatTime() {
   const now = new Date();
   return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// ── Typing indicator ─────────────────────────────────────────────────
+
+const statusVerbs = [
+  'orchestrating', 'pondering', 'crafting', 'conjuring',
+  'brewing', 'weaving', 'scheming', 'composing',
+  'concocting', 'hatching', 'manifesting', 'channeling',
+];
+let _verbInterval = null;
+let _hideTimer = null;
+let _indicatorActive = false;
+
+function pickVerb() {
+  return statusVerbs[Math.floor(Math.random() * statusVerbs.length)];
+}
+
+function showTypingIndicator() {
+  // Cancel any pending hide
+  if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
+
+  // Don't rebuild DOM if already showing — just keep it
+  if (_indicatorActive) return;
+  _indicatorActive = true;
+
+  const verb = pickVerb();
+  typingIndicator.innerHTML =
+    '<span class="dot-pulse"><span></span><span></span><span></span></span>' +
+    '<span class="status-label">orchestrator is ' + verb + '</span>';
+  typingIndicator.classList.add('active');
+
+  // Rotate verb every few seconds for fun
+  if (_verbInterval) clearInterval(_verbInterval);
+  _verbInterval = setInterval(() => {
+    const label = typingIndicator.querySelector('.status-label');
+    if (label) label.textContent = 'orchestrator is ' + pickVerb();
+  }, 4000);
+}
+
+function hideTypingIndicator() {
+  // Debounce: wait a beat before hiding (avoids flicker between busy→idle→busy)
+  if (_hideTimer) clearTimeout(_hideTimer);
+  _hideTimer = setTimeout(() => {
+    _indicatorActive = false;
+    typingIndicator.classList.remove('active');
+    if (_verbInterval) { clearInterval(_verbInterval); _verbInterval = null; }
+    _hideTimer = null;
+  }, 800);
+}
+
+// ── Message text processing ──────────────────────────────────────────
+
+function processMessageText(text) {
+  // Extract reply text from JSON action blocks, strip all action blocks,
+  // and return clean text ready for markdown rendering.
+  let replyText = null;
+
+  // Find {"action": "reply", "text": "..."} and extract the text field
+  const replyRe = /\{[\s]*"action"[\s]*:[\s]*"reply"[\s]*,[\s]*"text"[\s]*:[\s]*"/;
+  const replyMatch = text.match(replyRe);
+  if (replyMatch) {
+    const jsonStart = text.indexOf(replyMatch[0]);
+    // Try to parse the JSON block starting from this position
+    try {
+      const jsonStr = extractJsonObject(text, jsonStart);
+      if (jsonStr) {
+        const obj = JSON.parse(jsonStr);
+        if (obj.action === 'reply' && obj.text) {
+          replyText = obj.text;
+        }
+      }
+    } catch (e) { /* ignore parse errors */ }
+  }
+
+  if (replyText) return replyText;
+
+  // No reply action found — strip all {"action": ...} JSON blocks from text
+  return stripJsonBlocks(text);
+}
+
+function extractJsonObject(text, startIdx) {
+  // Extract a JSON object string starting at startIdx by matching braces
+  if (text[startIdx] !== '{') return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    if (ch === '}') { depth--; if (depth === 0) return text.substring(startIdx, i + 1); }
+  }
+  return null;
+}
+
+function stripJsonBlocks(text) {
+  // Remove all {"action": ...} JSON blocks using brace matching
+  const actionPattern = /\{[\s]*"action"[\s]*:/g;
+  let result = text;
+  let match;
+  // Collect all JSON blocks to remove (work backwards to preserve indices)
+  const toRemove = [];
+  while ((match = actionPattern.exec(result)) !== null) {
+    const jsonStr = extractJsonObject(result, match.index);
+    if (jsonStr) {
+      try {
+        JSON.parse(jsonStr);
+        toRemove.push({ start: match.index, end: match.index + jsonStr.length });
+      } catch (e) { /* not valid JSON, skip */ }
+    }
+  }
+  // Remove in reverse order
+  for (let i = toRemove.length - 1; i >= 0; i--) {
+    const r = toRemove[i];
+    result = result.substring(0, r.start) + result.substring(r.end);
+  }
+  // Clean up leftover whitespace
+  return result.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function renderMarkdown(text) {
+  if (typeof marked !== 'undefined') {
+    // Configure marked for compact output
+    marked.setOptions({ breaks: true, gfm: true });
+    return marked.parse(text);
+  }
+  // Fallback: plain text with HTML escaping
+  return escapeHtml(text).replace(/\n/g, '<br>');
 }
 
 // ── Message parsing ─────────────────────────────────────────────────
@@ -835,6 +1104,18 @@ function scrollToBottom() {
 
 function addMessage(text, cssClass) {
   const parsed = parseMessage(text, cssClass);
+
+  // For non-user messages, process JSON blocks + markdown.
+  // Skip if the result is empty (e.g. message was only JSON action blocks).
+  let displayHtml = '';
+  if (cssClass === 'msg-user') {
+    displayHtml = escapeHtml(parsed.body);
+  } else {
+    const processed = processMessageText(parsed.body);
+    if (!processed.trim()) return;  // nothing to show after stripping JSON
+    displayHtml = renderMarkdown(processed);
+  }
+
   const div = document.createElement('div');
   div.className = 'msg ' + cssClass;
 
@@ -854,7 +1135,11 @@ function addMessage(text, cssClass) {
 
   const body = document.createElement('div');
   body.className = 'msg-body';
-  body.textContent = parsed.body;
+  if (cssClass === 'msg-user') {
+    body.textContent = parsed.body;
+  } else {
+    body.innerHTML = displayHtml;
+  }
 
   div.appendChild(header);
   div.appendChild(body);
@@ -976,6 +1261,7 @@ function switchChannel(channelId) {
   ws.send(JSON.stringify({ type: 'switch_channel', channel_id: channelId }));
   loadHistory(channelId);
   loadMembers(channelId);
+  loadLogs(channelId);
 }
 
 function onChannelSwitched(channelId) {
@@ -1085,6 +1371,18 @@ function loadHistory(channelId) {
       }
     })
     .catch(err => console.error('Failed to load history:', err));
+}
+
+function loadLogs(channelId) {
+  fetch('/api/logs?channel=' + channelId)
+    .then(r => r.json())
+    .then(logs => {
+      monitorLog.innerHTML = '';
+      for (const entry of logs) {
+        addLogEntry(entry.text, entry.ts);
+      }
+    })
+    .catch(err => console.error('Failed to load logs:', err));
 }
 
 // ── @mention autocomplete ───────────────────────────────────────────
@@ -1218,7 +1516,7 @@ function toggleMonitor() {
 
 let _monitorScrollPending = false;
 
-function addLogEntry(text) {
+function addLogEntry(text, ts) {
   const entry = document.createElement('div');
   const isError = text.startsWith('[ERROR]');
   const isResult = text.startsWith('[result]');
@@ -1228,8 +1526,8 @@ function addLogEntry(text) {
 
   const time = document.createElement('span');
   time.className = 'log-time';
-  const now = new Date();
-  time.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const d = ts ? new Date(ts * 1000) : new Date();
+  time.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
   const content = document.createElement('span');
   content.textContent = text;
@@ -1300,11 +1598,16 @@ function connect() {
 
     if (data.type === 'channel_switched') {
       onChannelSwitched(data.channel_id);
+    } else if (data.type === 'status') {
+      if (data.status === 'busy') showTypingIndicator();
+      else hideTypingIndicator();
     } else if (data.type === 'log') {
       addLogEntry(data.text);
     } else if (data.type === 'reply') {
       const cls = classifyMessage(data.text);
       addMessage(data.text, 'msg-' + cls);
+      // Refresh members in case a worker was created
+      if (activeChannel !== null) loadMembers(activeChannel);
     } else if (data.type === 'permission_request' || data.type === 'clarification_request') {
       addEscalationCard(data);
     } else if (data.type === 'escalation_resolved') {

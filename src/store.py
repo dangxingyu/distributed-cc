@@ -243,6 +243,19 @@ class Store:
         ]
         self._save(chat_id, data)
 
+    # ---- logs (monitor) ----
+
+    async def add_log(self, chat_id: int, text: str):
+        data = self._load(chat_id)
+        if "logs" not in data:
+            data["logs"] = []
+        data["logs"].append({"text": text, "ts": time.time()})
+        self._save(chat_id, data)
+
+    async def get_logs(self, chat_id: int) -> list[dict]:
+        data = self._load(chat_id)
+        return data.get("logs", [])
+
     # ---- notes ----
 
     async def add_note(self, chat_id: int, content: str):

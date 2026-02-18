@@ -327,6 +327,10 @@ class Orchestrator:
         # Per-chat active orchestrator tasks (for /stop cancellation)
         self._active_tasks: dict[int, set[asyncio.Task]] = {}
 
+        # Per-chat status callbacks and state
+        self._status_callbacks: dict[int, callable] = {}
+        self._chat_status: dict[int, str] = {}  # "busy" | "idle"
+
     async def init(self):
         """Initialize: populate worker-to-chat reverse index from store."""
         for chat_id in await self._store.get_all_channel_ids():
@@ -337,6 +341,28 @@ class Orchestrator:
     def set_send_telegram(self, fn):
         """Inject the Telegram send function (set by Bot after wiring)."""
         self._send_telegram = fn
+
+    def set_status_callback(self, chat_id: int, callback: callable):
+        """Register a status callback for a chat (called with 'busy'/'idle')."""
+        self._status_callbacks[chat_id] = callback
+
+    def remove_status_callback(self, chat_id: int):
+        self._status_callbacks.pop(chat_id, None)
+
+    async def _set_status(self, chat_id: int, status: str):
+        """Update chat status and notify via callback."""
+        if self._chat_status.get(chat_id) == status:
+            return  # no-op if unchanged
+        self._chat_status[chat_id] = status
+        cb = self._status_callbacks.get(chat_id)
+        if cb:
+            try:
+                await cb(status)
+                log.info(f"Chat {chat_id} status → {status}")
+            except Exception:
+                log.warning(f"Status callback failed for chat {chat_id}", exc_info=True)
+        else:
+            log.info(f"Chat {chat_id} status → {status} (no callback registered)")
 
     # ── Human resolution (moved from PermissionEvaluator) ──────────────
 
@@ -436,9 +462,13 @@ class Orchestrator:
         queue = self._message_queues.get(chat_id)
         if queue is None:
             return
-        while not queue.empty():
-            text, send_reply, send_log = queue.get_nowait()
-            await self.handle_message(chat_id, text, send_reply, send_log)
+        await self._set_status(chat_id, "busy")
+        try:
+            while not queue.empty():
+                text, send_reply, send_log = queue.get_nowait()
+                await self.handle_message(chat_id, text, send_reply, send_log)
+        finally:
+            await self._set_status(chat_id, "idle")
 
     def _track_task(self, chat_id: int, task: asyncio.Task):
         """Register an active task for cancellation via /stop."""
