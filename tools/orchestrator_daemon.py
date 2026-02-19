@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """Orchestrator daemon — runs on each remote server as a persistent autonomous agent.
 
 This daemon now runs a split-channel architecture per project:
@@ -248,7 +248,7 @@ async def _run_worker_turn(
     if worker_config:
         prompt = (
             "[WORKER_PROMPT_CONFIG]\n"
-            f"{worker_config[:12000]}\n"
+            f"{worker_config}\n"
             "[/WORKER_PROMPT_CONFIG]\n\n"
             f"{prompt}"
         )
@@ -281,7 +281,7 @@ async def _run_worker_turn(
 
     report = _extract_after_marker(result_text, "[WORKER_REPORT]")
     if not report:
-        report = result_text.strip()[:4000] or "Worker returned empty report."
+        report = result_text.strip() or "Worker returned empty report."
 
     return report, worker_session_id
 
