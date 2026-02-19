@@ -22,7 +22,6 @@ from pathlib import Path
 from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 from claude_agent_sdk.types import (
     AssistantMessage,
-    PermissionResultAllow,
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
@@ -200,14 +199,6 @@ class SetupSession:
         except FileNotFoundError:
             return '{"servers": [], "orchestrator": {}}'
 
-    def _make_can_use_tool(self):
-        """Create tool permission callback. Auto-approve everything."""
-
-        async def can_use_tool(tool_name: str, input_data: dict, context=None):
-            return PermissionResultAllow()
-
-        return can_use_tool
-
     async def run(self, user_message: str) -> str:
         """Run a sysadmin task. Returns the result text."""
         os.environ.pop("CLAUDECODE", None)
@@ -220,11 +211,9 @@ class SetupSession:
 
     async def _run_inner(self, user_message: str) -> str:
         options = ClaudeAgentOptions(
-            can_use_tool=self._make_can_use_tool(),
+            permission_mode="bypassPermissions",
             model="sonnet",
             cwd=self._cwd,
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-            sandbox={"enabled": False},
         )
 
         if self._session_id:

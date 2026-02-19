@@ -66,9 +66,6 @@ class Router:
         # Optional callback to persist channel mapping
         self._mapping_persist_callback = None  # async (chat_id, project_id|None)
 
-        # Optional per-channel status callbacks
-        self._channel_status_callbacks: dict[int, callable] = {}
-
         # Setup mode — per-channel sessions and tasks
         self._setup_sessions: dict[int, SetupSession] = {}
         self._setup_channels: set[int] = set()
@@ -178,6 +175,8 @@ class Router:
         while True:
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as http:
+                    # Sync state on (re)connect to catch events missed during gap
+                    await self._sync_daemon_status(orch, http)
                     async with http.get(url) as resp:
                         async for line in resp.content:
                             text = line.decode("utf-8", errors="replace").strip()
@@ -195,6 +194,19 @@ class Router:
                 log.warning("SSE connection lost for %s: %s", orch.project_id, e)
                 orch.status = "disconnected"
                 await asyncio.sleep(5)
+
+    async def _sync_daemon_status(self, orch: RemoteOrchestrator, http: aiohttp.ClientSession):
+        """Poll /status to sync orch.status after SSE (re)connect."""
+        try:
+            status_url = f"{self._daemon_url(orch)}/status?project_id={orch.project_id}"
+            async with http.get(status_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    status = data.get("status", "idle")
+                    orch.status = status
+                    log.info("Synced status for %s: %s", orch.project_id, status)
+        except Exception as e:
+            log.debug("Status sync failed for %s: %s", orch.project_id, e)
 
     async def ingest_progress_event(self, project_id: str, event: dict, source: str = "unknown") -> bool:
         """Single ingestion path for both SSE and callback progress events.
@@ -225,10 +237,7 @@ class Router:
             except Exception:
                 log.warning("Progress callback failed", exc_info=True)
 
-        for chat_id in self.get_channels_for_project(project_id):
-            await self._update_channel_status(chat_id, event_type, data, iteration)
-
-        if event_type in ("done", "stuck", "error"):
+        if event_type in ("done", "error"):
             await self._maybe_start_deferred_task(project_id)
 
         return True
@@ -271,22 +280,6 @@ class Router:
 
         bucket[signature] = now
         return False
-
-    async def _update_channel_status(self, chat_id: int, event_type: str, data: str, iteration: int):
-        cb = self._channel_status_callbacks.get(chat_id)
-        if not cb:
-            return
-
-        if event_type in ("done", "stuck", "error"):
-            try:
-                await cb({"type": event_type, "data": data, "iteration": iteration})
-            except Exception:
-                pass
-        elif event_type == "iteration":
-            try:
-                await cb({"type": "busy", "data": data, "iteration": iteration})
-            except Exception:
-                pass
 
     # -- message routing ------------------------------------------------
 
@@ -354,7 +347,12 @@ class Router:
             await send_reply("Message is empty after `@orchestrator` prefix.")
             return
 
-        if orch.status in ("idle", "done", "stuck", "error", "unknown"):
+        if orch.status == "stuck":
+            # Orchestrator is blocked on ask_user — deliver as interrupt (the answer)
+            await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
+            return
+
+        if orch.status in ("idle", "done", "error", "unknown"):
             await self._start_task(chat_id, project_id, effective_text, send_reply, send_log)
             return
 
@@ -630,12 +628,6 @@ class Router:
         return list(self._orchestrators.values())
 
     # -- callbacks -----------------------------------------------------
-
-    def set_channel_status_callback(self, chat_id: int, callback: callable):
-        self._channel_status_callbacks[chat_id] = callback
-
-    def remove_channel_status_callback(self, chat_id: int):
-        self._channel_status_callbacks.pop(chat_id, None)
 
     def set_progress_callback(self, callback: callable):
         self._progress_callback = callback

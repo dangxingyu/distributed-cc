@@ -933,18 +933,6 @@ async def handle_health(request: web.Request) -> web.Response:
     )
 
 
-# -- utility -----------------------------------------------------------
-
-
-def _safe_serialize(obj) -> dict:
-    """Best-effort JSON-safe conversion."""
-    try:
-        json.dumps(obj)
-        return obj
-    except (TypeError, ValueError):
-        return {"raw": str(obj)}
-
-
 # -- main --------------------------------------------------------------
 
 

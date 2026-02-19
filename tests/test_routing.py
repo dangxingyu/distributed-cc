@@ -100,6 +100,30 @@ async def test_route_running_orchestrator_mention_interrupts():
     assert payload["message"] == "also check tests"
 
 
+async def test_route_stuck_sends_interrupt():
+    """When orchestrator is stuck (ask_user), user messages route as interrupts."""
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="stuck")])
+    router._channel_project[1] = "myproj"
+
+    mock_resp = AsyncMock()
+    mock_resp.json = AsyncMock(return_value={"ok": True, "queued": True})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.post = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "use the staging API key", send_reply)
+
+    mock_http.post.assert_called_once()
+    call_args = mock_http.post.call_args
+    assert "/interrupt" in call_args[0][0]
+    payload = call_args[1]["json"]
+    assert payload["message"] == "use the staging API key"
+
+
 async def test_route_stop_command():
     router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
     router._channel_project[1] = "myproj"
@@ -204,25 +228,6 @@ async def test_get_project_status():
     router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="running")])
     assert router.get_project_status("proj") == "running"
     assert router.get_project_status("unknown") == "unknown"
-
-
-async def test_channel_status_callback():
-    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
-    router._channel_project[1] = "proj"
-
-    events = []
-
-    async def cb(event):
-        events.append(event)
-
-    router.set_channel_status_callback(1, cb)
-    await router._update_channel_status(1, "iteration", "Iteration 1/20", 1)
-    assert len(events) == 1
-    assert events[0]["type"] == "busy"
-
-    router.remove_channel_status_callback(1)
-    await router._update_channel_status(1, "done", "Complete", 5)
-    assert len(events) == 1
 
 
 async def test_route_to_disconnected_daemon():
@@ -630,20 +635,15 @@ async def test_ingest_iteration_sets_status_running():
     assert router._orchestrators["proj"].status == "running"
 
 
-# ── stuck/error also trigger deferred tasks ──────────────────────────
+# ── deferred task triggers ────────────────────────────────────────────
 
 
-async def test_stuck_event_starts_deferred_task():
+async def test_stuck_event_does_not_start_deferred_task():
+    """'stuck' means ask_user is pending — don't start deferred tasks."""
     router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="running")])
     router._deferred_tasks["proj"] = [{"chat_id": 1, "text": "queued task", "ts": 1.0}]
 
-    mock_resp = AsyncMock()
-    mock_resp.json = AsyncMock(return_value={"ok": True})
-    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-    mock_resp.__aexit__ = AsyncMock()
-
     mock_http = MagicMock()
-    mock_http.post = MagicMock(return_value=mock_resp)
     router._http = mock_http
 
     await router.ingest_progress_event(
@@ -652,9 +652,10 @@ async def test_stuck_event_starts_deferred_task():
         source="sse",
     )
 
-    assert mock_http.post.called
-    assert "/task" in mock_http.post.call_args[0][0]
-    assert mock_http.post.call_args[1]["json"]["task"] == "queued task"
+    # Should NOT have tried to start a deferred task
+    assert not mock_http.post.called
+    # Deferred queue should still have the task
+    assert len(router._deferred_tasks["proj"]) == 1
 
 
 async def test_error_event_starts_deferred_task():
