@@ -1,30 +1,31 @@
 # Distributed Claude Code
 
-Run Claude Code sessions across multiple servers from a single chat interface on your laptop.
+Run Claude Code across multiple machines from one local web chat.
 
+It gives you:
+- One chat UI on your laptop (`http://localhost:8080`)
+- One daemon per server (`:8200`)
+- Two agent roles per task on each daemon:
+  - `orchestrator` for planning/verification
+  - `worker` for concrete execution
+
+## What You Type vs What Happens
+
+```text
+You (web UI) -> Router (local) -> Daemon (remote)
+                               -> Orchestrator turn
+                               -> Worker assignment
+                               -> Worker report
+                               -> Repeat until done/stuck/error
 ```
-You (laptop)                          Remote servers
-┌──────────────────────┐
-│  Web UI :8080        │     SSH      ┌──────────────────────┐
-│  ┌────────────────┐  │◄────────────►│  Server A            │
-│  │  Router        │  │              │  Daemon :8200        │
-│  │  /setup        │  │     SSH      │  ┌── Orchestrator ─┐ │
-│  │  /connect      │  │◄────────────►│  │  (plans, verifies│ │
-│  │  @orchestrator │  │              │  ├── Worker ────────┤ │
-│  └────────────────┘  │              │  │  (executes code) │ │
-└──────────────────────┘              │  └──────────────────┘ │
-                                      └──────────────────────┘
-```
 
-Each remote daemon runs two independent Claude Code sessions per task:
-- **Orchestrator** — the PhD student. Plans, decomposes tasks, verifies worker output, decides next steps. Read-only tools (Read, Glob, Grep, WebSearch).
-- **Worker** — the hands. Executes assignments end-to-end: writes code, runs tests, edits files. Full tools (Read, Write, Edit, Bash, etc.).
+The UI shows:
+- Chat panel: `@orchestrator -> @worker` and `@worker -> @orchestrator` messages
+- Monitor panel: tool calls, logs, and iteration progress
 
-The orchestrator assigns work via `[ASSIGN_WORKER]`, the worker reports back via `[WORKER_REPORT]`, and the loop continues until `[TASK_COMPLETE]` or `[NEED_USER_INPUT]`. Progress streams back in real-time.
+## Quick Start (10 Minutes)
 
-## Quick Start
-
-### 1. Install
+### 1. Install locally
 
 ```bash
 git clone https://github.com/dangxingyu/distributed-cc.git
@@ -32,208 +33,177 @@ cd distributed-cc
 uv sync --extra dev
 ```
 
-### 2. Start the router
+### 2. Start router + web UI
 
 ```bash
 make run
-# Open http://localhost:8080
 ```
 
-This starts the router and web UI on your laptop. No daemons need to be running yet — the router connects to daemons lazily when you first interact with a project.
+Open `http://localhost:8080`.
 
-### 3. Set up a remote server
+### 3. Set up a server from the UI
 
-The easiest way is the built-in `/setup` command. In the web UI, type:
+In chat, run:
 
+```text
+/setup user@your-server
 ```
-/setup user@your-server.example.com
-```
 
-The sysadmin session (a local Claude Code agent) will:
-- SSH into the server and probe the environment (OS, Python, GPUs, etc.)
-- Install the daemon and dependencies
-- Update your local `config.json`
-- Tell you what SSH tunnel command to run
+The setup agent will:
+- SSH into the server
+- install daemon dependencies
+- update local `config.json`
+- tell you tunnel commands
 
-Type follow-up messages to give it context (e.g. "this machine uses conda", "the project is in /data/my-repo"). Type `/done` when finished.
+Use follow-up messages to provide context (conda path, project path, cluster constraints).  
+Use `/done` to exit setup mode.
 
-Or set things up manually — see [Manual Setup](#manual-setup) below.
+### 4. Open SSH tunnel(s)
 
-### 4. Open SSH tunnels
-
-Each remote server needs two tunnels (one command per server):
+One tunnel command per server:
 
 ```bash
 ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@your-server
 ```
 
-- `-L` lets your laptop reach the remote daemon
-- `-R` lets the daemon stream progress back to you
+- `-L` exposes remote daemon locally
+- `-R` allows daemon progress callbacks back to your laptop
 
-Use different local ports for each server (`8201`, `8202`, etc.).
+### 5. Connect a channel and run a task
 
-### 5. Start working
-
-Create a channel, connect it to a project, and send your task:
-
-```
+```text
 /connect my-project
-Investigate why the training loss plateaus — might be reward hacking
+Investigate why training loss plateaus; maybe reward hacking.
 ```
 
-The orchestrator decomposes the task, assigns work to the worker, reviews results, and iterates until done. You see the full orchestrator ↔ worker dialogue in the chat panel and detailed tool activity in the monitor panel.
+## Core Commands
 
-## How it works
-
-```
-User: "investigate training loss plateau"
-  │
-  ▼
-Orchestrator (iteration 1):
-  "I'll start by checking the reward function for exploitable patterns."
-  [ASSIGN_WORKER]
-  WorkerTask: Read reward.py and training logs, look for reward hacking
-  │
-  ▼
-Worker:
-  (reads files, greps logs, analyzes patterns)
-  [WORKER_REPORT]
-  Summary: Found reward increasing while loss quality drops after step 5000...
-  │
-  ▼
-Orchestrator (iteration 2):
-  "Evidence of reward hacking confirmed. Let me assign a fix."
-  [ASSIGN_WORKER]
-  WorkerTask: Add reward clipping in reward.py, re-run eval...
-  │
-  ▼
-  ... (continues until done)
-```
-
-The chat panel shows the high-level dialogue (`@orchestrator -> @worker: ...` assignments and `@worker -> @orchestrator: ...` reports). The monitor panel shows every tool call, text output, and intermediate thinking.
-
-## Commands and messaging
-
-| Command | Description |
-|---------|-------------|
-| `/connect <project-id>` | Link this channel to a remote project |
-| `/connect` | Show current connection and available projects |
-| `/status` | Show current task status, iteration count, and queued tasks |
-| `/stop` | Stop the running task |
-| `/setup <user@host>` | Deploy a daemon to a new server (interactive) |
-| `/setup` | Health-check all configured servers |
+| Command | Purpose |
+|---|---|
+| `/connect <project-id>` | Connect current channel to a project |
+| `/connect` | Show current connection |
+| `/status` | Show daemon/task status |
+| `/stop` | Stop current running task |
+| `/setup <user@host>` | Interactive server setup |
+| `/setup` | Health check configured servers |
 | `/done` | Exit setup mode |
 
-### Messaging while a task is running
+### While a task is running
 
-| What you type | What happens |
-|---------------|-------------|
-| Regular message | Queued as the next task (starts after current one finishes) |
-| `@orchestrator <message>` | Urgent interrupt — injected at the next iteration boundary |
-| `@orchestrator /stop` | Commands also work with the `@orchestrator` prefix |
+| You send | Behavior |
+|---|---|
+| Normal message | queued as next task |
+| `@orchestrator <msg>` | urgent interrupt at next iteration boundary |
+| `@orchestrator /stop` | command form also works with prefix |
 
 ## Configuration
 
-The router reads `config.json` on startup to know about available servers. Daemons are contacted lazily — only when you first interact with a project.
+The router reads `config.json` at startup.
+
+Current common format:
 
 ```json
 {
   "servers": [
     {
       "name": "h100",
-      "host": "ubuntu@209.20.157.135",
-      "work_dir": "/home/ubuntu",
+      "host": "ubuntu@host-or-ip",
+      "work_dir": "/home/ubuntu/project",
       "broker_port": 8201
     },
     {
       "name": "local",
       "host": null,
-      "work_dir": "/path/to/project",
+      "work_dir": "/Users/you/project",
       "broker_port": 8200
     }
   ],
   "orchestrator": {
-    "model": "claude-opus-4-6"
+    "model": "claude-opus-4-6",
+    "session_model": "claude-opus-4-6"
   }
 }
 ```
 
-- **name** — project identifier (used with `/connect`)
-- **host** — SSH destination (`user@host`), or `null` for local
-- **work_dir** — working directory on the remote server
-- **broker_port** — local port for the SSH tunnel (must match your `-L` flag)
+Field meanings:
+- `name`: project ID used by `/connect`
+- `host`: SSH destination, or `null` for local
+- `work_dir`: project directory on that machine
+- `broker_port`: local forwarded port that maps to remote `:8200`
 
-Copy `config.example.json` to get started: `cp config.example.json config.json`
-
-## Manual Setup
-
-If you prefer to set up servers yourself instead of using `/setup`:
-
-**On the remote server:**
+Start from:
 
 ```bash
-# Install uv (if missing)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Deploy the daemon
-mkdir -p ~/.distributed-cc
-# Copy orchestrator_daemon.py to the server (from your laptop):
-# scp tools/orchestrator_daemon.py user@server:~/.distributed-cc/
-
-# Install dependencies
-cd ~/.distributed-cc
-uv venv .venv
-uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp
-
-# Start the daemon (in tmux for persistence)
-tmux new-session -d -s daemon \
-  '.venv/bin/python3 orchestrator_daemon.py --port 8200 --name server-a --callback-url http://127.0.0.1:9120'
+cp config.example.json config.json
 ```
 
-**Prerequisite**: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and authenticated on each remote server.
+## Manual Setup (If You Skip `/setup`)
 
-**Verify it's running** (after SSH tunnel is up):
+On remote server:
 
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+mkdir -p ~/.distributed-cc
+scp tools/orchestrator_daemon.py user@server:~/.distributed-cc/orchestrator_daemon.py
+ssh user@server "cd ~/.distributed-cc && uv venv .venv && uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp"
+ssh user@server "tmux new-session -d -s daemon '~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py --port 8200 --name server-a --callback-url http://127.0.0.1:9120'"
+```
+
+From laptop:
+
+```bash
+ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@server
 curl http://127.0.0.1:8201/health
 ```
+
+Prerequisite on each remote machine:
+- Claude Code CLI installed and authenticated
+
+## Troubleshooting
+
+### Router cannot reach daemon
+- Confirm tunnel is active:
+  - `curl http://127.0.0.1:<broker_port>/health`
+- Check daemon process on server:
+  - `tmux ls`
+  - daemon running with `~/.distributed-cc/.venv/bin/python3`
+
+### No progress events in UI
+- Check reverse tunnel (`-R 9120:localhost:9120`) is present
+- Verify local callback server is up (router running)
+
+### `/connect <id>` says unknown project
+- Confirm `config.json` has matching `servers[].name`
+- Restart router after config changes
 
 ## Testing
 
 ```bash
-make test         # Unit tests (131 tests, no API calls)
-make test-e2e     # End-to-end tests (calls Claude, costs money)
+make test      # unit/integration tests (no paid API calls)
+make test-e2e  # real Claude API calls (costs money)
 ```
 
-## Project Structure
+## Project Layout
 
-```
+```text
 src/
-  main.py         — entry point: Router + WebChat + callback server
-  router.py       — routes messages to daemons, manages urgency/deferral
-  setup.py        — sysadmin session for /setup (local Agent SDK)
-  web.py          — multi-client web chat (HTTP + WebSocket)
-  store.py        — JSON file persistence (messages, logs, channel-project mapping)
+  main.py      entrypoint (router + web + callback server)
+  router.py    command routing, daemon IO, status, queueing
+  web.py       HTTP/WebSocket chat backend
+  setup.py     local setup agent for /setup mode
+  store.py     JSON persistence
   static/
-    index.html    — single-page chat UI
+    index.html frontend
 
 tools/
-  orchestrator_daemon.py  — split-channel daemon (orchestrator + worker sessions)
+  orchestrator_daemon.py  remote daemon (orchestrator + worker loop)
+  deploy.sh               helper to copy/install daemon remotely
+  start_tunnels.sh        helper for SSH tunnels
 
 docs/
-  design-philosophy.md    — Professor → PhD Student → Claude Code model
-  broker-guide.md         — detailed daemon operations guide
+  design-philosophy.md
+  broker-guide.md
 ```
-
-## Design Philosophy
-
-The system follows the **Professor → PhD Student → Claude Code** model:
-
-- **You** are the professor — give high-level direction with specific intuitions
-- **Orchestrator** is the PhD student — decomposes tasks, reviews work, makes decisions autonomously
-- **Worker** is the implementation tool — executes specific, actionable assignments
-
-The orchestrator doesn't ask for permission on routine decisions. It escalates to you (via `[NEED_USER_INPUT]`) only when genuinely stuck. See `docs/design-philosophy.md` for details.
 
 ## Requirements
 
