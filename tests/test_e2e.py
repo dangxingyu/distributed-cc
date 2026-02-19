@@ -10,6 +10,8 @@ import asyncio
 import json
 import os
 import tempfile
+from pathlib import Path
+
 import pytest
 from aiohttp import web, ClientSession, ClientTimeout
 
@@ -212,7 +214,7 @@ async def test_e2e_daemon_task():
                 "http://127.0.0.1:18301/task",
                 json={
                     "project_id": "e2e-test",
-                    "task": "Reply with exactly 'TASK_OK' and include [TASK_COMPLETE] at the end.",
+                    "task": "Reply with 'TASK_OK' and call task_complete immediately.",
                     "max_iterations": 3,
                 },
             ) as resp:
@@ -274,7 +276,7 @@ async def test_e2e_daemon_interrupt():
                 "http://127.0.0.1:18302/task",
                 json={
                     "project_id": "int-test",
-                    "task": "List all files in /tmp and summarize. Include [TASK_COMPLETE] when done.",
+                    "task": "List all files in /tmp and summarize. Call task_complete when done.",
                     "max_iterations": 5,
                 },
             )
@@ -346,3 +348,193 @@ async def test_e2e_sdk_can_use_tool():
             print(f"Tools used: {tool_calls}")
 
     assert got_result, "Never received a ResultMessage"
+
+
+# ── Daemon E2E helper ─────────────────────────────────────────────────
+
+
+async def _run_daemon_task(
+    port: int,
+    sandbox: str,
+    project_id: str,
+    task: str,
+    max_iterations: int = 5,
+    timeout_secs: int = 180,
+) -> dict:
+    """Spin up a daemon, register a sandbox project, run a task, return final status."""
+    restore = _patch_daemon_globals(
+        name=f"e2e-{project_id}",
+        callback_url="http://127.0.0.1:19999",
+    )
+    app = _setup_daemon_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+
+    base = f"http://127.0.0.1:{port}"
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=timeout_secs + 30)) as http:
+            # Register project
+            async with http.post(
+                f"{base}/register",
+                json={"project_id": project_id, "project_dir": sandbox, "name": project_id},
+            ) as resp:
+                assert resp.status == 200
+
+            # Start task
+            async with http.post(
+                f"{base}/task",
+                json={"project_id": project_id, "task": task, "max_iterations": max_iterations},
+            ) as resp:
+                assert resp.status == 200
+
+            # Wait for completion
+            for _ in range(timeout_secs // 2):
+                await asyncio.sleep(2)
+                async with http.get(f"{base}/status?project_id={project_id}") as resp:
+                    status = await resp.json()
+                    if status.get("status") in ("done", "error", "stuck"):
+                        return status
+            pytest.fail(f"Task did not complete within {timeout_secs}s")
+    finally:
+        restore()
+        await runner.cleanup()
+
+
+# ── T7: MCP tools — assign_worker + update_task_list + task_complete ──
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_mcp_assign_worker_and_complete():
+    """Orchestrator uses assign_worker to create a file, update_task_list to plan, task_complete to finish."""
+    _clear_nesting_guard()
+
+    with tempfile.TemporaryDirectory(prefix="dcc_e2e_mcp_") as sandbox:
+        status = await _run_daemon_task(
+            port=18310,
+            sandbox=sandbox,
+            project_id="mcp-worker",
+            task=(
+                "Do the following steps in order:\n"
+                "1. Call update_task_list with a short plan (2-3 items)\n"
+                "2. Call assign_worker to create a file called hello.py "
+                "containing exactly: print('Hello MCP')\n"
+                "3. Call task_complete with a summary"
+            ),
+            max_iterations=5,
+            timeout_secs=180,
+        )
+
+        print(f"MCP worker test status: {status}")
+        assert status["status"] == "done", (
+            f"Expected done, got {status['status']}: {status.get('error', '')}"
+        )
+
+        # Verify worker created the file
+        hello = Path(sandbox) / "hello.py"
+        assert hello.exists(), f"Worker should have created hello.py. Files: {os.listdir(sandbox)}"
+        content = hello.read_text()
+        assert "Hello MCP" in content, f"Unexpected content: {content}"
+
+        # Verify task list was created
+        task_list = Path(sandbox) / "task_list.md"
+        assert task_list.exists(), (
+            f"Orchestrator should have called update_task_list. Files: {os.listdir(sandbox)}"
+        )
+        print(f"task_list.md content:\n{task_list.read_text()}")
+
+
+# ── T8: MCP tools — ask_user with interrupt ───────────────────────────
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_mcp_ask_user_with_interrupt():
+    """Orchestrator uses ask_user, daemon blocks, interrupt provides the answer."""
+    _clear_nesting_guard()
+
+    with tempfile.TemporaryDirectory(prefix="dcc_e2e_ask_") as sandbox:
+        restore = _patch_daemon_globals(
+            name="e2e-ask",
+            callback_url="http://127.0.0.1:19999",
+        )
+        app = _setup_daemon_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18311)
+        await site.start()
+
+        base = "http://127.0.0.1:18311"
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=210)) as http:
+                # Register
+                await http.post(
+                    f"{base}/register",
+                    json={"project_id": "ask-test", "project_dir": sandbox, "name": "ask-test"},
+                )
+
+                # Start task that requires user input
+                await http.post(
+                    f"{base}/task",
+                    json={
+                        "project_id": "ask-test",
+                        "task": (
+                            "You need to create a config file. "
+                            "First, call ask_user to ask: 'What should the project name be?' "
+                            "Then assign a worker to create config.json containing "
+                            '{"name": "<the name the user gave>"}. '
+                            "Finally call task_complete."
+                        ),
+                        "max_iterations": 5,
+                    },
+                )
+
+                # Wait for stuck status (ask_user blocks)
+                got_stuck = False
+                for _ in range(60):
+                    await asyncio.sleep(2)
+                    async with http.get(f"{base}/status?project_id=ask-test") as resp:
+                        status = await resp.json()
+                        st = status.get("status", "")
+                        if st == "stuck":
+                            got_stuck = True
+                            print(f"Orchestrator asked: {status.get('summary', '')}")
+                            break
+                        if st in ("done", "error"):
+                            break
+
+                if got_stuck:
+                    # Provide the answer via interrupt
+                    async with http.post(
+                        f"{base}/interrupt",
+                        json={"project_id": "ask-test", "message": "my-awesome-project"},
+                    ) as resp:
+                        data = await resp.json()
+                        assert data["ok"] is True
+
+                # Wait for final completion
+                for _ in range(60):
+                    await asyncio.sleep(2)
+                    async with http.get(f"{base}/status?project_id=ask-test") as resp:
+                        status = await resp.json()
+                        if status.get("status") in ("done", "error"):
+                            break
+                else:
+                    pytest.fail("Task did not complete after interrupt")
+
+                print(f"ask_user test final status: {status}")
+                assert status["status"] == "done", (
+                    f"Expected done, got {status['status']}: {status.get('error', '')}"
+                )
+
+                # Verify config.json was created
+                config_path = Path(sandbox) / "config.json"
+                if config_path.exists():
+                    config_content = config_path.read_text()
+                    print(f"config.json content: {config_content}")
+
+        finally:
+            restore()
+            await runner.cleanup()

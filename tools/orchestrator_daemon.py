@@ -427,6 +427,9 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
     async def ask_user(args):
         question = args["question"]
 
+        state.status = "stuck"
+        state.summary = f"Needs input: {question}"
+
         await emit_progress(
             project_id,
             ProgressEvent(type="stuck", data=question, iteration=state.iteration),
@@ -436,8 +439,12 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             answer = await asyncio.wait_for(
                 interrupt_queues[project_id].get(), timeout=600
             )
+            state.status = "running"
+            state.summary = ""
             return {"content": [{"type": "text", "text": f"User responded: {answer}"}]}
         except asyncio.TimeoutError:
+            state.status = "running"
+            state.summary = ""
             return {"content": [{"type": "text", "text":
                 "No user response after 10 minutes. "
                 "Proceed with your best judgment or call task_complete with current progress."}]}
