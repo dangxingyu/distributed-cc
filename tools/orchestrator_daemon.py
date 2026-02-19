@@ -68,15 +68,16 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 - **task_complete(summary)** — mark the overall task as done.
 - **ask_user(question)** — ask the professor a blocking question (use sparingly).
 - **update_task_list(content)** — update your research plan (task_list.md).
-- **update_worker_config(content)** — update standing worker instructions (CLAUDE.md).
+- **update_worker_config(content)** — update standing worker instructions (.claude/CLAUDE.md).
 
 ## Workflow
 
-1. Investigate: Read files, search the codebase, understand the problem.
-2. Plan: Call update_task_list with a research-level plan.
-3. Execute: Call assign_worker with concrete tasks and review their reports.
-4. Iterate: Refine based on evidence until the goal is met.
-5. Complete: Call task_complete with a summary.
+1. Start: Read task_list.md (if it exists) to resume your previous plan.
+2. Investigate: Read files, search the codebase, understand the problem.
+3. Plan: Call update_task_list with a research-level plan.
+4. Execute: Call assign_worker with concrete tasks and review their reports.
+5. Iterate: Refine based on evidence until the goal is met.
+6. Complete: Call task_complete with a summary.
 
 ## Rules
 
@@ -84,7 +85,7 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 - Worker assignments should be concrete and actionable.
 - Never edit code/config/tests yourself — use assign_worker for all implementation.
 - Keep task_list at PhD-level granularity (experiments, milestones), not micro-steps.
-- Only update worker config (CLAUDE.md) when conventions genuinely change.
+- Only update worker config (.claude/CLAUDE.md) when conventions genuinely change.
 - Use ask_user only for genuine blocking decisions, not routine status updates.
 """
 
@@ -232,6 +233,7 @@ async def _run_worker_turn(
         model="claude-opus-4-6",
         cwd=project.project_dir,
         max_turns=50,
+        setting_sources=["project"],  # loads CLAUDE.md from project dir natively
     )
 
     if worker_session_id:
@@ -244,14 +246,6 @@ async def _run_worker_turn(
         f"{assignment}\n\n"
         "Execute this assignment and provide evidence. End with [WORKER_REPORT]."
     )
-    worker_config = _load_worker_prompt_config(project_id)
-    if worker_config:
-        prompt = (
-            "[WORKER_PROMPT_CONFIG]\n"
-            f"{worker_config}\n"
-            "[/WORKER_PROMPT_CONFIG]\n\n"
-            f"{prompt}"
-        )
 
     result_text = ""
     done_event = asyncio.Event()
@@ -472,9 +466,10 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
     @tool(
         "update_worker_config",
-        "Update standing instructions for your worker (CLAUDE.md). "
-        "The worker sees this at the start of every assignment. "
-        "Use for: project conventions, file locations, environment quirks, "
+        "Update standing instructions for your worker (.claude/CLAUDE.md). "
+        "The worker loads this natively at the start of every assignment. "
+        "This is separate from the project's root CLAUDE.md (which you should not overwrite). "
+        "Use for: learned conventions, file locations, environment quirks, "
         "tool preferences. Only update when something genuinely changes.",
         {"content": str},
     )
@@ -486,11 +481,12 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
                 "is_error": True,
             }
 
-        path = Path(project.project_dir) / "CLAUDE.md"
-        path.write_text(args["content"])
+        claude_dir = Path(project.project_dir) / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        (claude_dir / "CLAUDE.md").write_text(args["content"])
 
         return {"content": [{"type": "text", "text":
-            "Worker instructions (CLAUDE.md) updated."}]}
+            "Worker instructions (.claude/CLAUDE.md) updated."}]}
 
     return create_sdk_mcp_server(
         "daemon",
@@ -540,13 +536,7 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         ProgressEvent(type="iteration", data=f"Starting task: {task_text[:200]}", iteration=0),
     )
 
-    # Build initial prompt
-    parts = []
-    task_list = _load_task_list(project_id)
-    if task_list:
-        parts.append(f"[CURRENT_TASK_LIST]\n{task_list}")
-    parts.append(f"[TASK]\n{task_text}")
-    prompt = "\n\n".join(parts)
+    prompt = f"[TASK]\n{task_text}"
 
     options = ClaudeAgentOptions(
         permission_mode="bypassPermissions",
@@ -679,33 +669,6 @@ def _save_task_list(project_id: str, content: str):
     path.write_text(content)
 
 
-def _load_task_list(project_id: str) -> str:
-    """Read task list from project root, with fallback to legacy state path."""
-    project = projects.get(project_id)
-    if project:
-        root = Path(project.project_dir)
-        for fname in ("task_list.md", ".task_list.md"):
-            path = root / fname
-            if path.exists():
-                return path.read_text().strip()
-
-    legacy = STATE_DIR / f"{project_id}.task_list.md"
-    if legacy.exists():
-        return legacy.read_text().strip()
-    return ""
-
-
-def _load_worker_prompt_config(project_id: str) -> str:
-    """Read CLAUDE.md/claude.md in project root for worker prompt config."""
-    project = projects.get(project_id)
-    if not project:
-        return ""
-    root = Path(project.project_dir)
-    for fname in ("CLAUDE.md", "claude.md"):
-        path = root / fname
-        if path.exists():
-            return path.read_text().strip()
-    return ""
 
 
 async def _forward_assistant_message(
@@ -778,7 +741,6 @@ def _save_state(
         "finished_at": state.finished_at,
         "summary": state.summary,
         "error": state.error,
-        "task_list": _load_task_list(state.project_id),
     }
     tmp = str(path) + ".tmp"
     with open(tmp, "w") as f:
