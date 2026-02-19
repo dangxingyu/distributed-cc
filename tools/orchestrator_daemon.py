@@ -30,7 +30,6 @@ from aiohttp import ClientSession, ClientTimeout, web
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 from claude_agent_sdk.types import (
     AssistantMessage,
-    PermissionResultAllow,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -54,17 +53,24 @@ ORCHESTRATOR_PROMPT = """\
 You are the ORCHESTRATOR (PhD student role). You do planning, decomposition,
 verification, and decision making. You do NOT execute implementation work directly.
 
-You also maintain a task list — your research plan for the overall task.
-Include a [TASK_LIST] block in your response to update it:
+You maintain two files that you may edit directly:
 
-[TASK_LIST]
-- [x] Completed item
-- [ ] Pending item
-- [ ] Another pending item
-[/TASK_LIST]
+1. task_list.md — your research plan for the overall task.
+   Include a [TASK_LIST] block each turn to update it:
+   [TASK_LIST]
+   - [x] Completed item
+   - [ ] Pending item
+   [/TASK_LIST]
+   This is PhD-level planning (experiments, investigations, milestones),
+   not worker micro-steps. Update every turn.
 
-Update this every turn — mark items done, add new ones as you learn more.
-This is your PhD-level research plan, not micro-implementation steps.
+2. CLAUDE.md — standing instructions for your worker.
+   Edit this when you learn something the worker should always know:
+   project conventions, file locations, environment quirks, tool preferences.
+   The worker sees this at the start of every assignment.
+   Only edit when the content genuinely changes — not every turn.
+
+Everything else (code, config, tests, commands) is the worker's job.
 
 At the end of every response, choose exactly one:
 
@@ -78,8 +84,10 @@ Summary: <why the overall user task is complete>
 Question: <specific blocking question>
 
 Rules:
-- Use worker reports as evidence.
-- If evidence is insufficient, assign a refined worker task.
+- Use worker reports as evidence. If insufficient, assign a refined worker task.
+- Investigate (Read, Grep, Glob) before assigning work.
+- Delegate all implementation and command execution to the worker.
+- Your only writes are task_list.md and CLAUDE.md — never edit code yourself.
 - Do not output multiple terminal markers.
 """
 
@@ -208,15 +216,6 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
         await done.wait()
 
 
-def _make_can_use_tool():
-    """Auto-approve tools in daemon-owned sessions."""
-
-    async def can_use_tool(tool_name: str, input_data: dict, context=None):
-        return PermissionResultAllow()
-
-    return can_use_tool
-
-
 # -- ralph split loop --------------------------------------------------
 
 
@@ -232,21 +231,9 @@ async def _run_worker_turn(
         return "Worker failed: unknown project.", worker_session_id
 
     options = ClaudeAgentOptions(
-        can_use_tool=_make_can_use_tool(),
+        permission_mode="bypassPermissions",
         model="claude-opus-4-6",
         cwd=project.project_dir,
-        allowed_tools=[
-            "Read",
-            "Write",
-            "Edit",
-            "Bash",
-            "Glob",
-            "Grep",
-            "WebSearch",
-            "WebFetch",
-            "NotebookEdit",
-        ],
-        sandbox={"enabled": False},
     )
 
     if worker_session_id:
@@ -259,6 +246,14 @@ async def _run_worker_turn(
         f"{assignment}\n\n"
         "Execute this assignment and provide evidence. End with [WORKER_REPORT]."
     )
+    worker_config = _load_worker_prompt_config(project_id)
+    if worker_config:
+        prompt = (
+            "[WORKER_PROMPT_CONFIG]\n"
+            f"{worker_config[:12000]}\n"
+            "[/WORKER_PROMPT_CONFIG]\n\n"
+            f"{prompt}"
+        )
 
     result_text = ""
     done_event = asyncio.Event()
@@ -363,11 +358,9 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
             )
 
             options = ClaudeAgentOptions(
-                can_use_tool=_make_can_use_tool(),
+                permission_mode="bypassPermissions",
                 model="claude-opus-4-6",
                 cwd=project.project_dir,
-                allowed_tools=["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
-                sandbox={"enabled": False},
             )
 
             if orchestrator_session_id:
@@ -659,23 +652,41 @@ def _extract_task_list(text: str) -> str | None:
 
 
 def _save_task_list(project_id: str, content: str):
-    """Write task list to {project_dir}/.task_list.md."""
+    """Write task list to task_list.md in project root."""
     project = projects.get(project_id)
     if not project:
         return
-    path = Path(project.project_dir) / ".task_list.md"
+    path = Path(project.project_dir) / "task_list.md"
     path.write_text(content)
 
 
 def _load_task_list(project_id: str) -> str:
-    """Read task list from {project_dir}/.task_list.md."""
+    """Read task list from project root, with fallback to legacy state path."""
+    project = projects.get(project_id)
+    if project:
+        root = Path(project.project_dir)
+        for fname in ("task_list.md", ".task_list.md"):
+            path = root / fname
+            if path.exists():
+                return path.read_text().strip()
+
+    legacy = STATE_DIR / f"{project_id}.task_list.md"
+    if legacy.exists():
+        return legacy.read_text().strip()
+    return ""
+
+
+def _load_worker_prompt_config(project_id: str) -> str:
+    """Read CLAUDE.md/claude.md in project root for worker prompt config."""
     project = projects.get(project_id)
     if not project:
         return ""
-    path = Path(project.project_dir) / ".task_list.md"
-    if not path.exists():
-        return ""
-    return path.read_text().strip()
+    root = Path(project.project_dir)
+    for fname in ("CLAUDE.md", "claude.md"):
+        path = root / fname
+        if path.exists():
+            return path.read_text().strip()
+    return ""
 
 
 async def _forward_assistant_message(
