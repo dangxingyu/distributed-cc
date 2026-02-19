@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import aiohttp
 from aiohttp import web, ClientSession, ClientTimeout
 
 from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
@@ -538,3 +539,233 @@ async def test_e2e_mcp_ask_user_with_interrupt():
         finally:
             restore()
             await runner.cleanup()
+
+
+# ── T9: Full stack — WebSocket → Router → Daemon → Claude → WS back ──
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_full_stack_web_to_worker():
+    """Full round trip: WS message → Router → Daemon → Orchestrator → Worker → progress events → WS.
+
+    Verifies:
+      - User message via WebSocket reaches the daemon and starts a task
+      - Orchestrator assigns worker, worker creates a file
+      - Progress events (iteration, log, reply, channel_status, done) flow back via WS
+      - Chat messages show orchestrator↔worker exchange
+      - File is actually created in the sandbox
+    """
+    _clear_nesting_guard()
+
+    DAEMON_PORT = 18320
+    CALLBACK_PORT = 18321
+    WEB_PORT = 18322
+
+    with tempfile.TemporaryDirectory(prefix="dcc_e2e_full_") as sandbox:
+        # ── 1. Start daemon ──────────────────────────────────────────
+        restore = _patch_daemon_globals(
+            name="e2e-full",
+            callback_url=f"http://127.0.0.1:{CALLBACK_PORT}",
+        )
+        daemon_app = _setup_daemon_app()
+        daemon_runner = web.AppRunner(daemon_app)
+        await daemon_runner.setup()
+        await web.TCPSite(daemon_runner, "127.0.0.1", DAEMON_PORT).start()
+
+        # ── 2. Set up Router + Store ─────────────────────────────────
+        from src.router import Router, RemoteOrchestrator
+        from src.store import Store
+        from src.web import WebChat
+
+        store = Store(tempfile.mkdtemp())
+        await store.init()
+
+        router = Router()
+        await router.init()
+        router._orchestrators["full-test"] = RemoteOrchestrator(
+            project_id="full-test",
+            name="full-test",
+            broker_port=DAEMON_PORT,
+            project_dir=sandbox,
+        )
+
+        # ── 3. Start callback server (daemon → router) ──────────────
+        callback_app = web.Application()
+
+        async def handle_callback_progress(request):
+            data = await request.json()
+            await router.ingest_progress_event(
+                data.get("project_id", ""), data.get("event", {}), source="callback"
+            )
+            return web.json_response({"ok": True})
+
+        callback_app.router.add_post("/progress", handle_callback_progress)
+        callback_runner = web.AppRunner(callback_app)
+        await callback_runner.setup()
+        await web.TCPSite(callback_runner, "127.0.0.1", CALLBACK_PORT).start()
+
+        # ── 4. Start WebChat ─────────────────────────────────────────
+        web_chat = WebChat(router=router, store=store)
+
+        web_app = web.Application()
+        web_app.router.add_get("/", web_chat._handle_index)
+        web_app.router.add_get("/api/history", web_chat._handle_history)
+        web_app.router.add_get("/api/channels", web_chat._handle_channels_list)
+        web_app.router.add_post("/api/channels", web_chat._handle_channels_create)
+        web_app.router.add_delete("/api/channels/{id}", web_chat._handle_channels_delete)
+        web_app.router.add_get("/api/channels/{id}/members", web_chat._handle_channels_members)
+        web_app.router.add_get("/api/logs", web_chat._handle_logs)
+        web_app.router.add_get("/api/projects", web_chat._handle_projects_list)
+        web_app.router.add_get("/ws", web_chat._handle_ws)
+
+        web_runner = web.AppRunner(web_app)
+        await web_runner.setup()
+        await web.TCPSite(web_runner, "127.0.0.1", WEB_PORT).start()
+
+        # ── 5. Drive test via WebSocket ──────────────────────────────
+        try:
+            async with ClientSession() as http:
+                # Create channel connected to our project
+                async with http.post(
+                    f"http://127.0.0.1:{WEB_PORT}/api/channels",
+                    json={"name": "e2e-full", "project_id": "full-test"},
+                ) as resp:
+                    assert resp.status == 200
+                    channel_data = await resp.json()
+                    channel_id = channel_data["id"]
+
+                # Connect WebSocket
+                async with http.ws_connect(f"http://127.0.0.1:{WEB_PORT}/ws") as ws:
+                    # Switch to channel
+                    await ws.send_json({"type": "switch_channel", "channel_id": channel_id})
+                    switch_msg = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                    assert switch_msg["type"] == "channel_switched"
+                    assert switch_msg["project_id"] == "full-test"
+                    print(f"Channel switched: {switch_msg}")
+
+                    # Send task message
+                    await ws.send_json({
+                        "type": "message",
+                        "text": (
+                            "Create a file called greeting.txt containing exactly "
+                            "'Hello from full E2E test'. Then call task_complete."
+                        ),
+                    })
+
+                    # Collect WS events until done or timeout
+                    ws_events = []
+                    event_types = set()
+                    done = False
+                    error_msg = ""
+
+                    try:
+                        while not done:
+                            raw = await asyncio.wait_for(ws.receive(), timeout=240)
+                            if raw.type in (
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.ERROR,
+                                aiohttp.WSMsgType.CLOSING,
+                            ):
+                                break
+                            if raw.type != aiohttp.WSMsgType.TEXT:
+                                continue
+
+                            data = json.loads(raw.data)
+                            ws_events.append(data)
+                            event_types.add(data["type"])
+
+                            # Print events for debugging
+                            if data["type"] == "reply":
+                                print(f"  [reply] {data['text'][:120]}")
+                            elif data["type"] == "progress":
+                                status = data.get("status", "")
+                                print(f"  [progress] status={status} iter={data.get('iteration')} data={str(data.get('data',''))[:80]}")
+                            elif data["type"] == "log":
+                                print(f"  [log] {data['text'][:100]}")
+                            elif data["type"] == "task_list":
+                                print(f"  [task_list] {data['data'][:100]}")
+
+                            if data["type"] == "progress" and data.get("status") == "done":
+                                done = True
+                            if data["type"] == "progress" and data.get("status") == "error":
+                                error_msg = data.get("data", "")
+                                done = True
+                    except asyncio.TimeoutError:
+                        pass
+
+                    # ── Assertions ────────────────────────────────────
+                    print(f"\nCollected {len(ws_events)} events, types: {sorted(event_types)}")
+
+                    # Must have progress events (iteration updates + done)
+                    assert "progress" in event_types, (
+                        f"No progress events received. Got types: {event_types}"
+                    )
+
+                    # Must have completed successfully
+                    done_events = [
+                        e for e in ws_events
+                        if e["type"] == "progress" and e.get("status") == "done"
+                    ]
+                    assert len(done_events) > 0, (
+                        f"Task did not complete. Error: {error_msg}. "
+                        f"Event types: {sorted(event_types)}"
+                    )
+
+                    # Must have reply messages (orchestrator↔worker exchange in chat)
+                    replies = [e for e in ws_events if e["type"] == "reply"]
+                    assert len(replies) > 0, (
+                        f"Expected chat replies (orchestrator↔worker). Got 0. "
+                        f"Event types: {sorted(event_types)}"
+                    )
+
+                    # At least one reply should show orchestrator→worker assignment
+                    orch_to_worker = [
+                        r for r in replies
+                        if "@orchestrator" in r.get("text", "") and "@worker" in r.get("text", "")
+                    ]
+                    assert len(orch_to_worker) > 0, (
+                        f"No orchestrator→worker assignment in chat. "
+                        f"Replies: {[r['text'][:80] for r in replies]}"
+                    )
+
+                    # Must have log entries (monitor panel content)
+                    logs = [e for e in ws_events if e["type"] == "log"]
+                    assert len(logs) > 0, "Expected monitor log entries"
+
+                    # Must have channel_status broadcasts (sidebar updates)
+                    ch_status = [e for e in ws_events if e["type"] == "channel_status"]
+                    assert len(ch_status) > 0, "Expected channel_status broadcasts"
+
+                    # Verify file was created by the worker
+                    greeting = Path(sandbox) / "greeting.txt"
+                    assert greeting.exists(), (
+                        f"Worker should have created greeting.txt. "
+                        f"Files in sandbox: {os.listdir(sandbox)}"
+                    )
+                    content = greeting.read_text()
+                    assert "Hello from full E2E test" in content, (
+                        f"Unexpected file content: {content}"
+                    )
+
+                    # Verify history was persisted
+                    history = await store.get_recent_messages(channel_id)
+                    user_msgs = [m for m in history if m["role"] == "user"]
+                    assistant_msgs = [m for m in history if m["role"] == "assistant"]
+                    assert len(user_msgs) >= 1, "User message not persisted"
+                    assert len(assistant_msgs) >= 1, "Assistant messages not persisted"
+
+                    print(f"\nFull stack E2E passed!")
+                    print(f"  Events: {len(ws_events)}")
+                    print(f"  Replies: {len(replies)}")
+                    print(f"  Logs: {len(logs)}")
+                    print(f"  File created: {content.strip()}")
+                    print(f"  History: {len(user_msgs)} user, {len(assistant_msgs)} assistant")
+
+        finally:
+            restore()
+            await web_runner.cleanup()
+            await callback_runner.cleanup()
+            await daemon_runner.cleanup()
+            await router.close()
+            await store.close()
