@@ -537,83 +537,6 @@ body {
   padding: 4px 0;
 }
 
-/* ── Escalation cards ───────────────────────────── */
-
-.msg-escalation {
-  background: var(--yellow-dim);
-  border: 1px solid rgba(249, 226, 175, 0.15);
-  border-radius: 10px;
-  padding: 14px 16px;
-  max-width: 85%;
-}
-
-.msg-escalation.resolved {
-  opacity: 0.5;
-}
-
-.escalation-title {
-  font-weight: 600;
-  margin-bottom: 6px;
-  color: var(--yellow);
-  font-size: 13px;
-}
-
-.escalation-detail {
-  margin-bottom: 10px;
-  font-size: 13px;
-  color: var(--text-secondary);
-  line-height: 1.5;
-  white-space: pre-wrap;
-}
-
-.escalation-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.escalation-buttons button {
-  padding: 6px 16px;
-  border: 1px solid var(--border-light);
-  border-radius: 6px;
-  background: var(--bg-surface);
-  color: var(--text-primary);
-  font-family: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.12s ease;
-}
-
-.escalation-buttons button:hover {
-  background: var(--bg-hover);
-}
-
-.escalation-buttons button.approve {
-  border-color: rgba(166, 227, 161, 0.4);
-  color: var(--green);
-}
-
-.escalation-buttons button.approve:hover {
-  background: var(--green-dim);
-}
-
-.escalation-buttons button.deny {
-  border-color: rgba(243, 139, 168, 0.4);
-  color: var(--red);
-}
-
-.escalation-buttons button.deny:hover {
-  background: rgba(243, 139, 168, 0.1);
-}
-
-.escalation-resolution {
-  margin-top: 8px;
-  color: var(--text-muted);
-  font-style: italic;
-  font-size: 12.5px;
-}
-
 /* ── Typing indicator ───────────────────────────── */
 
 #typing-indicator {
@@ -721,6 +644,16 @@ body {
   filter: none;
 }
 
+#input-area.awaiting-input #input {
+  border-color: var(--yellow);
+  box-shadow: 0 0 0 2px rgba(249, 226, 175, 0.15);
+}
+
+#input-area.awaiting-input #input:focus {
+  border-color: var(--yellow);
+  box-shadow: 0 0 0 2px rgba(249, 226, 175, 0.25);
+}
+
 /* ── Monitor panel ─────────────────────────────── */
 
 #monitor {
@@ -771,6 +704,85 @@ body {
 
 #monitor-close:hover {
   color: var(--text-primary);
+}
+
+#task-list-panel {
+  border-bottom: 1px solid var(--border);
+  max-height: 40%;
+  overflow-y: auto;
+  display: none;
+}
+
+#task-list-panel.has-content {
+  display: block;
+}
+
+#task-list-toggle {
+  padding: 8px 16px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+  transition: color 0.1s ease;
+}
+
+#task-list-toggle:hover {
+  color: var(--text-secondary);
+}
+
+#task-list-toggle .arrow {
+  font-size: 9px;
+  transition: transform 0.15s ease;
+}
+
+#task-list-toggle .arrow.collapsed {
+  transform: rotate(-90deg);
+}
+
+#task-list-content {
+  padding: 4px 16px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+#task-list-content ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+#task-list-content li {
+  padding: 2px 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+#task-list-content li::before {
+  content: '';
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid var(--border-light);
+  border-radius: 3px;
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+#task-list-content li.checked {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+#task-list-content li.checked::before {
+  background: var(--green);
+  border-color: var(--green);
 }
 
 #monitor-log {
@@ -877,6 +889,12 @@ body {
   <div id="monitor-header">
     <h2>Monitor</h2>
     <button id="monitor-close" onclick="toggleMonitor()">&times;</button>
+  </div>
+  <div id="task-list-panel">
+    <div id="task-list-toggle" onclick="toggleTaskList()">
+      <span class="arrow">&#9660;</span> Task List
+    </div>
+    <div id="task-list-content"></div>
   </div>
   <div id="monitor-log"></div>
 </div>
@@ -989,7 +1007,8 @@ function classifyMessage(text) {
   if (text.startsWith('@worker')) {
     return 'worker';
   }
-  if (text.startsWith('(queued') || text.startsWith('(stop')) {
+  if (/^\([\w\s]/.test(text)) {
+    // Router feedback: (queued...), (stopping...), (urgent interrupt queued...)
     return 'system';
   }
   return 'orchestrator';
@@ -1041,45 +1060,6 @@ function addMessage(text, cssClass, tsSeconds) {
   div.appendChild(bodyEl);
   messagesEl.appendChild(div);
   scrollToBottom();
-}
-
-function addEscalationCard(data) {
-  const div = document.createElement('div');
-  div.className = 'msg msg-escalation';
-  div.id = 'esc-' + data.request_id;
-
-  let html = '<div class="escalation-title">' + escapeHtml(data.title) + '</div>';
-  html += '<div class="escalation-detail">' + escapeHtml(data.detail) + '</div>';
-  html += '<div class="escalation-buttons">';
-  html += '<button class="approve" onclick="resolvePermission(\'' + escapeHtml(data.request_id) + '\', true)">Approve</button>';
-  html += '<button class="deny" onclick="resolvePermission(\'' + escapeHtml(data.request_id) + '\', false)">Deny</button>';
-  html += '</div>';
-
-  div.innerHTML = html;
-  messagesEl.appendChild(div);
-  scrollToBottom();
-}
-
-function markEscalationResolved(requestId, resolution) {
-  const div = document.getElementById('esc-' + requestId);
-  if (div) {
-    div.classList.add('resolved');
-    const btns = div.querySelector('.escalation-buttons');
-    if (btns) {
-      btns.innerHTML = '<div class="escalation-resolution">&gt;&gt; ' + escapeHtml(resolution) + '</div>';
-    }
-  }
-}
-
-function resolvePermission(requestId, approved) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
-    type: 'permission_response',
-    request_id: requestId,
-    approved: approved,
-    reason: approved ? 'Approved by user' : 'Denied by user'
-  }));
-  markEscalationResolved(requestId, approved ? 'APPROVED' : 'DENIED');
 }
 
 // ── Channel management ──────────────────────────────────────────────
@@ -1146,6 +1126,11 @@ function onChannelSwitched(data) {
   noChannelEl.style.display = 'none';
   messagesEl.style.display = 'flex';
   monitorLog.innerHTML = '';
+
+  // Reset per-channel UI state
+  taskListPanel.classList.remove('has-content');
+  taskListContent.innerHTML = '';
+  clearAwaitingInput();
 
   updateProjectBadge(currentProjectStatus, 0);
   renderChannelList();
@@ -1241,6 +1226,7 @@ function sendMessage() {
   ws.send(JSON.stringify({ type: 'message', text: text }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
+  clearAwaitingInput();
 }
 
 function loadHistory(channelId) {
@@ -1305,9 +1291,9 @@ let _monitorScrollPending = false;
 
 function addLogEntry(text, ts) {
   const entry = document.createElement('div');
-  const isError = text.startsWith('[ERROR]');
-  const isToolCall = /^orchestrator\s*->/.test(text);
-  const isIteration = /^Iteration\s+\d/.test(text);
+  const isError = text.startsWith('[ERROR]') || /\[error\]/i.test(text);
+  const isToolCall = /^→\s/.test(text) || /\[orchestrator\s*->\s*worker\]/.test(text);
+  const isIteration = /^(Worker assignment|Starting task|Iteration)\s/i.test(text);
   const cls = isError ? 'log-entry-error' : isIteration ? 'log-entry-iteration' : isToolCall ? 'log-entry-tool' : 'log-entry-text';
   entry.className = 'log-entry ' + cls;
 
@@ -1330,6 +1316,76 @@ function addLogEntry(text, ts) {
       _monitorScrollPending = false;
     });
   }
+}
+
+// ── Task list panel ─────────────────────────────────────────────────
+
+const taskListPanel = document.getElementById('task-list-panel');
+const taskListContent = document.getElementById('task-list-content');
+const taskListToggle = document.getElementById('task-list-toggle');
+let _taskListCollapsed = false;
+
+function toggleTaskList() {
+  _taskListCollapsed = !_taskListCollapsed;
+  const arrow = taskListToggle.querySelector('.arrow');
+  if (_taskListCollapsed) {
+    taskListContent.style.display = 'none';
+    arrow.classList.add('collapsed');
+  } else {
+    taskListContent.style.display = '';
+    arrow.classList.remove('collapsed');
+  }
+}
+
+function updateTaskList(markdown) {
+  if (!markdown || !markdown.trim()) {
+    taskListPanel.classList.remove('has-content');
+    return;
+  }
+  taskListPanel.classList.add('has-content');
+
+  // Parse markdown checkbox lines into rendered HTML
+  const lines = markdown.split('\n');
+  let html = '<ul>';
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const checkedMatch = trimmed.match(/^-\s*\[x\]\s*(.*)/i);
+    const uncheckedMatch = trimmed.match(/^-\s*\[\s\]\s*(.*)/);
+    if (checkedMatch) {
+      html += '<li class="checked">' + escapeHtml(checkedMatch[1]) + '</li>';
+    } else if (uncheckedMatch) {
+      html += '<li>' + escapeHtml(uncheckedMatch[1]) + '</li>';
+    } else {
+      // Non-checkbox line — render as plain text
+      html += '<li style="list-style:none">' + escapeHtml(trimmed.replace(/^-\s*/, '')) + '</li>';
+    }
+  }
+  html += '</ul>';
+  taskListContent.innerHTML = html;
+
+  // Auto-open monitor if task list arrives and monitor is closed
+  if (monitorEl.classList.contains('monitor-closed')) {
+    toggleMonitor();
+  }
+}
+
+// ── Stuck/ask_user UX ──────────────────────────────────────────────
+
+const inputArea = document.getElementById('input-area');
+let _pendingQuestion = null;
+
+function setAwaitingInput(question) {
+  _pendingQuestion = question;
+  inputArea.classList.add('awaiting-input');
+  inputEl.placeholder = 'Answer: ' + (question || 'Orchestrator needs your input...');
+  inputEl.focus();
+}
+
+function clearAwaitingInput() {
+  _pendingQuestion = null;
+  inputArea.classList.remove('awaiting-input');
+  inputEl.placeholder = 'Type a message... (Enter to send, Shift+Enter for newline)';
 }
 
 // Restore monitor state from localStorage
@@ -1385,12 +1441,6 @@ function connect() {
     if (data.type === 'channel_switched') {
       onChannelSwitched(data);
 
-    } else if (data.type === 'project_connected') {
-      currentProjectId = data.project_id;
-      currentProjectStatus = data.project_status || 'idle';
-      updateProjectBadge(currentProjectStatus, 0);
-      loadChannels();  // refresh sidebar status dots
-
     } else if (data.type === 'progress') {
       const pStatus = data.status || data.type;
       currentIteration = data.iteration || currentIteration;
@@ -1400,6 +1450,13 @@ function connect() {
         currentProjectStatus = 'running';
       }
       updateProjectBadge(currentProjectStatus, currentIteration, data.data);
+
+      // Stuck/ask_user UX
+      if (pStatus === 'stuck') {
+        setAwaitingInput(data.data);
+      } else if (pStatus === 'done' || pStatus === 'error' || pStatus === 'running') {
+        clearAwaitingInput();
+      }
 
       // Log iteration markers
       if (data.data && !data.status) {
@@ -1421,6 +1478,9 @@ function connect() {
         updateProjectBadge(currentProjectStatus, currentIteration, data.data);
       }
 
+    } else if (data.type === 'task_list') {
+      updateTaskList(data.data);
+
     } else if (data.type === 'log') {
       addLogEntry(data.text, data.ts);
 
@@ -1428,12 +1488,6 @@ function connect() {
       const cls = classifyMessage(data.text);
       addMessage(data.text, 'msg-' + cls, data.ts);
       if (activeChannel !== null) loadMembers(activeChannel);
-
-    } else if (data.type === 'permission_request') {
-      addEscalationCard(data);
-
-    } else if (data.type === 'escalation_resolved') {
-      markEscalationResolved(data.request_id, data.resolution);
 
     } else if (data.type === 'error') {
       addMessage('Error: ' + data.text, 'msg-system', data.ts);

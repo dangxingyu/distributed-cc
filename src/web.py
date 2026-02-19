@@ -280,17 +280,6 @@ class WebChat:
             asyncio.create_task(self._router.route_message(channel_id, text, send_reply, send_log))
             return
 
-        if msg_type == "permission_response":
-            # Backward compatibility for older frontend cards.
-            await self._ws_send_to_client(
-                client_id,
-                {
-                    "type": "error",
-                    "text": "Permission escalation is not active in this build.",
-                },
-            )
-            return
-
         await self._ws_send_to_client(client_id, {"type": "error", "text": f"Unknown message type: {msg_type}"})
 
     # -- Progress callback --------------------------------------------
