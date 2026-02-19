@@ -8,18 +8,19 @@ You (laptop)                          Remote servers
 │  Web UI :8080        │     SSH      ┌──────────────────────┐
 │  ┌────────────────┐  │◄────────────►│  Server A            │
 │  │  Router        │  │              │  Daemon :8200        │
-│  │  /setup        │  │     SSH      │  (autonomous agent)  │
-│  │  /connect      │  │◄────────────►├──────────────────────┤
-│  │  @orchestrator │  │              │  Server B            │
-│  └────────────────┘  │              │  Daemon :8200        │
-└──────────────────────┘              └──────────────────────┘
+│  │  /setup        │  │     SSH      │  ┌── Orchestrator ─┐ │
+│  │  /connect      │  │◄────────────►│  │  (plans, verifies│ │
+│  │  @orchestrator │  │              │  ├── Worker ────────┤ │
+│  └────────────────┘  │              │  │  (executes code) │ │
+└──────────────────────┘              │  └──────────────────┘ │
+                                      └──────────────────────┘
 ```
 
-Send a task, and a split remote system works on it:
-- an **orchestrator channel** (planning, verification, next-step decisions)
-- a **worker channel** (execution: read/write/bash/test)
+Each remote daemon runs two independent Claude Code sessions per task:
+- **Orchestrator** — the PhD student. Plans, decomposes tasks, verifies worker output, decides next steps. Read-only tools (Read, Glob, Grep, WebSearch).
+- **Worker** — the hands. Executes assignments end-to-end: writes code, runs tests, edits files. Full tools (Read, Write, Edit, Bash, etc.).
 
-Progress streams back in real-time. Think of it as having PhD students on different machines that you supervise from one place.
+The orchestrator assigns work via `[ASSIGN_WORKER]`, the worker reports back via `[WORKER_REPORT]`, and the loop continues until `[TASK_COMPLETE]` or `[NEED_USER_INPUT]`. Progress streams back in real-time.
 
 ## Quick Start
 
@@ -80,7 +81,36 @@ Create a channel, connect it to a project, and send your task:
 Investigate why the training loss plateaus — might be reward hacking
 ```
 
-The remote orchestrator starts the loop, assigns work to the worker channel, reviews worker reports, and iterates until done. You'll see tool calls, text output, and iteration progress in real-time via the monitor panel.
+The orchestrator decomposes the task, assigns work to the worker, reviews results, and iterates until done. You see the full orchestrator ↔ worker dialogue in the chat panel and detailed tool activity in the monitor panel.
+
+## How it works
+
+```
+User: "investigate training loss plateau"
+  │
+  ▼
+Orchestrator (iteration 1):
+  "I'll start by checking the reward function for exploitable patterns."
+  [ASSIGN_WORKER]
+  WorkerTask: Read reward.py and training logs, look for reward hacking
+  │
+  ▼
+Worker:
+  (reads files, greps logs, analyzes patterns)
+  [WORKER_REPORT]
+  Summary: Found reward increasing while loss quality drops after step 5000...
+  │
+  ▼
+Orchestrator (iteration 2):
+  "Evidence of reward hacking confirmed. Let me assign a fix."
+  [ASSIGN_WORKER]
+  WorkerTask: Add reward clipping in reward.py, re-run eval...
+  │
+  ▼
+  ... (continues until done)
+```
+
+The chat panel shows the high-level dialogue (`@orchestrator -> @worker: ...` assignments and `@worker -> @orchestrator: ...` reports). The monitor panel shows every tool call, text output, and intermediate thinking.
 
 ## Commands and messaging
 
@@ -171,7 +201,7 @@ curl http://127.0.0.1:8201/health
 ## Testing
 
 ```bash
-make test         # Unit tests (114 tests, no API calls)
+make test         # Unit tests (131 tests, no API calls)
 make test-e2e     # End-to-end tests (calls Claude, costs money)
 ```
 
@@ -188,12 +218,22 @@ src/
     index.html    — single-page chat UI
 
 tools/
-  orchestrator_daemon.py  — autonomous agent daemon (runs on remote servers)
+  orchestrator_daemon.py  — split-channel daemon (orchestrator + worker sessions)
 
 docs/
   design-philosophy.md    — Professor → PhD Student → Claude Code model
   broker-guide.md         — detailed daemon operations guide
 ```
+
+## Design Philosophy
+
+The system follows the **Professor → PhD Student → Claude Code** model:
+
+- **You** are the professor — give high-level direction with specific intuitions
+- **Orchestrator** is the PhD student — decomposes tasks, reviews work, makes decisions autonomously
+- **Worker** is the implementation tool — executes specific, actionable assignments
+
+The orchestrator doesn't ask for permission on routine decisions. It escalates to you (via `[NEED_USER_INPUT]`) only when genuinely stuck. See `docs/design-philosophy.md` for details.
 
 ## Requirements
 
