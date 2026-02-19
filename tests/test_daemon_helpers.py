@@ -1,6 +1,7 @@
 """Tests for orchestrator daemon helper functions.
 
-Covers _extract_after_marker and _build_prompt.
+Covers _extract_after_marker (still used for worker [WORKER_REPORT] extraction)
+and _create_orchestrator_tools (MCP tool factory).
 """
 
 import sys
@@ -9,7 +10,7 @@ import os
 # Add tools/ to path so we can import daemon helpers
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 
-from orchestrator_daemon import _extract_after_marker, _extract_task_list, _build_prompt
+from orchestrator_daemon import _extract_after_marker
 
 
 # ── _extract_after_marker ─────────────────────────────────────────────
@@ -92,142 +93,19 @@ def test_extract_preserves_indented_content():
     assert "- Set log_level = verbose" in result
 
 
-# ── _build_prompt ─────────────────────────────────────────────────────
+# ── _create_orchestrator_tools ────────────────────────────────────────
 
 
-def test_build_prompt_first_iteration():
-    prompt = _build_prompt(
-        task_text="fix the bug",
-        feedback="",
-        user_msgs=[],
-        iteration=1,
-        worker_report="",
-    )
-    assert "[TASK]" in prompt
-    assert "fix the bug" in prompt
-    assert "[CONTINUATION" not in prompt
+def test_create_orchestrator_tools_returns_server():
+    """Factory returns an MCP server config with the expected tools."""
+    from orchestrator_daemon import _create_orchestrator_tools, TaskState
 
+    state = TaskState(task_id="t1", project_id="p1", task_text="test")
+    server = _create_orchestrator_tools("p1", state)
 
-def test_build_prompt_continuation():
-    prompt = _build_prompt(
-        task_text="fix the bug",
-        feedback="some feedback",
-        user_msgs=[],
-        iteration=3,
-        worker_report="",
-    )
-    assert "[CONTINUATION" in prompt
-    assert "iteration 3" in prompt
-    assert "[SUPERVISOR_FEEDBACK]" in prompt
-    assert "some feedback" in prompt
-
-
-def test_build_prompt_with_worker_report():
-    prompt = _build_prompt(
-        task_text="fix the bug",
-        feedback="",
-        user_msgs=[],
-        iteration=2,
-        worker_report="Fixed parser.py",
-    )
-    assert "[LATEST_WORKER_REPORT]" in prompt
-    assert "Fixed parser.py" in prompt
-
-
-def test_build_prompt_with_user_interruptions():
-    prompt = _build_prompt(
-        task_text="fix the bug",
-        feedback="",
-        user_msgs=["also check tests", "use pytest"],
-        iteration=2,
-        worker_report="",
-    )
-    assert "[USER INTERRUPTIONS]" in prompt
-    assert "also check tests" in prompt
-    assert "use pytest" in prompt
-
-
-def test_build_prompt_no_duplicate_worker_report():
-    """Worker report should NOT appear in feedback anymore."""
-    prompt = _build_prompt(
-        task_text="fix the bug",
-        feedback="Worker report received (see [LATEST_WORKER_REPORT] below). Verify this.",
-        user_msgs=[],
-        iteration=2,
-        worker_report="Fixed parser.py line 42",
-    )
-    # Count occurrences of the report content
-    count = prompt.count("Fixed parser.py line 42")
-    assert count == 1, f"Worker report appeared {count} times, expected 1"
-
-
-# ── _extract_task_list ────────────────────────────────────────────────
-
-
-def test_extract_task_list_basic():
-    text = (
-        "Let me plan this.\n"
-        "[TASK_LIST]\n"
-        "- [ ] Check reward function\n"
-        "- [ ] Analyze logs\n"
-        "[/TASK_LIST]\n"
-        "[ASSIGN_WORKER]\nWorkerTask: do something"
-    )
-    result = _extract_task_list(text)
-    assert result == "- [ ] Check reward function\n- [ ] Analyze logs"
-
-
-def test_extract_task_list_missing_markers():
-    assert _extract_task_list("no markers here") is None
-    assert _extract_task_list("[TASK_LIST] only open") is None
-    assert _extract_task_list("[/TASK_LIST] only close") is None
-
-
-def test_extract_task_list_with_checked_items():
-    text = (
-        "[TASK_LIST]\n"
-        "- [x] Completed item\n"
-        "- [ ] Pending item\n"
-        "- [ ] Another pending\n"
-        "[/TASK_LIST]"
-    )
-    result = _extract_task_list(text)
-    assert "- [x] Completed item" in result
-    assert "- [ ] Pending item" in result
-    assert "- [ ] Another pending" in result
-
-
-def test_extract_task_list_reversed_markers():
-    """End marker before start marker returns None."""
-    text = "[/TASK_LIST]\nstuff\n[TASK_LIST]"
-    assert _extract_task_list(text) is None
-
-
-# ── _build_prompt with task_list ──────────────────────────────────────
-
-
-def test_build_prompt_with_task_list():
-    prompt = _build_prompt(
-        task_text="investigate reward hacking",
-        feedback="",
-        user_msgs=[],
-        iteration=2,
-        task_list="- [x] Check reward function\n- [ ] Analyze logs",
-    )
-    assert "[CURRENT_TASK_LIST]" in prompt
-    assert "- [x] Check reward function" in prompt
-    assert "- [ ] Analyze logs" in prompt
-    # Task list should appear before CONTINUATION
-    tl_pos = prompt.find("[CURRENT_TASK_LIST]")
-    cont_pos = prompt.find("[CONTINUATION")
-    assert tl_pos < cont_pos
-
-
-def test_build_prompt_without_task_list():
-    prompt = _build_prompt(
-        task_text="fix the bug",
-        feedback="",
-        user_msgs=[],
-        iteration=1,
-    )
-    assert "[CURRENT_TASK_LIST]" not in prompt
+    # Should be a dict-like McpSdkServerConfig with type="sdk"
+    assert server["type"] == "sdk"
+    assert server["name"] == "daemon"
+    # The instance should have our tools registered
+    mcp_instance = server["instance"]
+    assert mcp_instance is not None

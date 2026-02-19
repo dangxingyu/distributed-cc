@@ -27,7 +27,13 @@ from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ResultMessage,
+    create_sdk_mcp_server,
+    query,
+    tool,
+)
 from claude_agent_sdk.types import (
     AssistantMessage,
     TextBlock,
@@ -50,45 +56,36 @@ STATE_DIR = Path.home() / ".distributed-cc" / "state"
 # -- split-role prompts ------------------------------------------------
 
 ORCHESTRATOR_PROMPT = """\
-You are the ORCHESTRATOR (PhD student role). You do planning, decomposition,
-verification, and decision making. You do NOT execute implementation work directly.
+You are the ORCHESTRATOR — a PhD-student-level autonomous researcher.
+You plan, investigate, decompose tasks, review worker output, and make decisions.
 
-You maintain two files that you may edit directly:
+## Your tools
 
-1. task_list.md — your research plan for the overall task.
-   Include a [TASK_LIST] block each turn to update it:
-   [TASK_LIST]
-   - [x] Completed item
-   - [ ] Pending item
-   [/TASK_LIST]
-   This is PhD-level planning (experiments, investigations, milestones),
-   not worker micro-steps. Update every turn.
+Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you have:
 
-2. CLAUDE.md — standing instructions for your worker.
-   Edit this when you learn something the worker should always know:
-   project conventions, file locations, environment quirks, tool preferences.
-   The worker sees this at the start of every assignment.
-   Only edit when the content genuinely changes — not every turn.
+- **assign_worker(task)** — send a concrete assignment to your worker agent.
+  The worker has full tool access (Edit, Write, Bash, etc). Returns their report.
+- **task_complete(summary)** — mark the overall task as done.
+- **ask_user(question)** — ask the professor a blocking question (use sparingly).
+- **update_task_list(content)** — update your research plan (task_list.md).
+- **update_worker_config(content)** — update standing worker instructions (CLAUDE.md).
 
-Everything else (code, config, tests, commands) is the worker's job.
+## Workflow
 
-At the end of every response, choose exactly one:
+1. Investigate: Read files, search the codebase, understand the problem.
+2. Plan: Call update_task_list with a research-level plan.
+3. Execute: Call assign_worker with concrete tasks and review their reports.
+4. Iterate: Refine based on evidence until the goal is met.
+5. Complete: Call task_complete with a summary.
 
-1) [ASSIGN_WORKER]
-WorkerTask: <clear executable instruction>
+## Rules
 
-2) [TASK_COMPLETE]
-Summary: <why the overall user task is complete>
-
-3) [NEED_USER_INPUT]
-Question: <specific blocking question>
-
-Rules:
-- Use worker reports as evidence. If insufficient, assign a refined worker task.
-- Investigate (Read, Grep, Glob) before assigning work.
-- Delegate all implementation and command execution to the worker.
-- Your only writes are task_list.md and CLAUDE.md — never edit code yourself.
-- Do not output multiple terminal markers.
+- Investigate before assigning work — don't delegate blindly.
+- Worker assignments should be concrete and actionable.
+- Never edit code/config/tests yourself — use assign_worker for all implementation.
+- Keep task_list at PhD-level granularity (experiments, milestones), not micro-steps.
+- Only update worker config (CLAUDE.md) when conventions genuinely change.
+- Use ask_user only for genuine blocking decisions, not routine status updates.
 """
 
 
@@ -216,7 +213,7 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
         await done.wait()
 
 
-# -- ralph split loop --------------------------------------------------
+# -- worker execution --------------------------------------------------
 
 
 async def _run_worker_turn(
@@ -234,6 +231,7 @@ async def _run_worker_turn(
         permission_mode="bypassPermissions",
         model="claude-opus-4-6",
         cwd=project.project_dir,
+        max_turns=50,
     )
 
     if worker_session_id:
@@ -269,6 +267,7 @@ async def _run_worker_turn(
                 worker_session_id = message.session_id
                 done_event.set()
     except Exception as e:
+        done_event.set()
         log.exception("Worker SDK error on iteration %s: %s", iteration, e)
         await emit_progress(
             project_id,
@@ -287,8 +286,221 @@ async def _run_worker_turn(
     return report, worker_session_id
 
 
+# -- orchestrator MCP tools -------------------------------------------
+
+
+def _create_orchestrator_tools(project_id: str, state: TaskState):
+    """Create in-process MCP server with orchestrator control tools.
+
+    These tools replace the old text-marker protocol ([ASSIGN_WORKER], etc).
+    The orchestrator calls them naturally as tool-use, and the daemon handles
+    the side effects (running workers, emitting events, writing files).
+    """
+
+    @tool(
+        "assign_worker",
+        "Send a concrete task to your worker agent for execution. "
+        "The worker has full tool access (Edit, Write, Bash, etc). "
+        "Returns the worker's report when done. "
+        "Each call counts toward the iteration limit.",
+        {"task": str},
+    )
+    async def assign_worker(args):
+        state.iteration += 1
+
+        if state.iteration > state.max_iterations:
+            return {
+                "content": [{"type": "text", "text":
+                    f"Worker assignment limit ({state.max_iterations}) reached. "
+                    "Call task_complete to summarize progress, or ask_user for guidance."}],
+                "is_error": True,
+            }
+
+        if cancel_events.get(project_id, asyncio.Event()).is_set():
+            return {
+                "content": [{"type": "text", "text": "Task has been cancelled by user."}],
+                "is_error": True,
+            }
+
+        task_desc = args["task"]
+
+        # Drain any pending user interrupts
+        interrupts = _drain_interruptions(project_id)
+
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="iteration",
+                data=f"Worker assignment {state.iteration}/{state.max_iterations}",
+                iteration=state.iteration,
+            ),
+        )
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="tool_use",
+                data=f"[orchestrator -> worker] {task_desc[:400]}",
+                iteration=state.iteration,
+            ),
+        )
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="text",
+                data=f"@orchestrator -> @worker: {task_desc[:1500]}",
+                iteration=state.iteration,
+            ),
+        )
+
+        worker_sid = worker_sessions.get(project_id, "")
+        try:
+            report, new_sid = await _run_worker_turn(
+                project_id=project_id,
+                assignment=task_desc,
+                iteration=state.iteration,
+                worker_session_id=worker_sid,
+            )
+        except Exception as e:
+            log.exception("Worker turn failed: %s", e)
+            report = f"Worker failed with error: {e}"
+            new_sid = worker_sid
+
+        worker_sessions[project_id] = new_sid
+        state.worker_session_id = new_sid
+
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="text",
+                data=f"@worker -> @orchestrator: {report[:1800]}",
+                iteration=state.iteration,
+            ),
+        )
+
+        _save_state(
+            state,
+            orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
+            worker_session_id=new_sid,
+        )
+
+        # Append any pending user interrupts to the report
+        result_text = report
+        if interrupts:
+            result_text += "\n\n[USER INTERRUPTIONS]\n"
+            for msg in interrupts:
+                result_text += f"- {msg}\n"
+
+        return {"content": [{"type": "text", "text": result_text}]}
+
+    @tool(
+        "task_complete",
+        "Mark the overall user task as complete. "
+        "Call this when all goals are achieved.",
+        {"summary": str},
+    )
+    async def task_complete(args):
+        state.status = "done"
+        state.summary = args["summary"]
+        state.finished_at = time.time()
+
+        await emit_progress(
+            project_id,
+            ProgressEvent(type="done", data=state.summary, iteration=state.iteration),
+        )
+
+        _save_state(
+            state,
+            orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
+            worker_session_id=worker_sessions.get(project_id, ""),
+        )
+
+        return {"content": [{"type": "text", "text": f"Task marked complete: {args['summary']}"}]}
+
+    @tool(
+        "ask_user",
+        "Ask the professor/user a blocking question. "
+        "Use sparingly — only for genuine decisions or information "
+        "that cannot be found in the codebase. "
+        "Blocks until the user responds (up to 10 minutes).",
+        {"question": str},
+    )
+    async def ask_user(args):
+        question = args["question"]
+
+        await emit_progress(
+            project_id,
+            ProgressEvent(type="stuck", data=question, iteration=state.iteration),
+        )
+
+        try:
+            answer = await asyncio.wait_for(
+                interrupt_queues[project_id].get(), timeout=600
+            )
+            return {"content": [{"type": "text", "text": f"User responded: {answer}"}]}
+        except asyncio.TimeoutError:
+            return {"content": [{"type": "text", "text":
+                "No user response after 10 minutes. "
+                "Proceed with your best judgment or call task_complete with current progress."}]}
+
+    @tool(
+        "update_task_list",
+        "Update your research plan (task_list.md). "
+        "Use markdown checkboxes. PhD-level granularity: "
+        "experiments, investigations, milestones — not micro-implementation steps.",
+        {"content": str},
+    )
+    async def update_task_list(args):
+        _save_task_list(project_id, args["content"])
+
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="task_list",
+                data=args["content"],
+                iteration=state.iteration,
+            ),
+        )
+
+        return {"content": [{"type": "text", "text": "Task list updated."}]}
+
+    @tool(
+        "update_worker_config",
+        "Update standing instructions for your worker (CLAUDE.md). "
+        "The worker sees this at the start of every assignment. "
+        "Use for: project conventions, file locations, environment quirks, "
+        "tool preferences. Only update when something genuinely changes.",
+        {"content": str},
+    )
+    async def update_worker_config(args):
+        project = projects.get(project_id)
+        if not project:
+            return {
+                "content": [{"type": "text", "text": "Error: unknown project."}],
+                "is_error": True,
+            }
+
+        path = Path(project.project_dir) / "CLAUDE.md"
+        path.write_text(args["content"])
+
+        return {"content": [{"type": "text", "text":
+            "Worker instructions (CLAUDE.md) updated."}]}
+
+    return create_sdk_mcp_server(
+        "daemon",
+        tools=[assign_worker, task_complete, ask_user, update_task_list, update_worker_config],
+    )
+
+
+# -- main task runner --------------------------------------------------
+
+
 async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_ITERATIONS):
-    """Supervisor RALPH loop with split channels: orchestrator + worker."""
+    """Run autonomous task with MCP tool-driven orchestrator.
+
+    The orchestrator runs as a single continuous query() call. It uses MCP tools
+    (assign_worker, task_complete, etc.) to drive the workflow — no outer loop
+    or text-marker parsing needed.
+    """
     os.environ.pop("CLAUDECODE", None)
 
     project = projects.get(project_id)
@@ -312,214 +524,57 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
     cancel_events[project_id].clear()
 
     orchestrator_session_id = orchestrator_sessions.get(project_id, "")
-    worker_session_id = worker_sessions.get(project_id, "")
-    feedback = ""
-    worker_report = ""
+
+    # Create MCP tools bound to this project/task state
+    mcp_server = _create_orchestrator_tools(project_id, state)
 
     await emit_progress(
         project_id,
         ProgressEvent(type="iteration", data=f"Starting task: {task_text[:200]}", iteration=0),
     )
 
+    # Build initial prompt
+    parts = []
+    task_list = _load_task_list(project_id)
+    if task_list:
+        parts.append(f"[CURRENT_TASK_LIST]\n{task_list}")
+    parts.append(f"[TASK]\n{task_text}")
+    prompt = "\n\n".join(parts)
+
+    options = ClaudeAgentOptions(
+        permission_mode="bypassPermissions",
+        model="claude-opus-4-6",
+        cwd=project.project_dir,
+        mcp_servers={"daemon": mcp_server},
+        max_turns=max_iterations * 8,
+    )
+
+    if orchestrator_session_id:
+        options.resume = orchestrator_session_id
+    else:
+        options.system_prompt = ORCHESTRATOR_PROMPT
+
+    done_event = asyncio.Event()
+
     try:
-        while state.iteration < max_iterations:
-            if cancel_events[project_id].is_set():
-                state.status = "stopped"
-                state.summary = "Stopped by user"
-                state.finished_at = time.time()
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(type="done", data="Task stopped by user", iteration=state.iteration),
+        async for message in query(
+            prompt=_prompt_stream(prompt, done_event), options=options
+        ):
+            if isinstance(message, AssistantMessage):
+                await _forward_assistant_message(
+                    project_id, message, state.iteration, source="orchestrator"
                 )
-                break
+            elif isinstance(message, ResultMessage):
+                orchestrator_session_id = message.session_id
+                orchestrator_sessions[project_id] = orchestrator_session_id
+                state.orchestrator_session_id = orchestrator_session_id
+                state.sdk_session_id = orchestrator_session_id
+                done_event.set()
 
-            state.iteration += 1
-            user_msgs = _drain_interruptions(project_id)
-
-            prompt = _build_prompt(
-                task_text=task_text,
-                feedback=feedback,
-                user_msgs=user_msgs,
-                iteration=state.iteration,
-                worker_report=worker_report,
-                task_list=_load_task_list(project_id),
-            )
-            # Reset after consuming so stale reports don't leak into future iterations
-            worker_report = ""
-            feedback = ""
-
-            await emit_progress(
-                project_id,
-                ProgressEvent(
-                    type="iteration",
-                    data=f"Orchestrator iteration {state.iteration}/{max_iterations}",
-                    iteration=state.iteration,
-                ),
-            )
-
-            options = ClaudeAgentOptions(
-                permission_mode="bypassPermissions",
-                model="claude-opus-4-6",
-                cwd=project.project_dir,
-            )
-
-            if orchestrator_session_id:
-                options.resume = orchestrator_session_id
-            else:
-                options.system_prompt = ORCHESTRATOR_PROMPT
-
-            result_text = ""
-            done_event = asyncio.Event()
-
-            try:
-                async for message in query(prompt=_prompt_stream(prompt, done_event), options=options):
-                    if isinstance(message, AssistantMessage):
-                        await _forward_assistant_message(
-                            project_id, message, state.iteration, source="orchestrator"
-                        )
-                    elif isinstance(message, ResultMessage):
-                        result_text = message.result or ""
-                        orchestrator_session_id = message.session_id
-                        orchestrator_sessions[project_id] = orchestrator_session_id
-                        done_event.set()
-            except Exception as e:
-                log.exception("Orchestrator SDK error on iteration %s: %s", state.iteration, e)
-                state.status = "error"
-                state.error = str(e)
-                state.finished_at = time.time()
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(
-                        type="error",
-                        data=f"Orchestrator SDK error: {e}",
-                        iteration=state.iteration,
-                    ),
-                )
-                break
-
-            state.orchestrator_session_id = orchestrator_session_id
-            state.worker_session_id = worker_session_id
-            state.sdk_session_id = orchestrator_session_id
-
-            # Extract and persist task list if present
-            task_list_content = _extract_task_list(result_text)
-            if task_list_content is not None:
-                _save_task_list(project_id, task_list_content)
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(
-                        type="task_list",
-                        data=task_list_content,
-                        iteration=state.iteration,
-                    ),
-                )
-
-            _save_state(
-                state,
-                orchestrator_session_id=orchestrator_session_id,
-                worker_session_id=worker_session_id,
-            )
-
-            if "[TASK_COMPLETE]" in result_text:
-                state.status = "done"
-                state.summary = _extract_after_marker(result_text, "[TASK_COMPLETE]")
-                state.finished_at = time.time()
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(type="done", data=state.summary, iteration=state.iteration),
-                )
-                break
-
-            if "[NEED_USER_INPUT]" in result_text:
-                state.status = "stuck"
-                question = _extract_after_marker(result_text, "[NEED_USER_INPUT]")
-                state.summary = f"Needs input: {question}"
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(type="stuck", data=question, iteration=state.iteration),
-                )
-                try:
-                    user_input = await asyncio.wait_for(interrupt_queues[project_id].get(), timeout=600)
-                    state.status = "running"
-                    feedback = f"User responded: {user_input}"
-                    continue
-                except asyncio.TimeoutError:
-                    state.status = "stuck"
-                    state.finished_at = time.time()
-                    await emit_progress(
-                        project_id,
-                        ProgressEvent(
-                            type="stuck",
-                            data="No user response (timeout)",
-                            iteration=state.iteration,
-                        ),
-                    )
-                    break
-
-            if "[ASSIGN_WORKER]" in result_text:
-                assignment = _extract_after_marker(result_text, "[ASSIGN_WORKER]")
-                if not assignment:
-                    feedback = (
-                        "You returned [ASSIGN_WORKER] without a concrete assignment. "
-                        "Provide a specific WorkerTask."
-                    )
-                    continue
-
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(
-                        type="tool_use",
-                        data=f"[orchestrator -> worker] {assignment[:400]}",
-                        iteration=state.iteration,
-                    ),
-                )
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(
-                        type="text",
-                        data=f"@orchestrator -> @worker: {assignment[:1500]}",
-                        iteration=state.iteration,
-                    ),
-                )
-
-                worker_report, worker_session_id = await _run_worker_turn(
-                    project_id=project_id,
-                    assignment=assignment,
-                    iteration=state.iteration,
-                    worker_session_id=worker_session_id,
-                )
-                worker_sessions[project_id] = worker_session_id
-                state.worker_session_id = worker_session_id
-
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(
-                        type="text",
-                        data=f"@worker -> @orchestrator: {worker_report[:1800]}",
-                        iteration=state.iteration,
-                    ),
-                )
-
-                feedback = (
-                    "Worker report received (see [LATEST_WORKER_REPORT] below). "
-                    "Verify this against the original goal. Then either assign another worker task, "
-                    "ask user input, or declare completion."
-                )
-                _save_state(
-                    state,
-                    orchestrator_session_id=orchestrator_session_id,
-                    worker_session_id=worker_session_id,
-                )
-                continue
-
-            feedback = (
-                "No valid terminal marker found. End with exactly one of: "
-                "[ASSIGN_WORKER], [TASK_COMPLETE], [NEED_USER_INPUT]."
-            )
-
-        else:
+        # If orchestrator ended without calling task_complete
+        if state.status == "running":
             state.status = "done"
-            state.summary = f"Reached max iterations ({max_iterations})"
+            state.summary = "Orchestrator session ended (max turns or natural completion)"
             state.finished_at = time.time()
             await emit_progress(
                 project_id,
@@ -530,15 +585,17 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         state.status = "stopped"
         state.summary = "Task cancelled"
         state.finished_at = time.time()
+        done_event.set()
         await emit_progress(
             project_id,
             ProgressEvent(type="done", data="Task cancelled", iteration=state.iteration),
         )
     except Exception as e:
-        log.exception("Supervisor RALPH loop error: %s", e)
+        log.exception("Orchestrator error: %s", e)
         state.status = "error"
         state.error = str(e)
         state.finished_at = time.time()
+        done_event.set()
         await emit_progress(
             project_id,
             ProgressEvent(type="error", data=str(e), iteration=state.iteration),
@@ -548,45 +605,8 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         _save_state(
             state,
             orchestrator_session_id=orchestrator_session_id,
-            worker_session_id=worker_session_id,
+            worker_session_id=worker_sessions.get(project_id, ""),
         )
-
-
-def _build_prompt(
-    task_text: str,
-    feedback: str,
-    user_msgs: list[str],
-    iteration: int,
-    worker_report: str = "",
-    task_list: str = "",
-) -> str:
-    """Build orchestrator prompt for an iteration."""
-    parts = []
-
-    if task_list:
-        parts.append(f"[CURRENT_TASK_LIST]\n{task_list}")
-
-    if iteration == 1:
-        parts.append(f"[TASK]\n{task_text}")
-    else:
-        parts.append(f"[CONTINUATION — iteration {iteration}]")
-
-    if feedback:
-        parts.append(f"\n[SUPERVISOR_FEEDBACK]\n{feedback}")
-
-    if worker_report:
-        parts.append(f"\n[LATEST_WORKER_REPORT]\n{worker_report}")
-
-    if user_msgs:
-        parts.append("\n[USER INTERRUPTIONS]")
-        for msg in user_msgs:
-            parts.append(f"- {msg}")
-
-    parts.append(
-        "\nChoose exactly one marker this turn: [ASSIGN_WORKER], [TASK_COMPLETE], or [NEED_USER_INPUT]."
-    )
-
-    return "\n".join(parts)
 
 
 def _drain_interruptions(project_id: str) -> list[str]:
@@ -641,14 +661,6 @@ def _extract_after_marker(text: str, marker: str) -> str:
 
     return "\n".join(result_lines) if result_lines else ""
 
-
-def _extract_task_list(text: str) -> str | None:
-    """Extract content between [TASK_LIST] and [/TASK_LIST]."""
-    start = text.find("[TASK_LIST]")
-    end = text.find("[/TASK_LIST]")
-    if start < 0 or end < 0 or end <= start:
-        return None
-    return text[start + len("[TASK_LIST]") : end].strip()
 
 
 def _save_task_list(project_id: str, content: str):
