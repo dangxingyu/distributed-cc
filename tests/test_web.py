@@ -138,9 +138,10 @@ async def test_channel_members_no_project(aiohttp_client):
     resp = await client.get(f"/api/channels/{ch_id}/members")
     assert resp.status == 200
     data = await resp.json()
-    assert len(data) == 1
-    assert data[0]["name"] == "Humans"
-    assert data[0]["role"] == "user"
+    assert len(data) == 2
+    names = {m["name"] for m in data}
+    assert "You" in names
+    assert "Router" in names
     await store.close()
 
 
@@ -152,9 +153,12 @@ async def test_channel_members_with_project(aiohttp_client):
     resp = await client.get(f"/api/channels/{ch_id}/members")
     assert resp.status == 200
     data = await resp.json()
-    assert len(data) == 2
-    assert data[0]["name"] == "Humans"
-    assert "Orchestrator" in data[1]["name"]
+    assert len(data) == 4
+    names = [m["name"] for m in data]
+    assert any(n == "You" for n in names)
+    assert any(n == "Router" for n in names)
+    assert any("Orchestrator" in n for n in names)
+    assert any("Worker" in n for n in names)
     await store.close()
 
 
@@ -250,6 +254,45 @@ async def test_progress_persists_for_inactive_channel(aiohttp_client):
 
     logs = await store.get_logs(ch_target)
     assert any("background-progress" in entry["text"] for entry in logs)
+
+    await ws.close()
+    await store.close()
+
+
+async def test_orchestrator_worker_exchange_visible_in_chat_and_monitor(aiohttp_client):
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("exchange-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()  # channel_switched
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {
+            "type": "text",
+            "data": "@orchestrator -> @worker: run focused tests and report",
+            "iteration": 2,
+            "ts": 200.0,
+        },
+    )
+
+    msg1 = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    msg2 = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    msg3 = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    got_types = {msg1["type"], msg2["type"], msg3["type"]}
+    assert "log" in got_types
+    assert "reply" in got_types
+    assert "channel_status" in got_types
+
+    logs = await store.get_logs(ch_id)
+    history = await store.get_recent_messages(ch_id)
+    assert any("@orchestrator -> @worker" in entry["text"] for entry in logs)
+    assert any(
+        m["role"] == "assistant" and "@orchestrator -> @worker" in m["content"]
+        for m in history
+    )
 
     await ws.close()
     await store.close()
@@ -436,6 +479,46 @@ async def test_progress_tool_error_goes_to_log(aiohttp_client):
     log_msg = next(m for m in messages if m["type"] == "log")
     assert "[ERROR]" in log_msg["text"]
     assert "timeout" in log_msg["text"]
+
+    await ws.close()
+    await store.close()
+
+
+async def test_progress_error_sends_chat_reply(aiohttp_client):
+    """'error' progress event produces both a log and a chat reply."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("error-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {"type": "error", "data": "SDK crashed", "iteration": 3, "ts": 100.0},
+    )
+
+    messages = []
+    for _ in range(4):  # progress + log + reply + channel_status
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        messages.append(msg)
+
+    types = [m["type"] for m in messages]
+    assert "progress" in types
+    assert "log" in types
+    assert "reply" in types
+
+    reply = next(m for m in messages if m["type"] == "reply")
+    assert "SDK crashed" in reply["text"]
+    assert "@orchestrator" in reply["text"]
+
+    progress = next(m for m in messages if m["type"] == "progress")
+    assert progress.get("status") == "error"
+
+    # Verify persisted as assistant message
+    msgs = await store.get_recent_messages(ch_id)
+    assert any("SDK crashed" in m["content"] for m in msgs)
 
     await ws.close()
     await store.close()

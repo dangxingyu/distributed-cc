@@ -69,10 +69,10 @@ class Router:
         # Optional per-channel status callbacks
         self._channel_status_callbacks: dict[int, callable] = {}
 
-        # Setup mode
-        self._setup_session: SetupSession | None = None
+        # Setup mode — per-channel sessions and tasks
+        self._setup_sessions: dict[int, SetupSession] = {}
         self._setup_channels: set[int] = set()
-        self._setup_task: asyncio.Task | None = None
+        self._setup_tasks: dict[int, asyncio.Task] = {}
 
     async def init(self):
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -402,9 +402,25 @@ class Router:
             return
 
         next_task = queue.pop(0)
+        remaining = len(queue)
         ok, error = await self._start_task_request(project_id, next_task["text"])
         if ok:
             orch.status = "running"
+            # Notify via progress callback so the web layer can inform the user
+            if self._progress_callback:
+                snippet = next_task["text"][:200]
+                note = f"Starting queued task: {snippet}"
+                if remaining:
+                    note += f" ({remaining} more in queue)"
+                try:
+                    await self._progress_callback(project_id, {
+                        "type": "text",
+                        "data": f"@orchestrator {note}",
+                        "iteration": 0,
+                        "ts": time.time(),
+                    })
+                except Exception:
+                    pass
         else:
             log.warning("Failed to start deferred task for %s: %s", project_id, error)
 
@@ -507,10 +523,11 @@ class Router:
     # -- setup mode ----------------------------------------------------
 
     async def _handle_setup(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None):
-        if self._setup_session is None:
-            self._setup_session = SetupSession(cwd=self._cwd)
+        if chat_id not in self._setup_sessions:
+            self._setup_sessions[chat_id] = SetupSession(cwd=self._cwd)
 
-        self._setup_session.set_callbacks(progress=send_reply, log=send_log)
+        session = self._setup_sessions[chat_id]
+        session.set_callbacks(progress=send_reply, log=send_log)
 
         stripped = text.strip()
         if stripped.startswith("/setup"):
@@ -531,7 +548,7 @@ class Router:
 
         async def _run():
             try:
-                result = await self._setup_session.run(prompt)
+                result = await session.run(prompt)
                 if result:
                     await send_reply(result)
                 self.reload_config()
@@ -539,7 +556,12 @@ class Router:
                 log.exception("Setup session error: %s", e)
                 await send_reply(f"Setup error: {e}")
 
-        self._setup_task = asyncio.create_task(_run())
+        # Cancel any in-flight setup task for this channel before starting a new one
+        old_task = self._setup_tasks.get(chat_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        self._setup_tasks[chat_id] = asyncio.create_task(_run())
 
     def reload_config(self):
         old_ids = set(self._orchestrators.keys())

@@ -65,6 +65,8 @@ def _patch_daemon_globals(name: str, callback_url: str):
         "projects": dict(daemon_mod.projects),
         "task_states": dict(daemon_mod.task_states),
         "running_tasks": dict(daemon_mod.running_tasks),
+        "orchestrator_sessions": dict(daemon_mod.orchestrator_sessions),
+        "worker_sessions": dict(daemon_mod.worker_sessions),
     }
     daemon_mod.DAEMON_NAME = name
     daemon_mod.CALLBACK_URL = callback_url
@@ -78,6 +80,10 @@ def _patch_daemon_globals(name: str, callback_url: str):
         daemon_mod.task_states.update(orig["task_states"])
         daemon_mod.running_tasks.clear()
         daemon_mod.running_tasks.update(orig["running_tasks"])
+        daemon_mod.orchestrator_sessions.clear()
+        daemon_mod.orchestrator_sessions.update(orig["orchestrator_sessions"])
+        daemon_mod.worker_sessions.clear()
+        daemon_mod.worker_sessions.update(orig["worker_sessions"])
 
     return restore
 

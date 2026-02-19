@@ -309,6 +309,7 @@ body {
 }
 
 .member-dot.user { background: var(--blue); }
+.member-dot.router { background: var(--accent); }
 .member-dot.orchestrator { background: var(--green); }
 .member-dot.worker { background: var(--orange); }
 
@@ -399,6 +400,7 @@ body {
 
 .msg-user .msg-sender { color: var(--blue); }
 .msg-orchestrator .msg-sender { color: var(--green); }
+.msg-worker .msg-sender { color: var(--orange); }
 .msg-system .msg-sender { color: var(--text-muted); }
 
 .msg-time {
@@ -519,6 +521,11 @@ body {
 .msg-orchestrator .msg-body {
   background: var(--green-dim);
   border: 1px solid rgba(166, 227, 161, 0.1);
+}
+
+.msg-worker .msg-body {
+  background: var(--orange-dim);
+  border: 1px solid rgba(250, 179, 135, 0.12);
 }
 
 .msg-system .msg-body {
@@ -979,6 +986,9 @@ function renderMarkdown(text) {
 }
 
 function classifyMessage(text) {
+  if (text.startsWith('@worker')) {
+    return 'worker';
+  }
   if (text.startsWith('(queued') || text.startsWith('(stop')) {
     return 'system';
   }
@@ -996,6 +1006,8 @@ function addMessage(text, cssClass, tsSeconds) {
   if (cssClass === 'msg-user') {
     label = 'You';
     body = text;
+  } else if (cssClass === 'msg-worker') {
+    label = 'Worker';
   } else if (cssClass === 'msg-system') {
     label = 'System';
   }

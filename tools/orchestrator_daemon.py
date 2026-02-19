@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """Orchestrator daemon — runs on each remote server as a persistent autonomous agent.
 
-Evolves from remote_broker.py. The core change: replaces one-shot /run with an
-autonomous RALPH loop (Reason → Act → Learn → Plan → Hypothesize).
-
-The daemon runs a Claude Agent SDK session that autonomously works on tasks:
-  build_prompt → query() → evaluate → repeat/done
-
-Uses the Claude Agent SDK directly for tool use (Read, Write, Bash, Grep, etc.)
-instead of delegating to one-shot workers.
+This daemon now runs a split-channel architecture per project:
+- Orchestrator channel: planning, decomposition, verification, completion decisions
+- Worker channel: execution of orchestrator assignments
 
 HTTP API:
   POST /register   — register a project (project_id, project_dir, name)
@@ -18,8 +13,6 @@ HTTP API:
   GET  /stream     — SSE stream of progress events
   POST /stop       — stop current task
   GET  /health     — health check
-
-Deploy via: tools/deploy.sh user@host
 """
 
 import argparse
@@ -32,15 +25,15 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, web
 
-from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 from claude_agent_sdk.types import (
     AssistantMessage,
     PermissionResultAllow,
     TextBlock,
-    ToolUseBlock,
     ToolResultBlock,
+    ToolUseBlock,
 )
 
 logging.basicConfig(
@@ -55,54 +48,45 @@ MAX_ITERATIONS = 20
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 
 
-# ── PhD Student System Prompt ─────────────────────────────────────────
+# -- split-role prompts ------------------------------------------------
 
-PHD_STUDENT_PROMPT = """\
-You are an autonomous research assistant (like a PhD student) working on a project.
-You receive tasks from your advisor (the user) and work on them independently.
+ORCHESTRATOR_PROMPT = """\
+You are the ORCHESTRATOR (PhD student role). You do planning, decomposition,
+verification, and decision making. You do NOT execute implementation work directly.
 
-=== CORE PRINCIPLES ===
+At the end of every response, choose exactly one:
 
-**AUTONOMOUS**: You don't wait for permission for routine work. Read files, run tests,
-write code, check logs — just do it. Only pause when you genuinely need the user's input.
+1) [ASSIGN_WORKER]
+WorkerTask: <clear executable instruction>
 
-**THOROUGH**: Before making changes, understand the codebase. Read relevant files, check
-existing patterns, run tests before AND after changes. Don't guess — verify.
+2) [TASK_COMPLETE]
+Summary: <why the overall user task is complete>
 
-**HONEST**: If you're stuck, say so clearly. Don't pretend to have succeeded when you haven't.
-Don't keep retrying the same failing approach.
+3) [NEED_USER_INPUT]
+Question: <specific blocking question>
 
-**EFFICIENT**: Do the work, report results. Don't narrate your thought process excessively.
-Focus on outcomes, not process description.
-
-**PERSISTENT**: Try alternative approaches before giving up. If one path doesn't work,
-think about why and try something different. Exhaust reasonable options before escalating.
-
-=== COMPLETION MARKERS ===
-
-When you have COMPLETED the task successfully, end your response with:
-[TASK_COMPLETE]
-Summary: <brief summary of what was done>
-
-When you are genuinely STUCK and need the user's input to proceed, end with:
-[NEED_USER_INPUT]
-Question: <specific question for the user>
-
-If neither marker is present, you will receive a continuation prompt to keep working.
-Always include exactly one of these markers when appropriate.
-
-=== WORKING STYLE ===
-
-- Start by understanding the task and relevant code
-- Make a plan, then execute it
-- Test your changes (run tests, verify behavior)
-- If tests fail, debug and fix before declaring done
-- Commit logical units of work when appropriate
-- Report what you did, what worked, what didn't
+Rules:
+- Use worker reports as evidence.
+- If evidence is insufficient, assign a refined worker task.
+- Do not output multiple terminal markers.
 """
 
 
-# ── Data Models ───────────────────────────────────────────────────────
+WORKER_PROMPT = """\
+You are a WORKER agent. Execute the orchestrator assignment end-to-end.
+Focus on concrete actions and evidence.
+
+End with:
+[WORKER_REPORT]
+Summary: <what you changed/checked and outcomes>
+
+If blocked, still use [WORKER_REPORT] and describe blocker + attempts.
+Do not decide overall user-task completion.
+"""
+
+
+# -- data models -------------------------------------------------------
+
 
 @dataclass
 class Project:
@@ -114,64 +98,69 @@ class Project:
 @dataclass
 class ProgressEvent:
     """An event streamed to SSE subscribers and the router callback."""
-    type: str           # text, tool_use, tool_result, tool_error, iteration, done, stuck, error
+
+    type: str
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     data: str = ""
     iteration: int = 0
     timestamp: float = field(default_factory=time.time)
 
     def to_sse(self) -> str:
-        payload = json.dumps({
-            "event_id": self.event_id,
-            "type": self.type,
-            "data": self.data,
-            "iteration": self.iteration,
-            "ts": self.timestamp,
-        })
+        payload = json.dumps(
+            {
+                "event_id": self.event_id,
+                "type": self.type,
+                "data": self.data,
+                "iteration": self.iteration,
+                "ts": self.timestamp,
+            }
+        )
         return f"data: {payload}\n\n"
 
 
 @dataclass
 class TaskState:
     """Tracks the state of a running task for a project."""
+
     task_id: str
     project_id: str
     task_text: str
-    status: str = "running"     # running, done, stuck, error, stopped
+    status: str = "running"  # running, done, stuck, error, stopped
     iteration: int = 0
     max_iterations: int = MAX_ITERATIONS
-    sdk_session_id: str = ""
+    sdk_session_id: str = ""  # backward-compat alias of orchestrator_session_id
+    orchestrator_session_id: str = ""
+    worker_session_id: str = ""
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0
     summary: str = ""
     error: str = ""
 
 
-# ── Daemon State ──────────────────────────────────────────────────────
+# -- daemon state ------------------------------------------------------
 
 projects: dict[str, Project] = {}
-task_states: dict[str, TaskState] = {}      # project_id → TaskState
-running_tasks: dict[str, asyncio.Task] = {} # project_id → asyncio.Task
-interrupt_queues: dict[str, asyncio.Queue] = {}  # project_id → Queue[str]
-cancel_events: dict[str, asyncio.Event] = {}     # project_id → Event
-sse_subscribers: dict[str, list[asyncio.Queue]] = {}  # project_id → [Queue[ProgressEvent]]
+task_states: dict[str, TaskState] = {}
+running_tasks: dict[str, asyncio.Task] = {}
+interrupt_queues: dict[str, asyncio.Queue] = {}
+cancel_events: dict[str, asyncio.Event] = {}
+sse_subscribers: dict[str, list[asyncio.Queue]] = {}
 
-# Per-project SDK session IDs (persist across tasks for context)
-sdk_sessions: dict[str, str] = {}  # project_id → sdk_session_id
+orchestrator_sessions: dict[str, str] = {}  # project_id -> orchestrator session
+worker_sessions: dict[str, str] = {}  # project_id -> worker session
 
 
-# ── Progress Streaming ────────────────────────────────────────────────
+# -- progress streaming ------------------------------------------------
+
 
 async def emit_progress(project_id: str, event: ProgressEvent):
-    """Send progress event to all SSE subscribers and HTTP callback."""
-    # SSE subscribers
+    """Send progress event to SSE subscribers and HTTP callback."""
     for q in sse_subscribers.get(project_id, []):
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
-            pass  # drop if subscriber is slow
+            pass
 
-    # HTTP callback to router
     try:
         async with ClientSession(timeout=ClientTimeout(total=5)) as http:
             await http.post(
@@ -189,17 +178,14 @@ async def emit_progress(project_id: str, event: ProgressEvent):
                 },
             )
     except Exception:
-        pass  # best-effort
+        pass
 
 
-# ── Agent SDK Helpers ─────────────────────────────────────────────────
+# -- agent sdk helpers -------------------------------------------------
+
 
 async def _prompt_stream(text: str, done: asyncio.Event | None = None):
-    """Wrap a string prompt into an AsyncIterable for the Agent SDK.
-
-    Required when can_use_tool is set — the SDK needs streaming mode.
-    When `done` is provided, keeps the stream alive until the event is set.
-    """
+    """Wrap a string prompt into an AsyncIterable for Agent SDK streaming mode."""
     yield {
         "type": "user",
         "session_id": "",
@@ -211,7 +197,7 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
 
 
 def _make_can_use_tool():
-    """Create a can_use_tool callback that auto-approves everything."""
+    """Auto-approve tools in daemon-owned sessions."""
 
     async def can_use_tool(tool_name: str, input_data: dict, context=None):
         return PermissionResultAllow()
@@ -219,19 +205,88 @@ def _make_can_use_tool():
     return can_use_tool
 
 
-# ── RALPH Loop ────────────────────────────────────────────────────────
+# -- ralph split loop --------------------------------------------------
+
+
+async def _run_worker_turn(
+    project_id: str,
+    assignment: str,
+    iteration: int,
+    worker_session_id: str = "",
+) -> tuple[str, str]:
+    """Execute one worker assignment in an independent worker session."""
+    project = projects.get(project_id)
+    if not project:
+        return "Worker failed: unknown project.", worker_session_id
+
+    options = ClaudeAgentOptions(
+        can_use_tool=_make_can_use_tool(),
+        model="claude-opus-4-6",
+        cwd=project.project_dir,
+        allowed_tools=[
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "Glob",
+            "Grep",
+            "WebSearch",
+            "WebFetch",
+            "NotebookEdit",
+        ],
+        sandbox={"enabled": False},
+    )
+
+    if worker_session_id:
+        options.resume = worker_session_id
+    else:
+        options.system_prompt = WORKER_PROMPT
+
+    prompt = (
+        "[WORKER_TASK]\n"
+        f"{assignment}\n\n"
+        "Execute this assignment and provide evidence. End with [WORKER_REPORT]."
+    )
+
+    result_text = ""
+    done_event = asyncio.Event()
+
+    try:
+        async for message in query(prompt=_prompt_stream(prompt, done_event), options=options):
+            if isinstance(message, AssistantMessage):
+                await _forward_assistant_message(
+                    project_id, message, iteration, source="worker"
+                )
+            elif isinstance(message, ResultMessage):
+                result_text = message.result or ""
+                worker_session_id = message.session_id
+                done_event.set()
+    except Exception as e:
+        log.exception("Worker SDK error on iteration %s: %s", iteration, e)
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="tool_error",
+                data=f"[worker] SDK error: {e}",
+                iteration=iteration,
+            ),
+        )
+        return f"Worker failed: {e}", worker_session_id
+
+    report = _extract_after_marker(result_text, "[WORKER_REPORT]")
+    if not report:
+        report = result_text.strip()[:4000] or "Worker returned empty report."
+
+    return report, worker_session_id
+
 
 async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_ITERATIONS):
-    """The autonomous RALPH loop: Reason → Act → Learn → Plan → Hypothesize.
-
-    Runs the Agent SDK in a loop, evaluating markers after each turn.
-    User interruptions are drained at iteration boundaries and injected into the prompt.
-    """
+    """Supervisor RALPH loop with split channels: orchestrator + worker."""
     os.environ.pop("CLAUDECODE", None)
 
     project = projects.get(project_id)
     if not project:
-        log.error(f"Unknown project: {project_id}")
+        log.error("Unknown project: %s", project_id)
         return
 
     task_id = uuid.uuid4().hex[:12]
@@ -243,162 +298,238 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
     )
     task_states[project_id] = state
 
-    # Ensure interrupt queue and cancel event exist
     if project_id not in interrupt_queues:
         interrupt_queues[project_id] = asyncio.Queue()
     if project_id not in cancel_events:
         cancel_events[project_id] = asyncio.Event()
     cancel_events[project_id].clear()
 
-    session_id = sdk_sessions.get(project_id)
+    orchestrator_session_id = orchestrator_sessions.get(project_id, "")
+    worker_session_id = worker_sessions.get(project_id, "")
     feedback = ""
+    worker_report = ""
 
-    await emit_progress(project_id, ProgressEvent(
-        type="iteration", data=f"Starting task: {task_text[:200]}", iteration=0,
-    ))
+    await emit_progress(
+        project_id,
+        ProgressEvent(type="iteration", data=f"Starting task: {task_text[:200]}", iteration=0),
+    )
 
     try:
         while state.iteration < max_iterations:
-            # Check for cancellation
             if cancel_events[project_id].is_set():
                 state.status = "stopped"
                 state.summary = "Stopped by user"
                 state.finished_at = time.time()
-                await emit_progress(project_id, ProgressEvent(
-                    type="done", data="Task stopped by user",
-                    iteration=state.iteration,
-                ))
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(type="done", data="Task stopped by user", iteration=state.iteration),
+                )
                 break
 
             state.iteration += 1
-
-            # Drain pending interruptions
             user_msgs = _drain_interruptions(project_id)
 
-            # Build prompt
-            prompt = _build_prompt(task_text, feedback, user_msgs, state.iteration)
-
-            await emit_progress(project_id, ProgressEvent(
-                type="iteration",
-                data=f"Iteration {state.iteration}/{max_iterations}",
+            prompt = _build_prompt(
+                task_text=task_text,
+                feedback=feedback,
+                user_msgs=user_msgs,
                 iteration=state.iteration,
-            ))
+                worker_report=worker_report,
+            )
+            # Reset after consuming so stale reports don't leak into future iterations
+            worker_report = ""
+            feedback = ""
 
-            # One Agent SDK turn
+            await emit_progress(
+                project_id,
+                ProgressEvent(
+                    type="iteration",
+                    data=f"Orchestrator iteration {state.iteration}/{max_iterations}",
+                    iteration=state.iteration,
+                ),
+            )
+
             options = ClaudeAgentOptions(
                 can_use_tool=_make_can_use_tool(),
                 model="claude-opus-4-6",
                 cwd=project.project_dir,
-                allowed_tools=[
-                    "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-                    "WebSearch", "WebFetch", "NotebookEdit",
-                ],
+                allowed_tools=["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
                 sandbox={"enabled": False},
             )
 
-            if session_id:
-                options.resume = session_id
+            if orchestrator_session_id:
+                options.resume = orchestrator_session_id
             else:
-                options.system_prompt = PHD_STUDENT_PROMPT
+                options.system_prompt = ORCHESTRATOR_PROMPT
 
             result_text = ""
             done_event = asyncio.Event()
 
             try:
-                async for message in query(
-                    prompt=_prompt_stream(prompt, done_event),
-                    options=options,
-                ):
+                async for message in query(prompt=_prompt_stream(prompt, done_event), options=options):
                     if isinstance(message, AssistantMessage):
-                        await _forward_assistant_message(project_id, message, state.iteration)
+                        await _forward_assistant_message(
+                            project_id, message, state.iteration, source="orchestrator"
+                        )
                     elif isinstance(message, ResultMessage):
                         result_text = message.result or ""
-                        session_id = message.session_id
-                        sdk_sessions[project_id] = session_id
+                        orchestrator_session_id = message.session_id
+                        orchestrator_sessions[project_id] = orchestrator_session_id
                         done_event.set()
             except Exception as e:
-                log.exception(f"Agent SDK error on iteration {state.iteration}: {e}")
+                log.exception("Orchestrator SDK error on iteration %s: %s", state.iteration, e)
                 state.status = "error"
                 state.error = str(e)
                 state.finished_at = time.time()
-                await emit_progress(project_id, ProgressEvent(
-                    type="error", data=f"SDK error: {e}",
-                    iteration=state.iteration,
-                ))
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="error",
+                        data=f"Orchestrator SDK error: {e}",
+                        iteration=state.iteration,
+                    ),
+                )
                 break
 
-            # Save state
-            _save_state(state, session_id)
+            state.orchestrator_session_id = orchestrator_session_id
+            state.worker_session_id = worker_session_id
+            state.sdk_session_id = orchestrator_session_id
+            _save_state(
+                state,
+                orchestrator_session_id=orchestrator_session_id,
+                worker_session_id=worker_session_id,
+            )
 
-            # Evaluate result (zero-cost: marker-based)
             if "[TASK_COMPLETE]" in result_text:
                 state.status = "done"
                 state.summary = _extract_after_marker(result_text, "[TASK_COMPLETE]")
                 state.finished_at = time.time()
-                await emit_progress(project_id, ProgressEvent(
-                    type="done", data=state.summary,
-                    iteration=state.iteration,
-                ))
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(type="done", data=state.summary, iteration=state.iteration),
+                )
                 break
 
             if "[NEED_USER_INPUT]" in result_text:
                 state.status = "stuck"
                 question = _extract_after_marker(result_text, "[NEED_USER_INPUT]")
                 state.summary = f"Needs input: {question}"
-                await emit_progress(project_id, ProgressEvent(
-                    type="stuck", data=question,
-                    iteration=state.iteration,
-                ))
-                # Wait for an interruption (user message)
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(type="stuck", data=question, iteration=state.iteration),
+                )
                 try:
-                    user_input = await asyncio.wait_for(
-                        interrupt_queues[project_id].get(),
-                        timeout=600,  # 10 min timeout
-                    )
+                    user_input = await asyncio.wait_for(interrupt_queues[project_id].get(), timeout=600)
                     state.status = "running"
-                    feedback = f"User responded: {user_input}\n\nContinue working on the task."
+                    feedback = f"User responded: {user_input}"
+                    continue
                 except asyncio.TimeoutError:
                     state.status = "stuck"
                     state.finished_at = time.time()
-                    await emit_progress(project_id, ProgressEvent(
-                        type="stuck", data="No user response (timeout)",
-                        iteration=state.iteration,
-                    ))
+                    await emit_progress(
+                        project_id,
+                        ProgressEvent(
+                            type="stuck",
+                            data="No user response (timeout)",
+                            iteration=state.iteration,
+                        ),
+                    )
                     break
-            else:
-                # No marker — continue working
-                feedback = "Continue working toward the task goal."
+
+            if "[ASSIGN_WORKER]" in result_text:
+                assignment = _extract_after_marker(result_text, "[ASSIGN_WORKER]")
+                if not assignment:
+                    feedback = (
+                        "You returned [ASSIGN_WORKER] without a concrete assignment. "
+                        "Provide a specific WorkerTask."
+                    )
+                    continue
+
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="tool_use",
+                        data=f"[orchestrator -> worker] {assignment[:400]}",
+                        iteration=state.iteration,
+                    ),
+                )
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="text",
+                        data=f"@orchestrator -> @worker: {assignment[:1500]}",
+                        iteration=state.iteration,
+                    ),
+                )
+
+                worker_report, worker_session_id = await _run_worker_turn(
+                    project_id=project_id,
+                    assignment=assignment,
+                    iteration=state.iteration,
+                    worker_session_id=worker_session_id,
+                )
+                worker_sessions[project_id] = worker_session_id
+                state.worker_session_id = worker_session_id
+
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="text",
+                        data=f"@worker -> @orchestrator: {worker_report[:1800]}",
+                        iteration=state.iteration,
+                    ),
+                )
+
+                feedback = (
+                    "Worker report received (see [LATEST_WORKER_REPORT] below). "
+                    "Verify this against the original goal. Then either assign another worker task, "
+                    "ask user input, or declare completion."
+                )
+                _save_state(
+                    state,
+                    orchestrator_session_id=orchestrator_session_id,
+                    worker_session_id=worker_session_id,
+                )
+                continue
+
+            feedback = (
+                "No valid terminal marker found. End with exactly one of: "
+                "[ASSIGN_WORKER], [TASK_COMPLETE], [NEED_USER_INPUT]."
+            )
 
         else:
-            # Max iterations reached
             state.status = "done"
             state.summary = f"Reached max iterations ({max_iterations})"
             state.finished_at = time.time()
-            await emit_progress(project_id, ProgressEvent(
-                type="done", data=state.summary,
-                iteration=state.iteration,
-            ))
+            await emit_progress(
+                project_id,
+                ProgressEvent(type="done", data=state.summary, iteration=state.iteration),
+            )
 
     except asyncio.CancelledError:
         state.status = "stopped"
         state.summary = "Task cancelled"
         state.finished_at = time.time()
-        await emit_progress(project_id, ProgressEvent(
-            type="done", data="Task cancelled",
-            iteration=state.iteration,
-        ))
+        await emit_progress(
+            project_id,
+            ProgressEvent(type="done", data="Task cancelled", iteration=state.iteration),
+        )
     except Exception as e:
-        log.exception(f"RALPH loop error: {e}")
+        log.exception("Supervisor RALPH loop error: %s", e)
         state.status = "error"
         state.error = str(e)
         state.finished_at = time.time()
-        await emit_progress(project_id, ProgressEvent(
-            type="error", data=str(e),
-            iteration=state.iteration,
-        ))
+        await emit_progress(
+            project_id,
+            ProgressEvent(type="error", data=str(e), iteration=state.iteration),
+        )
     finally:
         running_tasks.pop(project_id, None)
-        _save_state(state, session_id)
+        _save_state(
+            state,
+            orchestrator_session_id=orchestrator_session_id,
+            worker_session_id=worker_session_id,
+        )
 
 
 def _build_prompt(
@@ -406,27 +537,30 @@ def _build_prompt(
     feedback: str,
     user_msgs: list[str],
     iteration: int,
+    worker_report: str = "",
 ) -> str:
-    """Build the prompt for an iteration of the RALPH loop."""
+    """Build orchestrator prompt for an iteration."""
     parts = []
 
     if iteration == 1:
         parts.append(f"[TASK]\n{task_text}")
     else:
         parts.append(f"[CONTINUATION — iteration {iteration}]")
-        if feedback:
-            parts.append(f"\n{feedback}")
+
+    if feedback:
+        parts.append(f"\n[SUPERVISOR_FEEDBACK]\n{feedback}")
+
+    if worker_report:
+        parts.append(f"\n[LATEST_WORKER_REPORT]\n{worker_report}")
 
     if user_msgs:
         parts.append("\n[USER INTERRUPTIONS]")
         for msg in user_msgs:
             parts.append(f"- {msg}")
-        parts.append("")
 
-    if iteration > 1 and not user_msgs:
-        parts.append(
-            "\nRemember: emit [TASK_COMPLETE] when done, or [NEED_USER_INPUT] if stuck."
-        )
+    parts.append(
+        "\nChoose exactly one marker this turn: [ASSIGN_WORKER], [TASK_COMPLETE], or [NEED_USER_INPUT]."
+    )
 
     return "\n".join(parts)
 
@@ -436,6 +570,7 @@ def _drain_interruptions(project_id: str) -> list[str]:
     queue = interrupt_queues.get(project_id)
     if not queue:
         return []
+
     msgs = []
     while not queue.empty():
         try:
@@ -446,56 +581,96 @@ def _drain_interruptions(project_id: str) -> list[str]:
 
 
 def _extract_after_marker(text: str, marker: str) -> str:
-    """Extract text after a marker line."""
+    """Extract all text after a marker until the next marker or end of text.
+
+    Strips optional label prefixes (Summary:, Question:, WorkerTask:) from
+    the first line, then captures everything until a line starting with '['.
+    """
     idx = text.find(marker)
     if idx < 0:
         return ""
-    rest = text[idx + len(marker):].strip()
-    # Take the first meaningful line
-    for line in rest.split("\n"):
-        line = line.strip()
-        if line and not line.startswith("["):
-            # Strip common prefixes like "Summary: " or "Question: "
-            for prefix in ("Summary:", "Question:"):
-                if line.startswith(prefix):
-                    line = line[len(prefix):].strip()
-            return line
-    return rest[:200] if rest else ""
+
+    rest = text[idx + len(marker) :].strip()
+    if not rest:
+        return ""
+
+    lines = rest.split("\n")
+    result_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Stop at the next marker (e.g. [TASK_COMPLETE], [ASSIGN_WORKER])
+        if stripped.startswith("[") and stripped.endswith("]") and len(stripped) > 2:
+            break
+        if not result_lines:
+            # Strip optional label prefix on first content line
+            for prefix in ("Summary:", "Question:", "WorkerTask:"):
+                if stripped.startswith(prefix):
+                    stripped = stripped[len(prefix) :].strip()
+                    break
+        result_lines.append(stripped)
+
+    # Drop leading/trailing empty lines
+    while result_lines and not result_lines[0]:
+        result_lines.pop(0)
+    while result_lines and not result_lines[-1]:
+        result_lines.pop()
+
+    return "\n".join(result_lines) if result_lines else ""
 
 
 async def _forward_assistant_message(
-    project_id: str, message: AssistantMessage, iteration: int,
+    project_id: str,
+    message: AssistantMessage,
+    iteration: int,
+    source: str,
 ):
     """Forward intermediate assistant output as progress events."""
     for block in message.content:
         if isinstance(block, TextBlock):
             text = block.text.strip()
             if text:
-                await emit_progress(project_id, ProgressEvent(
-                    type="text", data=text[:2000],
-                    iteration=iteration,
-                ))
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="text",
+                        data=f"[{source}] {text[:2000]}",
+                        iteration=iteration,
+                    ),
+                )
         elif isinstance(block, ToolUseBlock):
             tool_msg = f"{block.name}"
             if block.name in ("Bash", "Write", "Edit"):
                 snippet = json.dumps(block.input, ensure_ascii=False)[:300]
                 tool_msg += f": {snippet}"
-            await emit_progress(project_id, ProgressEvent(
-                type="tool_use", data=tool_msg,
-                iteration=iteration,
-            ))
+            await emit_progress(
+                project_id,
+                ProgressEvent(
+                    type="tool_use",
+                    data=f"[{source}] {tool_msg}",
+                    iteration=iteration,
+                ),
+            )
         elif isinstance(block, ToolResultBlock):
             if block.is_error:
                 content = block.content if isinstance(block.content, str) else str(block.content or "")
-                await emit_progress(project_id, ProgressEvent(
-                    type="tool_error", data=content[:500],
-                    iteration=iteration,
-                ))
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="tool_error",
+                        data=f"[{source}] {content[:500]}",
+                        iteration=iteration,
+                    ),
+                )
 
 
-# ── State Persistence ─────────────────────────────────────────────────
+# -- state persistence -------------------------------------------------
 
-def _save_state(state: TaskState, session_id: str = ""):
+
+def _save_state(
+    state: TaskState,
+    orchestrator_session_id: str = "",
+    worker_session_id: str = "",
+):
     """Persist task state to disk for crash recovery."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     path = STATE_DIR / f"{state.project_id}.json"
@@ -506,7 +681,9 @@ def _save_state(state: TaskState, session_id: str = ""):
         "status": state.status,
         "iteration": state.iteration,
         "max_iterations": state.max_iterations,
-        "sdk_session_id": session_id,
+        "sdk_session_id": orchestrator_session_id,
+        "orchestrator_session_id": orchestrator_session_id,
+        "worker_session_id": worker_session_id,
         "started_at": state.started_at,
         "finished_at": state.finished_at,
         "summary": state.summary,
@@ -527,7 +704,8 @@ def _load_state(project_id: str) -> dict | None:
         return json.load(f)
 
 
-# ── HTTP Handlers ─────────────────────────────────────────────────────
+# -- http handlers -----------------------------------------------------
+
 
 async def handle_register(request: web.Request) -> web.Response:
     """POST /register — register a project."""
@@ -535,17 +713,11 @@ async def handle_register(request: web.Request) -> web.Response:
     project_id = data.get("project_id")
     project_dir = data.get("project_dir")
     if not project_id or not project_dir:
-        return web.json_response(
-            {"error": "project_id and project_dir required"}, status=400
-        )
+        return web.json_response({"error": "project_id and project_dir required"}, status=400)
 
     name = data.get("name", project_id)
-    projects[project_id] = Project(
-        project_id=project_id,
-        project_dir=project_dir,
-        name=name,
-    )
-    log.info(f"Registered project {project_id}: {project_dir}")
+    projects[project_id] = Project(project_id=project_id, project_dir=project_dir, name=name)
+    log.info("Registered project %s: %s", project_id, project_dir)
     return web.json_response({"ok": True, "project_id": project_id})
 
 
@@ -557,31 +729,28 @@ async def handle_task(request: web.Request) -> web.Response:
     max_iter = data.get("max_iterations", MAX_ITERATIONS)
 
     if not project_id or not task_text:
-        return web.json_response(
-            {"error": "project_id and task required"}, status=400
-        )
+        return web.json_response({"error": "project_id and task required"}, status=400)
 
     if project_id not in projects:
         return web.json_response(
             {"error": f"Unknown project: {project_id}. Register first."}, status=404
         )
 
-    # Check if already running
     if project_id in running_tasks and not running_tasks[project_id].done():
         return web.json_response(
-            {"error": f"Project {project_id} already has a running task. Use /interrupt or /stop first."},
+            {
+                "error": (
+                    f"Project {project_id} already has a running task. "
+                    "Use /interrupt or /stop first."
+                )
+            },
             status=409,
         )
 
-    # Start RALPH loop in background
     task = asyncio.create_task(run_task(project_id, task_text, max_iter))
     running_tasks[project_id] = task
 
-    return web.json_response({
-        "ok": True,
-        "project_id": project_id,
-        "status": "started",
-    })
+    return web.json_response({"ok": True, "project_id": project_id, "status": "started"})
 
 
 async def handle_interrupt(request: web.Request) -> web.Response:
@@ -597,7 +766,7 @@ async def handle_interrupt(request: web.Request) -> web.Response:
         interrupt_queues[project_id] = asyncio.Queue()
     interrupt_queues[project_id].put_nowait(message)
 
-    log.info(f"Interrupt queued for {project_id}: {message[:100]}")
+    log.info("Interrupt queued for %s: %s", project_id, message[:100])
     return web.json_response({"ok": True, "queued": True})
 
 
@@ -605,7 +774,6 @@ async def handle_status(request: web.Request) -> web.Response:
     """GET /status — current status of a project's task."""
     project_id = request.query.get("project_id")
     if not project_id:
-        # Return all project statuses
         result = {}
         for pid, proj in projects.items():
             state = task_states.get(pid)
@@ -625,18 +793,20 @@ async def handle_status(request: web.Request) -> web.Response:
             return web.json_response({"status": "idle", "project_id": project_id})
         return web.json_response({"error": "Unknown project"}, status=404)
 
-    return web.json_response({
-        "project_id": project_id,
-        "task_id": state.task_id,
-        "status": state.status,
-        "iteration": state.iteration,
-        "max_iterations": state.max_iterations,
-        "task_text": state.task_text[:500],
-        "summary": state.summary,
-        "error": state.error,
-        "started_at": state.started_at,
-        "finished_at": state.finished_at,
-    })
+    return web.json_response(
+        {
+            "project_id": project_id,
+            "task_id": state.task_id,
+            "status": state.status,
+            "iteration": state.iteration,
+            "max_iterations": state.max_iterations,
+            "task_text": state.task_text[:500],
+            "summary": state.summary,
+            "error": state.error,
+            "started_at": state.started_at,
+            "finished_at": state.finished_at,
+        }
+    )
 
 
 async def handle_stream(request: web.Request) -> web.StreamResponse:
@@ -657,7 +827,6 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
 
-    # Subscribe
     queue: asyncio.Queue[ProgressEvent] = asyncio.Queue(maxsize=100)
     if project_id not in sse_subscribers:
         sse_subscribers[project_id] = []
@@ -669,12 +838,13 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                 event = await asyncio.wait_for(queue.get(), timeout=30)
                 await response.write(event.to_sse().encode())
             except asyncio.TimeoutError:
-                # Send keepalive
                 await response.write(b": keepalive\n\n")
             except (ConnectionError, ConnectionResetError):
                 break
     finally:
-        sse_subscribers.get(project_id, []).remove(queue) if queue in sse_subscribers.get(project_id, []) else None
+        subscribers = sse_subscribers.get(project_id, [])
+        if queue in subscribers:
+            subscribers.remove(queue)
 
     return response
 
@@ -687,11 +857,9 @@ async def handle_stop(request: web.Request) -> web.Response:
     if not project_id:
         return web.json_response({"error": "project_id required"}, status=400)
 
-    # Signal cancellation
     if project_id in cancel_events:
         cancel_events[project_id].set()
 
-    # Cancel the asyncio task
     task = running_tasks.get(project_id)
     if task and not task.done():
         task.cancel()
@@ -702,15 +870,18 @@ async def handle_stop(request: web.Request) -> web.Response:
 
 async def handle_health(request: web.Request) -> web.Response:
     """GET /health — health check."""
-    return web.json_response({
-        "status": "ok",
-        "daemon": DAEMON_NAME,
-        "projects": list(projects.keys()),
-        "running": [pid for pid, t in running_tasks.items() if not t.done()],
-    })
+    return web.json_response(
+        {
+            "status": "ok",
+            "daemon": DAEMON_NAME,
+            "projects": list(projects.keys()),
+            "running": [pid for pid, t in running_tasks.items() if not t.done()],
+        }
+    )
 
 
-# ── Utility ───────────────────────────────────────────────────────────
+# -- utility -----------------------------------------------------------
+
 
 def _safe_serialize(obj) -> dict:
     """Best-effort JSON-safe conversion."""
@@ -721,13 +892,17 @@ def _safe_serialize(obj) -> dict:
         return {"raw": str(obj)}
 
 
-# ── Main ──────────────────────────────────────────────────────────────
+# -- main --------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(description="Orchestrator daemon")
     parser.add_argument("--port", type=int, default=8200)
     parser.add_argument("--name", default=os.environ.get("DAEMON_NAME", "unknown"))
-    parser.add_argument("--callback-url", default=os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120"))
+    parser.add_argument(
+        "--callback-url",
+        default=os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120"),
+    )
     args = parser.parse_args()
 
     global DAEMON_NAME, CALLBACK_URL
@@ -735,7 +910,12 @@ def main():
     CALLBACK_URL = args.callback_url
     os.environ["DAEMON_NAME"] = args.name
 
-    log.info(f"Daemon starting: name={args.name}, port={args.port}, callback={args.callback_url}")
+    log.info(
+        "Daemon starting: name=%s, port=%s, callback=%s",
+        args.name,
+        args.port,
+        args.callback_url,
+    )
 
     app = web.Application()
     app.router.add_post("/register", handle_register)

@@ -150,11 +150,8 @@ class WebChat:
 
         viewer_count = sum(1 for ch in self._client_active_channel.values() if ch == channel_id)
         members = [
-            {
-                "name": "Humans",
-                "role": "user",
-                "detail": f"{viewer_count} active viewer(s)",
-            }
+            {"name": "You", "role": "user", "detail": f"{viewer_count} active viewer(s)"},
+            {"name": "Router", "role": "router", "detail": "local relay"},
         ]
 
         project_id = self._router.get_channel_project(channel_id)
@@ -166,6 +163,13 @@ class WebChat:
                         "name": f"Orchestrator ({orch.name})",
                         "role": "orchestrator",
                         "detail": f"{project_id} — {orch.status}",
+                    }
+                )
+                members.append(
+                    {
+                        "name": f"Worker ({orch.name})",
+                        "role": "worker",
+                        "detail": "active" if orch.status == "running" else "idle",
                     }
                 )
 
@@ -316,6 +320,9 @@ class WebChat:
         if event_type == "text":
             await self._store.add_log(chat_id, data_text)
             await self._ws_send_to_channel(chat_id, {"type": "log", "text": data_text, "ts": ts})
+            if data_text.startswith("@orchestrator") or data_text.startswith("@worker"):
+                await self._store.add_message(chat_id, "assistant", data_text)
+                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": data_text, "ts": ts})
         elif event_type == "tool_use":
             line = f"→ {data_text}"
             await self._store.add_log(chat_id, line)
@@ -341,7 +348,7 @@ class WebChat:
                 },
             )
             if data_text:
-                msg = f"Task complete: {data_text}"
+                msg = f"@orchestrator Task complete: {data_text}"
                 await self._store.add_message(chat_id, "assistant", msg)
                 await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "ts": ts})
         elif event_type == "stuck":
@@ -356,7 +363,7 @@ class WebChat:
                 },
             )
             if data_text:
-                msg = f"Needs input: {data_text}"
+                msg = f"@orchestrator Needs input: {data_text}"
                 await self._store.add_message(chat_id, "assistant", msg)
                 await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "ts": ts})
         elif event_type == "error":
@@ -374,6 +381,9 @@ class WebChat:
                 line = f"[ERROR] {data_text}"
                 await self._store.add_log(chat_id, line)
                 await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
+                msg = f"@orchestrator Error: {data_text}"
+                await self._store.add_message(chat_id, "assistant", msg)
+                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "ts": ts})
 
         project_status = self._router.get_project_status(project_id)
         await self._ws_broadcast(

@@ -15,7 +15,11 @@ You (laptop)                          Remote servers
 └──────────────────────┘              └──────────────────────┘
 ```
 
-Send a task, and an autonomous agent on the remote server works on it — reading files, writing code, running tests — streaming progress back in real-time. Think of it as having PhD students on different machines that you supervise from one place.
+Send a task, and a split remote system works on it:
+- an **orchestrator channel** (planning, verification, next-step decisions)
+- a **worker channel** (execution: read/write/bash/test)
+
+Progress streams back in real-time. Think of it as having PhD students on different machines that you supervise from one place.
 
 ## Quick Start
 
@@ -76,7 +80,7 @@ Create a channel, connect it to a project, and send your task:
 Investigate why the training loss plateaus — might be reward hacking
 ```
 
-The remote agent starts working autonomously. You'll see tool calls, text output, and iteration progress streaming in real-time via the monitor panel.
+The remote orchestrator starts the loop, assigns work to the worker channel, reviews worker reports, and iterates until done. You'll see tool calls, text output, and iteration progress in real-time via the monitor panel.
 
 ## Commands and messaging
 

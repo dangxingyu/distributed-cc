@@ -708,3 +708,58 @@ async def test_disconnect_channel_calls_persist_with_none():
     await router.disconnect_channel(1)
 
     assert persisted[1] is None
+
+
+# ── Deferred task notification ────────────────────────────────────────
+
+
+async def test_deferred_task_notifies_via_progress_callback():
+    """When a deferred task starts, a progress event is emitted."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="done")])
+    router._channel_project[1] = "proj"
+    router._deferred_tasks["proj"] = [{"chat_id": 1, "text": "run the tests", "ts": 1.0}]
+
+    mock_resp = AsyncMock()
+    mock_resp.json = AsyncMock(return_value={"ok": True})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.post = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    progress_events = []
+
+    async def on_progress(project_id, event):
+        progress_events.append(event)
+
+    router.set_progress_callback(on_progress)
+
+    await router._maybe_start_deferred_task("proj")
+
+    # Should have emitted a text event about starting the queued task
+    assert any(
+        "run the tests" in e.get("data", "") and "@orchestrator" in e.get("data", "")
+        for e in progress_events
+    )
+
+
+# ── Per-channel setup sessions ────────────────────────────────────────
+
+
+async def test_setup_sessions_are_per_channel():
+    """Each channel gets its own setup session."""
+    router = _make_router([])
+
+    with patch.object(router, "_handle_setup", new_callable=AsyncMock) as mock_setup:
+        send_reply_1 = AsyncMock()
+        send_reply_2 = AsyncMock()
+        await router.route_message(1, "/setup server-a", send_reply_1)
+        await router.route_message(2, "/setup server-b", send_reply_2)
+
+        assert 1 in router._setup_channels
+        assert 2 in router._setup_channels
+        assert mock_setup.call_count == 2
+        # Each call has the correct chat_id
+        assert mock_setup.call_args_list[0][0][0] == 1
+        assert mock_setup.call_args_list[1][0][0] == 2

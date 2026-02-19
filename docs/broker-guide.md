@@ -60,9 +60,12 @@ The daemon is a per-server process — start it once per server:
     --callback-url http://127.0.0.1:9120
 ```
 
-The daemon runs an autonomous RALPH loop when tasks are submitted. It uses the
-Claude Agent SDK directly for tool use (Read, Write, Bash, Grep, etc.) and
-evaluates completion via markers (`[TASK_COMPLETE]`, `[NEED_USER_INPUT]`).
+The daemon runs a split-channel autonomous RALPH loop when tasks are submitted:
+- **Orchestrator channel**: plans, verifies worker reports, decides next step
+- **Worker channel**: executes assignments with tools (Read, Write, Bash, Grep, etc.)
+
+The orchestrator decides progress/completion via markers (`[ASSIGN_WORKER]`,
+`[TASK_COMPLETE]`, `[NEED_USER_INPUT]`), and worker turns return `[WORKER_REPORT]`.
 
 ### HTTP API
 
@@ -161,9 +164,9 @@ ssh {host} "kill \$(cat {daemon_dir}/{server_name}.pid)"
 ## 9. State Persistence
 
 Task state is persisted to `~/.distributed-cc/state/{project_id}.json` at each
-iteration boundary. This includes task ID, iteration count, SDK session ID,
-status, and summary. On daemon restart, the state file is available for
-inspection but tasks are not auto-resumed (the user decides via the web UI).
+iteration boundary. This includes task ID, iteration count, orchestrator/worker
+session IDs, status, and summary. On daemon restart, the state file is available
+for inspection but tasks are not auto-resumed (the user decides via the web UI).
 
 SDK sessions are persisted by Claude Code itself and can be resumed across
 daemon restarts via `--resume {session_id}`.
