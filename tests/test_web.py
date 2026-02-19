@@ -594,3 +594,47 @@ async def test_ws_reply_only_sent_to_same_channel_viewers(aiohttp_client):
     await ws_a.close()
     await ws_b.close()
     await store.close()
+
+
+# ── task_list progress event ─────────────────────────────────────────
+
+
+async def test_progress_task_list_sent_to_ws(aiohttp_client):
+    """task_list progress event emits a task_list WS message (no store persistence)."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("tl-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()  # channel_switched
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {
+            "type": "task_list",
+            "data": "- [x] Check reward\n- [ ] Analyze logs",
+            "iteration": 2,
+            "ts": 300.0,
+        },
+    )
+
+    # Should get task_list + channel_status
+    messages = []
+    for _ in range(2):
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        messages.append(msg)
+
+    tl_msg = next(m for m in messages if m["type"] == "task_list")
+    assert "- [x] Check reward" in tl_msg["data"]
+    assert "- [ ] Analyze logs" in tl_msg["data"]
+    assert tl_msg["iteration"] == 2
+
+    # Not persisted as a chat message or log
+    logs = await store.get_logs(ch_id)
+    history = await store.get_recent_messages(ch_id)
+    assert not any("Check reward" in entry["text"] for entry in logs)
+    assert not any("Check reward" in m["content"] for m in history)
+
+    await ws.close()
+    await store.close()

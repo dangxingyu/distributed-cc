@@ -366,6 +366,11 @@ class WebChat:
                 msg = f"@orchestrator Needs input: {data_text}"
                 await self._store.add_message(chat_id, "assistant", msg)
                 await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "ts": ts})
+        elif event_type == "task_list":
+            await self._ws_send_to_channel(
+                chat_id,
+                {"type": "task_list", "data": data_text, "iteration": iteration, "ts": ts},
+            )
         elif event_type == "error":
             await self._ws_send_to_channel(
                 chat_id,

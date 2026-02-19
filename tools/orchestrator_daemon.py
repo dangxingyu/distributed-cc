@@ -54,6 +54,18 @@ ORCHESTRATOR_PROMPT = """\
 You are the ORCHESTRATOR (PhD student role). You do planning, decomposition,
 verification, and decision making. You do NOT execute implementation work directly.
 
+You also maintain a task list — your research plan for the overall task.
+Include a [TASK_LIST] block in your response to update it:
+
+[TASK_LIST]
+- [x] Completed item
+- [ ] Pending item
+- [ ] Another pending item
+[/TASK_LIST]
+
+Update this every turn — mark items done, add new ones as you learn more.
+This is your PhD-level research plan, not micro-implementation steps.
+
 At the end of every response, choose exactly one:
 
 1) [ASSIGN_WORKER]
@@ -335,6 +347,7 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
                 user_msgs=user_msgs,
                 iteration=state.iteration,
                 worker_report=worker_report,
+                task_list=_load_task_list(project_id),
             )
             # Reset after consuming so stale reports don't leak into future iterations
             worker_report = ""
@@ -394,6 +407,20 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
             state.orchestrator_session_id = orchestrator_session_id
             state.worker_session_id = worker_session_id
             state.sdk_session_id = orchestrator_session_id
+
+            # Extract and persist task list if present
+            task_list_content = _extract_task_list(result_text)
+            if task_list_content is not None:
+                _save_task_list(project_id, task_list_content)
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="task_list",
+                        data=task_list_content,
+                        iteration=state.iteration,
+                    ),
+                )
+
             _save_state(
                 state,
                 orchestrator_session_id=orchestrator_session_id,
@@ -538,9 +565,13 @@ def _build_prompt(
     user_msgs: list[str],
     iteration: int,
     worker_report: str = "",
+    task_list: str = "",
 ) -> str:
     """Build orchestrator prompt for an iteration."""
     parts = []
+
+    if task_list:
+        parts.append(f"[CURRENT_TASK_LIST]\n{task_list}")
 
     if iteration == 1:
         parts.append(f"[TASK]\n{task_text}")
@@ -618,6 +649,35 @@ def _extract_after_marker(text: str, marker: str) -> str:
     return "\n".join(result_lines) if result_lines else ""
 
 
+def _extract_task_list(text: str) -> str | None:
+    """Extract content between [TASK_LIST] and [/TASK_LIST]."""
+    start = text.find("[TASK_LIST]")
+    end = text.find("[/TASK_LIST]")
+    if start < 0 or end < 0 or end <= start:
+        return None
+    return text[start + len("[TASK_LIST]") : end].strip()
+
+
+def _save_task_list(project_id: str, content: str):
+    """Write task list to {project_dir}/.task_list.md."""
+    project = projects.get(project_id)
+    if not project:
+        return
+    path = Path(project.project_dir) / ".task_list.md"
+    path.write_text(content)
+
+
+def _load_task_list(project_id: str) -> str:
+    """Read task list from {project_dir}/.task_list.md."""
+    project = projects.get(project_id)
+    if not project:
+        return ""
+    path = Path(project.project_dir) / ".task_list.md"
+    if not path.exists():
+        return ""
+    return path.read_text().strip()
+
+
 async def _forward_assistant_message(
     project_id: str,
     message: AssistantMessage,
@@ -688,6 +748,7 @@ def _save_state(
         "finished_at": state.finished_at,
         "summary": state.summary,
         "error": state.error,
+        "task_list": _load_task_list(state.project_id),
     }
     tmp = str(path) + ".tmp"
     with open(tmp, "w") as f:
