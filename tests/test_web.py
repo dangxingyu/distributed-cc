@@ -524,6 +524,115 @@ async def test_progress_error_sends_chat_reply(aiohttp_client):
     await store.close()
 
 
+# ── Orchestrator text surfaces in chat ────────────────────────────────
+
+
+async def test_orchestrator_text_surfaces_in_chat(aiohttp_client):
+    """[orchestrator] text events appear in chat (prefix stripped) and monitor."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("orch-text-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {"type": "text", "data": "[orchestrator] Let me investigate this.", "iteration": 1, "ts": 100.0},
+    )
+
+    messages = []
+    for _ in range(3):  # log + reply + channel_status
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        messages.append(msg)
+
+    types = [m["type"] for m in messages]
+    assert "log" in types
+    assert "reply" in types
+
+    reply = next(m for m in messages if m["type"] == "reply")
+    assert reply["text"] == "Let me investigate this."
+    assert reply["sender"] == "orchestrator"
+
+    log_msg = next(m for m in messages if m["type"] == "log")
+    assert "[orchestrator]" in log_msg["text"]
+
+    # Persisted in chat history (clean text, no prefix)
+    msgs = await store.get_recent_messages(ch_id)
+    assert any(m["content"] == "Let me investigate this." for m in msgs)
+
+    await ws.close()
+    await store.close()
+
+
+async def test_worker_text_stays_in_monitor_only(aiohttp_client):
+    """[worker] text events go to monitor log only, not chat."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("worker-text-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {"type": "text", "data": "[worker] Reading file parser.py...", "iteration": 1, "ts": 100.0},
+    )
+
+    messages = []
+    for _ in range(2):  # log + channel_status
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        messages.append(msg)
+
+    types = [m["type"] for m in messages]
+    assert "log" in types
+    assert "reply" not in types
+
+    # Not in chat history
+    msgs = await store.get_recent_messages(ch_id)
+    assert not any("Reading file" in m["content"] for m in msgs)
+
+    await ws.close()
+    await store.close()
+
+
+async def test_done_empty_data_no_chat_reply(aiohttp_client):
+    """'done' with empty data sends progress status but no chat reply."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("done-empty-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {"type": "done", "data": "", "iteration": 1, "ts": 100.0},
+    )
+
+    messages = []
+    for _ in range(2):  # progress + channel_status
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        messages.append(msg)
+
+    types = [m["type"] for m in messages]
+    assert "progress" in types
+    assert "reply" not in types
+
+    progress = next(m for m in messages if m["type"] == "progress")
+    assert progress.get("status") == "done"
+
+    # No chat message persisted
+    msgs = await store.get_recent_messages(ch_id)
+    assert len(msgs) == 0
+
+    await ws.close()
+    await store.close()
+
+
 # ── Channel list includes project fields ─────────────────────────────
 
 
