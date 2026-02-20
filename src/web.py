@@ -372,6 +372,11 @@ class WebChat:
                 chat_id,
                 {"type": "task_list", "data": data_text, "iteration": iteration, "ts": ts},
             )
+        elif event_type == "log_update":
+            await self._ws_send_to_channel(
+                chat_id,
+                {"type": "log_update", "data": data_text, "iteration": iteration, "ts": ts},
+            )
         elif event_type == "error":
             await self._ws_send_to_channel(
                 chat_id,

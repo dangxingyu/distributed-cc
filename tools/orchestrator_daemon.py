@@ -57,7 +57,8 @@ STATE_DIR = Path.home() / ".distributed-cc" / "state"
 
 ORCHESTRATOR_PROMPT = """\
 You are the ORCHESTRATOR — a PhD-student-level autonomous researcher.
-You plan, investigate, decompose tasks, review worker output, and make decisions.
+You receive direction from the professor (user), then independently plan,
+investigate, decompose tasks, assign workers, review output, and drive to completion.
 
 ## Your tools
 
@@ -68,16 +69,37 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 - **task_complete(summary)** — mark the overall task as done.
 - **ask_user(question)** — ask the professor a blocking question (use sparingly).
 - **update_task_list(content)** — update your research plan (task_list.md).
+- **append_log(entry)** — append an entry to your research log (LOG.md).
 - **update_worker_config(content)** — update standing worker instructions (.claude/CLAUDE.md).
 
 ## Workflow
 
-1. Start: Read task_list.md (if it exists) to resume your previous plan.
+1. Start: Read task_list.md and LOG.md (if they exist) to resume context.
 2. Investigate: Read files, search the codebase, understand the problem.
 3. Plan: Call update_task_list with a research-level plan.
 4. Execute: Call assign_worker with concrete tasks and review their reports.
 5. Iterate: Refine based on evidence until the goal is met.
 6. Complete: Call task_complete with a summary.
+
+## Research log (LOG.md)
+
+Your log is your lab notebook — the narrative record of an investigation.
+Call append_log at turning points, not on every action.
+
+**Log when it matters:**
+- A hypothesis forms or is tested ("suspect reward hacking — reward distribution is bimodal")
+- Evidence changes your understanding ("worker confirmed: 72% of outputs exploit length bonus")
+- You choose between approaches and WHY ("normalized reward > length penalty: no extra hyperparameter")
+- A dead end worth remembering ("lr warmup had no effect — loss curve identical, ruling out optimization issue")
+- A milestone is reached ("fix verified: loss drops to 0.3 by step 8k, reward distribution unimodal")
+
+**A great entry captures WHY, not just WHAT:**
+- Not "ran tests" → "tests revealed the reward model gives max score to 73% of outputs — confirms reward hacking"
+- Not "fixed the bug" → "root cause: gradient clipping at 0.1 starved updates after step 5k. Relaxed to 1.0"
+- Not "moving to next task" → "approach A ruled out (no effect on loss curve). Pivoting to reward shaping"
+
+The log should read as a story — someone picking up where you left off can trace
+your reasoning, see what you tried, and understand why you made each decision.
 
 ## Rules
 
@@ -504,6 +526,27 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         return {"content": [{"type": "text", "text": "Task list updated."}]}
 
     @tool(
+        "append_log",
+        "Append an entry to your research log (LOG.md). "
+        "Your lab notebook — record hypotheses, findings, decisions, and pivots. "
+        "Write at turning points, not on every action.",
+        {"entry": str},
+    )
+    async def append_log(args):
+        log_path = _append_log(project_id, args["entry"])
+
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="log_update",
+                data=args["entry"],
+                iteration=state.iteration,
+            ),
+        )
+
+        return {"content": [{"type": "text", "text": f"Log entry appended to {log_path}"}]}
+
+    @tool(
         "update_worker_config",
         "Update standing instructions for your worker (.claude/CLAUDE.md). "
         "The worker loads this natively at the start of every assignment. "
@@ -529,7 +572,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
     return create_sdk_mcp_server(
         "daemon",
-        tools=[assign_worker, task_complete, ask_user, update_task_list, update_worker_config],
+        tools=[assign_worker, task_complete, ask_user, update_task_list, append_log, update_worker_config],
     )
 
 
@@ -671,6 +714,19 @@ def _save_task_list(project_id: str, content: str):
         return
     path = Path(project.project_dir) / "task_list.md"
     path.write_text(content)
+
+
+def _append_log(project_id: str, entry: str) -> str:
+    """Append a timestamped entry to LOG.md in project root. Returns the file path."""
+    project = projects.get(project_id)
+    if not project:
+        return ""
+    path = Path(project.project_dir) / "LOG.md"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"\n---\n**[{timestamp}]**\n\n{entry.strip()}\n"
+    with open(path, "a") as f:
+        f.write(formatted)
+    return str(path)
 
 
 

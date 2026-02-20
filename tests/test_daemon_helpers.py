@@ -88,3 +88,51 @@ def test_submit_report_writes_file_and_captures(tmp_path):
     captured.append(report_text)
     assert len(captured) == 1
     assert captured[0] == report_text
+
+
+# ── _append_log ──────────────────────────────────────────────────────
+
+
+def test_append_log_creates_file(tmp_path):
+    """First append_log creates LOG.md with a timestamped entry."""
+    from orchestrator_daemon import _append_log, projects, Project
+
+    projects["log_test"] = Project(
+        project_id="log_test", project_dir=str(tmp_path), name="test"
+    )
+    try:
+        _append_log("log_test", "Hypothesis: reward hacking causing plateau")
+        log_path = tmp_path / "LOG.md"
+        assert log_path.exists()
+        content = log_path.read_text()
+        assert "reward hacking causing plateau" in content
+        assert "---" in content
+    finally:
+        projects.pop("log_test", None)
+
+
+def test_append_log_appends_multiple_entries(tmp_path):
+    """Multiple append_log calls accumulate entries chronologically."""
+    from orchestrator_daemon import _append_log, projects, Project
+
+    projects["log_test2"] = Project(
+        project_id="log_test2", project_dir=str(tmp_path), name="test"
+    )
+    try:
+        _append_log("log_test2", "First entry: starting investigation")
+        _append_log("log_test2", "Second entry: found the root cause")
+        content = (tmp_path / "LOG.md").read_text()
+        # Both entries present in order
+        first_pos = content.index("First entry")
+        second_pos = content.index("Second entry")
+        assert first_pos < second_pos
+        # Two separators
+        assert content.count("---") == 2
+    finally:
+        projects.pop("log_test2", None)
+
+
+def test_append_log_unknown_project():
+    """append_log returns empty string for unknown project."""
+    from orchestrator_daemon import _append_log
+    assert _append_log("nonexistent", "test") == ""

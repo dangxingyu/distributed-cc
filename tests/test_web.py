@@ -747,3 +747,36 @@ async def test_progress_task_list_sent_to_ws(aiohttp_client):
 
     await ws.close()
     await store.close()
+
+
+async def test_progress_log_update_sent_to_ws(aiohttp_client):
+    """log_update progress event emits a log_update WS message."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("log-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()  # channel_switched
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {
+            "type": "log_update",
+            "data": "Hypothesis: reward hacking causing plateau",
+            "iteration": 1,
+            "ts": 400.0,
+        },
+    )
+
+    messages = []
+    for _ in range(2):
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        messages.append(msg)
+
+    log_msg = next(m for m in messages if m["type"] == "log_update")
+    assert "reward hacking" in log_msg["data"]
+    assert log_msg["iteration"] == 1
+
+    await ws.close()
+    await store.close()
