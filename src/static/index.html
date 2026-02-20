@@ -363,15 +363,75 @@ body {
   align-items: center;
   justify-content: center;
   color: var(--text-muted);
-  font-size: 15px;
-  gap: 8px;
+  font-size: 14px;
+  gap: 20px;
+  padding: 40px;
 }
 
-#no-channel-msg::before {
-  content: '#';
-  font-size: 48px;
+.onboard-logo {
+  font-size: 36px;
   font-weight: 800;
-  opacity: 0.15;
+  color: var(--accent);
+  opacity: 0.25;
+  letter-spacing: -1px;
+}
+
+.onboard-title {
+  font-size: 16px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.onboard-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 360px;
+  width: 100%;
+}
+
+.onboard-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.12s ease;
+}
+
+.onboard-step:hover {
+  border-color: var(--border-light);
+}
+
+.onboard-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.onboard-step-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.onboard-step-text code {
+  background: rgba(0,0,0,0.25);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', monospace;
+  font-size: 12px;
+  color: var(--accent);
 }
 
 /* ── Message bubbles ────────────────────────────── */
@@ -380,10 +440,36 @@ body {
   padding: 6px 0;
   line-height: 1.6;
   max-width: 85%;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
 }
 
 .msg-user {
   align-self: flex-start;
+}
+
+.msg-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  margin-top: 2px;
+}
+
+.msg-user .msg-avatar { background: var(--blue-dim); color: var(--blue); border: 1px solid rgba(137, 180, 250, 0.2); }
+.msg-orchestrator .msg-avatar { background: var(--green-dim); color: var(--green); border: 1px solid rgba(166, 227, 161, 0.2); }
+.msg-worker .msg-avatar { background: var(--orange-dim); color: var(--orange); border: 1px solid rgba(250, 179, 135, 0.2); }
+.msg-system .msg-avatar { display: none; }
+
+.msg-content {
+  flex: 1;
+  min-width: 0;
 }
 
 .msg-header {
@@ -535,6 +621,69 @@ body {
   font-style: italic;
   font-size: 12.5px;
   padding: 4px 0;
+}
+
+.msg-system { padding-left: 40px; }
+
+/* ── Message collapsing ─────────────────────────── */
+
+.msg-body-wrapper {
+  position: relative;
+}
+
+.msg-body-wrapper.collapsed .msg-body {
+  max-height: 180px;
+  overflow: hidden;
+}
+
+.msg-body-wrapper.collapsed::after {
+  content: '';
+  position: absolute;
+  bottom: 28px;
+  left: 0;
+  right: 0;
+  height: 48px;
+  background: linear-gradient(transparent, var(--bg-primary));
+  pointer-events: none;
+  border-radius: 0 0 8px 8px;
+}
+
+.msg-orchestrator .msg-body-wrapper.collapsed::after {
+  background: linear-gradient(transparent, #1a2420);
+}
+
+.msg-worker .msg-body-wrapper.collapsed::after {
+  background: linear-gradient(transparent, #221e1a);
+}
+
+.msg-user .msg-body-wrapper.collapsed::after {
+  background: linear-gradient(transparent, #1e1b24);
+}
+
+.msg-expand-btn {
+  display: none;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 3px 12px;
+  cursor: pointer;
+  margin-top: 4px;
+  transition: all 0.12s ease;
+}
+
+.msg-body-wrapper.collapsed .msg-expand-btn,
+.msg-body-wrapper.expanded .msg-expand-btn {
+  display: inline-block;
+}
+
+.msg-expand-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-light);
 }
 
 /* ── Typing indicator ───────────────────────────── */
@@ -857,13 +1006,26 @@ body {
 }
 
 .log-entry {
-  padding: 3px 14px;
-  border-bottom: 1px solid rgba(51, 51, 77, 0.4);
-  word-break: break-all;
+  padding: 4px 14px;
+  word-break: break-word;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border-left: 2px solid transparent;
+  transition: background 0.08s ease;
+}
+
+.log-entry:hover {
+  background: rgba(255,255,255,0.02);
+}
+
+.log-entry + .log-entry {
+  border-top: 1px solid rgba(51, 51, 77, 0.25);
 }
 
 .log-entry-tool {
-  color: var(--blue);
+  color: var(--text-secondary);
+  border-left-color: var(--blue);
 }
 
 .log-entry-text {
@@ -872,18 +1034,62 @@ body {
 
 .log-entry-error {
   color: var(--red);
+  border-left-color: var(--red);
+  background: rgba(243, 139, 168, 0.04);
 }
 
 .log-entry-iteration {
   color: var(--accent);
   font-weight: 500;
+  border-left-color: var(--accent);
+  background: rgba(203, 166, 247, 0.04);
 }
 
 .log-time {
   color: var(--text-muted);
-  opacity: 0.6;
-  margin-right: 6px;
+  opacity: 0.5;
   font-size: 10px;
+  flex-shrink: 0;
+  padding-top: 1px;
+  min-width: 58px;
+}
+
+.log-source {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  line-height: 1.5;
+}
+
+.log-source-orch {
+  background: var(--green-dim);
+  color: var(--green);
+}
+
+.log-source-worker {
+  background: var(--orange-dim);
+  color: var(--orange);
+}
+
+.log-source-system {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.log-tool-name {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.log-content {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #monitor-btn {
@@ -937,7 +1143,24 @@ body {
     </div>
   </div>
 
-  <div id="no-channel-msg">Select or create a channel to start</div>
+  <div id="no-channel-msg">
+    <div class="onboard-logo">dcc</div>
+    <div class="onboard-title">Get started with distributed Claude Code</div>
+    <div class="onboard-steps">
+      <div class="onboard-step">
+        <div class="onboard-num">1</div>
+        <div class="onboard-step-text">Create a channel with <strong>+ New Channel</strong> in the sidebar</div>
+      </div>
+      <div class="onboard-step">
+        <div class="onboard-num">2</div>
+        <div class="onboard-step-text">Deploy a daemon with <code>/setup user@host</code> or connect with <code>/connect project-id</code></div>
+      </div>
+      <div class="onboard-step">
+        <div class="onboard-num">3</div>
+        <div class="onboard-step-text">Send a task — the orchestrator will plan, decompose, and assign workers autonomously</div>
+      </div>
+    </div>
+  </div>
   <div id="messages" style="display:none"></div>
 
   <div id="typing-indicator"></div>
@@ -1083,19 +1306,33 @@ function scrollToBottom() {
 
 function addMessage(text, cssClass, tsSeconds) {
   let label = 'Orchestrator';
+  let avatarLetter = 'O';
   let body = text;
 
   if (cssClass === 'msg-user') {
     label = 'You';
-    body = text;
+    avatarLetter = 'Y';
   } else if (cssClass === 'msg-worker') {
     label = 'Worker';
+    avatarLetter = 'W';
   } else if (cssClass === 'msg-system') {
     label = 'System';
   }
 
   const div = document.createElement('div');
   div.className = 'msg ' + cssClass;
+
+  // Avatar (hidden for system messages via CSS)
+  if (cssClass !== 'msg-system') {
+    const avatar = document.createElement('div');
+    avatar.className = 'msg-avatar';
+    avatar.textContent = avatarLetter;
+    div.appendChild(avatar);
+  }
+
+  // Content wrapper
+  const content = document.createElement('div');
+  content.className = 'msg-content';
 
   const header = document.createElement('div');
   header.className = 'msg-header';
@@ -1111,6 +1348,10 @@ function addMessage(text, cssClass, tsSeconds) {
   header.appendChild(sender);
   header.appendChild(time);
 
+  // Body wrapper (for collapsing long messages)
+  const bodyWrapper = document.createElement('div');
+  bodyWrapper.className = 'msg-body-wrapper';
+
   const bodyEl = document.createElement('div');
   bodyEl.className = 'msg-body';
   if (cssClass === 'msg-user') {
@@ -1119,9 +1360,36 @@ function addMessage(text, cssClass, tsSeconds) {
     bodyEl.innerHTML = renderMarkdown(body);
   }
 
-  div.appendChild(header);
-  div.appendChild(bodyEl);
+  const expandBtn = document.createElement('button');
+  expandBtn.className = 'msg-expand-btn';
+  expandBtn.textContent = 'Show more';
+
+  bodyWrapper.appendChild(bodyEl);
+  bodyWrapper.appendChild(expandBtn);
+
+  content.appendChild(header);
+  content.appendChild(bodyWrapper);
+  div.appendChild(content);
   messagesEl.appendChild(div);
+
+  // Check if message needs collapsing (after render)
+  requestAnimationFrame(() => {
+    if (bodyEl.scrollHeight > 220) {
+      bodyWrapper.classList.add('collapsed');
+      expandBtn.addEventListener('click', () => {
+        if (bodyWrapper.classList.contains('collapsed')) {
+          bodyWrapper.classList.remove('collapsed');
+          bodyWrapper.classList.add('expanded');
+          expandBtn.textContent = 'Show less';
+        } else {
+          bodyWrapper.classList.remove('expanded');
+          bodyWrapper.classList.add('collapsed');
+          expandBtn.textContent = 'Show more';
+        }
+      });
+    }
+  });
+
   scrollToBottom();
 }
 
@@ -1342,22 +1610,87 @@ let _monitorScrollPending = false;
 
 function addLogEntry(text, ts) {
   const entry = document.createElement('div');
-  const isError = text.startsWith('[ERROR]') || /\[error\]/i.test(text);
-  const isToolCall = /^→\s/.test(text) || /\[orchestrator\s*->\s*worker\]/.test(text);
-  const isIteration = /^(Worker assignment|Starting task|Iteration)\s/i.test(text);
-  const cls = isError ? 'log-entry-error' : isIteration ? 'log-entry-iteration' : isToolCall ? 'log-entry-tool' : 'log-entry-text';
-  entry.className = 'log-entry ' + cls;
 
-  const time = document.createElement('span');
-  time.className = 'log-time';
+  // Parse log entry to extract source, tool name, and display text
+  const isError = text.startsWith('[ERROR]');
+  const assignMatch = text.match(/^→\s*\[orchestrator\s*->\s*worker\]\s*(.*)/s);
+  const toolMatch = text.match(/^→\s*\[(orchestrator|worker)\]\s*(\w+):\s*(.*)/s);
+  const orchText = text.match(/^\[orchestrator\]\s*(.*)/s);
+  const atOrchWorker = text.match(/^@orchestrator\s*->\s*@worker:\s*(.*)/s);
+  const atWorkerOrch = text.match(/^@worker\s*->\s*@orchestrator:\s*(.*)/s);
+  const isIteration = /^(Worker assignment|Starting task)/i.test(text);
+
+  let entryClass, source, toolName, displayText;
+
+  if (isError) {
+    entryClass = 'log-entry-error';
+    source = 'system';
+    displayText = text.replace(/^\[ERROR\]\s*/, '');
+  } else if (assignMatch) {
+    entryClass = 'log-entry-iteration';
+    source = 'orchestrator';
+    toolName = 'assign';
+    displayText = assignMatch[1];
+  } else if (toolMatch) {
+    entryClass = 'log-entry-tool';
+    source = toolMatch[1];
+    toolName = toolMatch[2];
+    displayText = toolMatch[3];
+  } else if (isIteration) {
+    entryClass = 'log-entry-iteration';
+    source = 'system';
+    displayText = text;
+  } else if (orchText) {
+    entryClass = 'log-entry-text';
+    source = 'orchestrator';
+    displayText = orchText[1];
+  } else if (atOrchWorker) {
+    entryClass = 'log-entry-text';
+    source = 'orchestrator';
+    displayText = atOrchWorker[1];
+  } else if (atWorkerOrch) {
+    entryClass = 'log-entry-text';
+    source = 'worker';
+    displayText = atWorkerOrch[1];
+  } else {
+    entryClass = 'log-entry-text';
+    source = null;
+    displayText = text;
+  }
+
+  entry.className = 'log-entry ' + entryClass;
+
+  // Timestamp
+  const timeEl = document.createElement('span');
+  timeEl.className = 'log-time';
   const d = ts ? new Date(ts * 1000) : new Date();
-  time.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  timeEl.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  entry.appendChild(timeEl);
 
-  const content = document.createElement('span');
-  content.textContent = text;
+  // Source badge
+  if (source) {
+    const badge = document.createElement('span');
+    const badgeClass = source === 'orchestrator' ? 'log-source-orch'
+      : source === 'worker' ? 'log-source-worker' : 'log-source-system';
+    badge.className = 'log-source ' + badgeClass;
+    badge.textContent = source === 'orchestrator' ? 'orch' : source;
+    entry.appendChild(badge);
+  }
 
-  entry.appendChild(time);
-  entry.appendChild(content);
+  // Tool name badge
+  if (toolName) {
+    const toolEl = document.createElement('span');
+    toolEl.className = 'log-tool-name';
+    toolEl.textContent = toolName;
+    entry.appendChild(toolEl);
+  }
+
+  // Content
+  const contentEl = document.createElement('span');
+  contentEl.className = 'log-content';
+  contentEl.textContent = displayText;
+  entry.appendChild(contentEl);
+
   monitorLog.appendChild(entry);
 
   if (!_monitorScrollPending) {
@@ -1451,15 +1784,27 @@ const COMMANDS = [
   { name: '/done', args: '', desc: 'Exit setup mode' },
 ];
 
+const MENTIONS = [
+  { name: '@orchestrator', args: '<message>', desc: 'Urgent interrupt to orchestrator' },
+];
+
 let _cmdSelectedIdx = -1;
 let _cmdVisible = false;
 let _cmdFiltered = [];
 
 function renderCommandPalette(filter) {
   const query = (filter || '').toLowerCase();
-  _cmdFiltered = COMMANDS.filter(c => c.name.startsWith(query));
 
-  if (_cmdFiltered.length === 0 || !query.startsWith('/')) {
+  if (query.startsWith('/')) {
+    _cmdFiltered = COMMANDS.filter(c => c.name.startsWith(query));
+  } else if (query.startsWith('@')) {
+    _cmdFiltered = MENTIONS.filter(c => c.name.startsWith(query));
+  } else {
+    hideCommandPalette();
+    return;
+  }
+
+  if (_cmdFiltered.length === 0) {
     hideCommandPalette();
     return;
   }
@@ -1536,11 +1881,11 @@ inputEl.addEventListener('input', function() {
   this.style.height = 'auto';
   this.style.height = Math.min(this.scrollHeight, 120) + 'px';
 
-  // command palette
+  // command palette — triggers on / or @, hides once args start
   const text = this.value.trim();
-  if (text.startsWith('/') && !text.includes('\n')) {
-    const firstWord = text.split(/\s/)[0];
-    renderCommandPalette(firstWord);
+  const hasSpace = text.includes(' ');
+  if ((text.startsWith('/') || text.startsWith('@')) && !text.includes('\n') && !hasSpace) {
+    renderCommandPalette(text);
   } else {
     hideCommandPalette();
   }
