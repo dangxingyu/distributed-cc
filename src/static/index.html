@@ -1921,7 +1921,10 @@ function hideCommandPalette() {
 function selectCommand(idx) {
   if (idx < 0 || idx >= _cmdFiltered.length) return;
   const cmd = _cmdFiltered[idx];
-  inputEl.value = cmd.name + (cmd.args ? ' ' : '');
+  // Preserve @mention prefix if present (e.g. "@router /setup")
+  const mentionMatch = inputEl.value.trim().match(/^(@\w+\s+)\/\S*$/);
+  const prefix = mentionMatch ? mentionMatch[1] : '';
+  inputEl.value = prefix + cmd.name + (cmd.args ? ' ' : '');
   inputEl.focus();
   hideCommandPalette();
 
@@ -1953,8 +1956,13 @@ inputEl.addEventListener('input', function() {
 
   // command palette — triggers on / or @, hides once args start
   const text = this.value.trim();
-  const hasSpace = text.includes(' ');
-  if ((text.startsWith('/') || text.startsWith('@')) && !text.includes('\n') && !hasSpace) {
+  if (text.includes('\n')) { hideCommandPalette(); return; }
+
+  // Check for @mention prefix followed by a /command (e.g. "@router /setup")
+  const mentionCmdMatch = text.match(/^@\w+\s+(\/\S*)$/);
+  if (mentionCmdMatch) {
+    renderCommandPalette(mentionCmdMatch[1]);
+  } else if ((text.startsWith('/') || text.startsWith('@')) && !text.includes(' ')) {
     renderCommandPalette(text);
   } else {
     hideCommandPalette();
