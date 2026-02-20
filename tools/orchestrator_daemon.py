@@ -610,11 +610,13 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         # If orchestrator ended without calling task_complete
         if state.status == "running":
             state.status = "done"
-            state.summary = "Orchestrator session ended (max turns or natural completion)"
+            state.summary = "Orchestrator session ended naturally"
             state.finished_at = time.time()
+            # Empty data so web layer only shows progress status, not a chat message
+            # (only explicit task_complete summaries should appear in chat)
             await emit_progress(
                 project_id,
-                ProgressEvent(type="done", data=state.summary, iteration=state.iteration),
+                ProgressEvent(type="done", data="", iteration=state.iteration),
             )
 
     except asyncio.CancelledError:

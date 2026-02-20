@@ -313,6 +313,12 @@ class WebChat:
                 sender = "worker" if data_text.startswith("@worker") else "orchestrator"
                 await self._store.add_message(chat_id, "assistant", data_text, sender=sender)
                 await self._ws_send_to_channel(chat_id, {"type": "reply", "text": data_text, "sender": sender, "ts": ts})
+            elif data_text.startswith("[orchestrator]"):
+                # Surface orchestrator's own text in chat (strip prefix)
+                clean_text = data_text[len("[orchestrator]"):].strip()
+                if clean_text:
+                    await self._store.add_message(chat_id, "assistant", clean_text, sender="orchestrator")
+                    await self._ws_send_to_channel(chat_id, {"type": "reply", "text": clean_text, "sender": "orchestrator", "ts": ts})
         elif event_type == "tool_use":
             line = f"→ {data_text}"
             await self._store.add_log(chat_id, line)
