@@ -18,8 +18,6 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
-
 from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 from claude_agent_sdk.types import (
     AssistantMessage,
@@ -93,30 +91,26 @@ When asked to set up a server (e.g., `/setup user@server`):
    curl http://127.0.0.1:LOCAL_PORT/health
    ```
 
-=== CURRENT CONFIG ===
+=== CONFIG ===
 
-```json
-{config_snapshot}
-```
-
-=== CONFIG FORMAT ===
+Read `config.json` in the project root to see the current server configuration.
 
 The config.json has this structure:
 ```json
-{{
+{
   "servers": [
-    {{
+    {
       "name": "server-name",
       "host": "user@hostname",    // SSH destination, null for local
       "work_dir": "/path/to/project",
       "broker_port": 8200         // local port for SSH tunnel
-    }}
+    }
   ],
-  "orchestrator": {{
+  "orchestrator": {
     "model": "claude-opus-4-6",
     "session_model": "claude-opus-4-6"
-  }}
-}}
+  }
+}
 ```
 
 Each server needs a unique `broker_port` for its SSH tunnel.
@@ -191,15 +185,6 @@ class RouterSession:
         self._progress_callback = progress
         self._log_callback = log
 
-    def _get_config_snapshot(self) -> str:
-        """Read current config.json for injection into the system prompt."""
-        config_path = os.path.join(self._cwd, "config.json")
-        try:
-            with open(config_path) as f:
-                return f.read()
-        except FileNotFoundError:
-            return '{"servers": [], "orchestrator": {}}'
-
     async def run(self, user_message: str) -> str:
         """Run a sysadmin task. Returns the result text."""
         os.environ.pop("CLAUDECODE", None)
@@ -220,10 +205,7 @@ class RouterSession:
         if self._session_id:
             options.resume = self._session_id
         else:
-            config_snapshot = self._get_config_snapshot()
-            options.system_prompt = SYSADMIN_PROMPT.format(
-                config_snapshot=config_snapshot
-            )
+            options.system_prompt = SYSADMIN_PROMPT
 
         done_event = asyncio.Event()
         result_text = ""

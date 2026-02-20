@@ -121,26 +121,6 @@ async def test_router_session_resume():
     assert s.session_id == "sess-abc123"
 
 
-# ── Config snapshot ──────────────────────────────────────────────────────
-
-
-def test_get_config_snapshot_missing_file(tmp_path):
-    """Returns default JSON when config.json doesn't exist."""
-    s = RouterSession(cwd=str(tmp_path))
-    snapshot = s._get_config_snapshot()
-    assert "servers" in snapshot
-
-
-def test_get_config_snapshot_reads_file(tmp_path):
-    """Reads actual config.json content."""
-    config = '{"servers": [{"name": "test"}]}'
-    (tmp_path / "config.json").write_text(config)
-
-    s = RouterSession(cwd=str(tmp_path))
-    snapshot = s._get_config_snapshot()
-    assert snapshot == config
-
-
 # ── Prompt stream ────────────────────────────────────────────────────────
 
 

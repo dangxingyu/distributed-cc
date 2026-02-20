@@ -94,12 +94,14 @@ WORKER_PROMPT = """\
 You are a WORKER agent. Execute the orchestrator assignment end-to-end.
 Focus on concrete actions and evidence.
 
-End with:
-[WORKER_REPORT]
-Summary: <what you changed/checked and outcomes>
+When finished, call the **submit_report** tool with a structured report covering:
+1. **What was done**: Specific actions, files modified, commands run
+2. **Results & Evidence**: Test output, verification results, key findings
+3. **Issues** (if any): Blockers, partial results, open questions
 
-If blocked, still use [WORKER_REPORT] and describe blocker + attempts.
-Do not decide overall user-task completion.
+Be concrete — include file paths, line numbers, test counts, error messages.
+If blocked, still submit a report describing the blocker and what you attempted.
+Do not decide overall user-task completion — just report your work.
 """
 
 
@@ -217,6 +219,42 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
 # -- worker execution --------------------------------------------------
 
 
+def _create_worker_tools(project_id: str, iteration: int, captured_report: list):
+    """Create MCP server with the worker's submit_report tool.
+
+    The submit_report tool writes a structured report to .reports/iteration-N.md
+    and captures the content via the `captured_report` list so the daemon can
+    return it to the orchestrator as the assign_worker result.
+    """
+    project = projects.get(project_id)
+    reports_dir = Path(project.project_dir) / ".reports" if project else Path("/tmp/.reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    @tool(
+        "submit_report",
+        "Submit your work report when you've completed the assignment. "
+        "Write a structured, comprehensive report covering:\n"
+        "1. **What was done**: Specific actions taken, files modified, commands run\n"
+        "2. **Results & Evidence**: Test output, verification results, key findings\n"
+        "3. **Issues** (if any): Blockers, partial results, open questions\n\n"
+        "Be concrete — include file paths, line numbers, test counts, error messages. "
+        "This report goes directly to the orchestrator for review.",
+        {"report": str},
+    )
+    async def submit_report(args):
+        report_text = args["report"]
+        report_path = reports_dir / f"iteration-{iteration}.md"
+        report_path.write_text(report_text)
+        captured_report.append(report_text)
+        return {"content": [{"type": "text", "text":
+            f"Report submitted and saved to .reports/iteration-{iteration}.md"}]}
+
+    return create_sdk_mcp_server(
+        "worker_tools",
+        tools=[submit_report],
+    )
+
+
 async def _run_worker_turn(
     project_id: str,
     assignment: str,
@@ -228,12 +266,17 @@ async def _run_worker_turn(
     if not project:
         return "Worker failed: unknown project.", worker_session_id
 
+    # Capture report content via closure
+    captured_report: list[str] = []
+    worker_mcp = _create_worker_tools(project_id, iteration, captured_report)
+
     options = ClaudeAgentOptions(
         permission_mode="bypassPermissions",
         model="claude-opus-4-6",
         cwd=project.project_dir,
         max_turns=50,
         setting_sources=["project"],  # loads CLAUDE.md from project dir natively
+        mcp_servers={"worker_tools": worker_mcp},
     )
 
     if worker_session_id:
@@ -241,17 +284,11 @@ async def _run_worker_turn(
     else:
         options.system_prompt = WORKER_PROMPT
 
-    prompt = (
-        "[WORKER_TASK]\n"
-        f"{assignment}\n\n"
-        "Execute this assignment and provide evidence. End with [WORKER_REPORT]."
-    )
-
     result_text = ""
     done_event = asyncio.Event()
 
     try:
-        async for message in query(prompt=_prompt_stream(prompt, done_event), options=options):
+        async for message in query(prompt=_prompt_stream(assignment, done_event), options=options):
             if isinstance(message, AssistantMessage):
                 await _forward_assistant_message(
                     project_id, message, iteration, source="worker"
@@ -273,9 +310,11 @@ async def _run_worker_turn(
         )
         return f"Worker failed: {e}", worker_session_id
 
-    report = _extract_after_marker(result_text, "[WORKER_REPORT]")
-    if not report:
-        report = result_text.strip() or "Worker returned empty report."
+    # Use the report submitted via MCP tool; fall back to session result
+    if captured_report:
+        report = captured_report[-1]
+    else:
+        report = result_text.strip() or "Worker returned without submitting a report."
 
     return report, worker_session_id
 
@@ -620,43 +659,6 @@ def _drain_interruptions(project_id: str) -> list[str]:
             break
     return msgs
 
-
-def _extract_after_marker(text: str, marker: str) -> str:
-    """Extract all text after a marker until the next marker or end of text.
-
-    Strips optional label prefixes (Summary:, Question:, WorkerTask:) from
-    the first line, then captures everything until a line starting with '['.
-    """
-    idx = text.find(marker)
-    if idx < 0:
-        return ""
-
-    rest = text[idx + len(marker) :].strip()
-    if not rest:
-        return ""
-
-    lines = rest.split("\n")
-    result_lines = []
-    for line in lines:
-        stripped = line.strip()
-        # Stop at the next marker (e.g. [TASK_COMPLETE], [ASSIGN_WORKER])
-        if stripped.startswith("[") and stripped.endswith("]") and len(stripped) > 2:
-            break
-        if not result_lines:
-            # Strip optional label prefix on first content line
-            for prefix in ("Summary:", "Question:", "WorkerTask:"):
-                if stripped.startswith(prefix):
-                    stripped = stripped[len(prefix) :].strip()
-                    break
-        result_lines.append(stripped)
-
-    # Drop leading/trailing empty lines
-    while result_lines and not result_lines[0]:
-        result_lines.pop(0)
-    while result_lines and not result_lines[-1]:
-        result_lines.pop()
-
-    return "\n".join(result_lines) if result_lines else ""
 
 
 
