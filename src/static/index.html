@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>distributed-cc</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
@@ -1218,6 +1219,11 @@ let channelMembers = [];
 let currentProjectId = null;
 let currentProjectStatus = 'unknown';
 let currentIteration = 0;
+const requestScopes = {
+  history: { token: 0, controller: null },
+  members: { token: 0, controller: null },
+  logs: { token: 0, controller: null },
+};
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -1288,12 +1294,39 @@ function hideTypingIndicator() {
 
 // ── Message rendering ────────────────────────────────────────────────
 
-function renderMarkdown(text) {
-  if (typeof marked !== 'undefined') {
-    marked.setOptions({ breaks: true, gfm: true });
-    return marked.parse(text);
+if (typeof marked !== 'undefined') {
+  marked.setOptions({ breaks: true, gfm: true });
+}
+
+function sanitizeHtml(html) {
+  if (typeof DOMPurify !== 'undefined') {
+    return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
   }
-  return escapeHtml(text).replace(/\n/g, '<br>');
+
+  // Conservative fallback for environments where DOMPurify fails to load.
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  template.content.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach((node) => node.remove());
+  template.content.querySelectorAll('*').forEach((el) => {
+    for (const attr of [...el.attributes]) {
+      const name = attr.name.toLowerCase();
+      const value = attr.value.trim();
+      if (name.startsWith('on')) {
+        el.removeAttribute(attr.name);
+      } else if ((name === 'href' || name === 'src' || name === 'xlink:href') && /^javascript:/i.test(value)) {
+        el.removeAttribute(attr.name);
+      }
+    }
+  });
+  return template.innerHTML;
+}
+
+function renderMarkdown(text) {
+  const source = typeof text === 'string' ? text : String(text ?? '');
+  if (typeof marked !== 'undefined') {
+    return sanitizeHtml(marked.parse(source));
+  }
+  return escapeHtml(source).replace(/\n/g, '<br>');
 }
 
 // Fallback for old stored messages without sender field
@@ -1317,6 +1350,7 @@ const SENDER_CONFIG = {
 };
 
 function addMessage(text, sender, tsSeconds) {
+  const body = typeof text === 'string' ? text : String(text ?? '');
   const cfg = SENDER_CONFIG[sender] || SENDER_CONFIG.orchestrator;
   const cssClass = cfg.css;
   const label = cfg.label;
@@ -1444,9 +1478,6 @@ function deleteChannel(channelId, name) {
 function switchChannel(channelId) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: 'switch_channel', channel_id: channelId }));
-  loadHistory(channelId);
-  loadMembers(channelId);
-  loadLogs(channelId);
 }
 
 function onChannelSwitched(data) {
@@ -1467,6 +1498,7 @@ function onChannelSwitched(data) {
   clearAwaitingInput();
 
   updateProjectBadge(currentProjectStatus, 0);
+  refreshActiveChannelData(activeChannel);
   renderChannelList();
 }
 
@@ -1512,16 +1544,43 @@ newChannelBtn.addEventListener('click', createChannel);
 
 // ── Members ─────────────────────────────────────────────────────────
 
-function loadMembers(channelId) {
-  fetch('/api/channels/' + channelId + '/members')
+function beginScopedRequest(scopeName) {
+  const scope = requestScopes[scopeName];
+  if (!scope) return { token: 0, signal: undefined };
+
+  scope.token += 1;
+  if (scope.controller) scope.controller.abort();
+  scope.controller = new AbortController();
+  return { token: scope.token, signal: scope.controller.signal };
+}
+
+function isActiveRequest(scopeName, token, channelId) {
+  const scope = requestScopes[scopeName];
+  return !!scope && scope.token === token && activeChannel === channelId;
+}
+
+function refreshActiveChannelData(channelId) {
+  const historyReq = beginScopedRequest('history');
+  const membersReq = beginScopedRequest('members');
+  const logsReq = beginScopedRequest('logs');
+  loadHistory(channelId, historyReq);
+  loadMembers(channelId, membersReq);
+  loadLogs(channelId, logsReq);
+}
+
+function loadMembers(channelId, req = beginScopedRequest('members')) {
+  fetch('/api/channels/' + channelId + '/members', { signal: req.signal })
     .then(r => r.json())
     .then(members => {
+      if (!isActiveRequest('members', req.token, channelId)) return;
       channelMembers = members;
       membersBtn.style.display = '';
       membersBtn.childNodes[0].textContent = members.length + ' members ';
       renderMembersPopover();
     })
-    .catch(() => {
+    .catch((err) => {
+      if (err && err.name === 'AbortError') return;
+      if (!isActiveRequest('members', req.token, channelId)) return;
       channelMembers = [];
       membersBtn.style.display = 'none';
     });
@@ -1563,29 +1622,39 @@ function sendMessage() {
   clearAwaitingInput();
 }
 
-function loadHistory(channelId) {
-  fetch('/api/history?channel=' + channelId)
+function loadHistory(channelId, req = beginScopedRequest('history')) {
+  fetch('/api/history?channel=' + channelId, { signal: req.signal })
     .then(r => r.json())
     .then(messages => {
+      if (!isActiveRequest('history', req.token, channelId)) return;
       messagesEl.innerHTML = '';
       for (const msg of messages) {
         const sender = msg.sender || (msg.role === 'user' ? 'user' : classifyMessageLegacy(msg.content));
         addMessage(msg.content, sender, msg.ts);
       }
     })
-    .catch(err => console.error('Failed to load history:', err));
+    .catch((err) => {
+      if (err && err.name === 'AbortError') return;
+      if (!isActiveRequest('history', req.token, channelId)) return;
+      console.error('Failed to load history:', err);
+    });
 }
 
-function loadLogs(channelId) {
-  fetch('/api/logs?channel=' + channelId)
+function loadLogs(channelId, req = beginScopedRequest('logs')) {
+  fetch('/api/logs?channel=' + channelId, { signal: req.signal })
     .then(r => r.json())
     .then(logs => {
+      if (!isActiveRequest('logs', req.token, channelId)) return;
       monitorLog.innerHTML = '';
       for (const entry of logs) {
         addLogEntry(entry.text, entry.ts);
       }
     })
-    .catch(err => console.error('Failed to load logs:', err));
+    .catch((err) => {
+      if (err && err.name === 'AbortError') return;
+      if (!isActiveRequest('logs', req.token, channelId)) return;
+      console.error('Failed to load logs:', err);
+    });
 }
 
 sendBtn.addEventListener('click', sendMessage);
@@ -1980,7 +2049,13 @@ function connect() {
   };
 
   ws.onmessage = function(event) {
-    const data = JSON.parse(event.data);
+    let data = null;
+    try {
+      data = JSON.parse(event.data);
+    } catch (err) {
+      console.error('Invalid WebSocket payload:', err);
+      return;
+    }
 
     if (data.type === 'channel_switched') {
       onChannelSwitched(data);
@@ -2031,10 +2106,12 @@ function connect() {
     } else if (data.type === 'reply') {
       const sender = data.sender || classifyMessageLegacy(data.text);
       addMessage(data.text, sender, data.ts);
-      if (activeChannel !== null) loadMembers(activeChannel);
+      if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
 
     } else if (data.type === 'error') {
       addMessage('Error: ' + data.text, 'system', data.ts);
+    } else {
+      console.warn('Unhandled WebSocket message type:', data.type);
     }
   };
 }
