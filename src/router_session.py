@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-"""SetupSession: local sysadmin Claude session for server setup and daemon deployment.
+"""RouterSession: local sysadmin Claude session for infrastructure management.
 
-Mental model: Professor tells sysadmin "set up della-gpu, it's a SLURM node" →
-Sysadmin (this local Claude session) handles all plumbing → PhD students (remote
-daemons) get a CLAUDE.md with their server constraints.
+The router's local brain — a persistent Claude session that handles all
+infrastructure tasks: deploying daemons, managing config, SSH operations,
+health checks, and any other sysadmin work the user sends via @router.
 
 Features:
   - SSH into servers, detect environments, install daemons
-  - Generate config.json entries and CLAUDE.md files
+  - Manage local config.json and remote CLAUDE.md files
   - Health-check deployed daemons
+  - General infrastructure tasks via @router messages
   - Persistent session with resume (context carries across follow-ups)
 """
 
@@ -163,8 +164,8 @@ When asked to check health (`/setup` with no args):
 """
 
 
-class SetupSession:
-    """Wraps a local Claude Agent SDK session for sysadmin tasks."""
+class RouterSession:
+    """Local sysadmin Claude session for the router — handles infra and config tasks."""
 
     def __init__(self, cwd: str = "."):
         self._cwd = os.path.abspath(cwd)
@@ -257,14 +258,14 @@ class SetupSession:
                     tool_msg += f": {snippet}"
                 if self._log_callback:
                     try:
-                        await self._log_callback(f"setup -> {tool_msg}")
+                        await self._log_callback(f"router -> {tool_msg}")
                     except Exception:
                         pass
             elif isinstance(block, ToolResultBlock):
                 if block.is_error and self._log_callback:
                     content = block.content if isinstance(block.content, str) else str(block.content or "")
                     try:
-                        await self._log_callback(f"[setup ERROR] {content[:500]}")
+                        await self._log_callback(f"[router ERROR] {content[:500]}")
                     except Exception:
                         pass
 

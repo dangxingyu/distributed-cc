@@ -4,7 +4,7 @@ Responsibilities:
   1. Route user messages: idle -> POST /task, running -> urgent interrupt or deferred queue
   2. Listen to daemon SSE and ingest callback progress with dedupe
   3. Track channel <-> project mappings (with optional persistence hook)
-  4. Support setup-mode orchestration via SetupSession
+  4. Local sysadmin session via RouterSession (@router, /setup)
 """
 
 import asyncio
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from .setup import SetupSession
+from .router_session import RouterSession
 
 log = logging.getLogger(__name__)
 
@@ -67,9 +67,9 @@ class Router:
         self._mapping_persist_callback = None  # async (chat_id, project_id|None)
 
         # Setup mode — per-channel sessions and tasks
-        self._setup_sessions: dict[int, SetupSession] = {}
-        self._setup_channels: set[int] = set()
-        self._setup_tasks: dict[int, asyncio.Task] = {}
+        self._router_sessions: dict[int, RouterSession] = {}
+        self._router_channels: set[int] = set()
+        self._router_tasks: dict[int, asyncio.Task] = {}
 
     async def init(self):
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -292,24 +292,24 @@ class Router:
             if not router_body:
                 await send_reply("Message is empty after `@router` prefix.", sender="system")
                 return
-            self._setup_channels.add(chat_id)
-            await self._handle_setup(chat_id, router_body, send_reply, send_log)
+            self._router_channels.add(chat_id)
+            await self._handle_router_message(chat_id, router_body, send_reply, send_log)
             return
 
         # setup mode routing (works without connected project)
         if stripped.startswith("/setup"):
-            self._setup_channels.add(chat_id)
-            await self._handle_setup(chat_id, stripped, send_reply, send_log)
+            self._router_channels.add(chat_id)
+            await self._handle_router_message(chat_id, stripped, send_reply, send_log)
             return
 
-        if chat_id in self._setup_channels:
+        if chat_id in self._router_channels:
             if stripped.startswith("/connect") or stripped == "/done":
-                self._setup_channels.discard(chat_id)
+                self._router_channels.discard(chat_id)
                 if stripped == "/done":
-                    await send_reply("Exited setup mode.")
+                    await send_reply("Exited router session.")
                     return
             else:
-                await self._handle_setup(chat_id, stripped, send_reply, send_log)
+                await self._handle_router_message(chat_id, stripped, send_reply, send_log)
                 return
 
         addressed_to_orchestrator, orchestrator_body = self._strip_prefix(stripped, "@orchestrator")
@@ -527,13 +527,13 @@ class Router:
         except aiohttp.ClientError as e:
             await send_reply(f"Cannot reach daemon: {e}")
 
-    # -- setup mode ----------------------------------------------------
+    # -- router session ------------------------------------------------
 
-    async def _handle_setup(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None):
-        if chat_id not in self._setup_sessions:
-            self._setup_sessions[chat_id] = SetupSession(cwd=self._cwd)
+    async def _handle_router_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None):
+        if chat_id not in self._router_sessions:
+            self._router_sessions[chat_id] = RouterSession(cwd=self._cwd)
 
-        session = self._setup_sessions[chat_id]
+        session = self._router_sessions[chat_id]
 
         # Wrap send_reply to tag setup messages as "router" sender
         async def setup_reply(msg: str):
@@ -565,15 +565,15 @@ class Router:
                     await setup_reply(result)
                 self.reload_config()
             except Exception as e:
-                log.exception("Setup session error: %s", e)
-                await send_reply(f"Setup error: {e}", sender="system")
+                log.exception("Router session error: %s", e)
+                await send_reply(f"Router error: {e}", sender="system")
 
         # Cancel any in-flight setup task for this channel before starting a new one
-        old_task = self._setup_tasks.get(chat_id)
+        old_task = self._router_tasks.get(chat_id)
         if old_task and not old_task.done():
             old_task.cancel()
 
-        self._setup_tasks[chat_id] = asyncio.create_task(_run())
+        self._router_tasks[chat_id] = asyncio.create_task(_run())
 
     def reload_config(self):
         old_ids = set(self._orchestrators.keys())

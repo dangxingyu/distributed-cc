@@ -1,34 +1,34 @@
-"""Tests for SetupSession: init, running flag, progress callbacks, session resume."""
+"""Tests for RouterSession: init, running flag, progress callbacks, session resume."""
 
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.setup import SetupSession, _prompt_stream
+from src.router_session import RouterSession, _prompt_stream
 
 
 # ── Basic state ──────────────────────────────────────────────────────────
 
 
-def test_setup_session_init():
-    """SetupSession starts with no session_id and not running."""
-    s = SetupSession(cwd="/tmp")
+def test_router_session_init():
+    """RouterSession starts with no session_id and not running."""
+    s = RouterSession(cwd="/tmp")
     assert s.session_id is None
     assert s.is_running is False
 
 
-def test_setup_session_init_resolves_cwd():
+def test_router_session_init_resolves_cwd():
     """cwd is resolved to an absolute path."""
-    s = SetupSession(cwd=".")
+    s = RouterSession(cwd=".")
     assert s._cwd.startswith("/")
 
 
 # ── Running flag ─────────────────────────────────────────────────────────
 
 
-async def test_setup_is_running_flag():
+async def test_router_is_running_flag():
     """is_running is True during run(), False after."""
-    s = SetupSession(cwd="/tmp")
+    s = RouterSession(cwd="/tmp")
 
     observed_running = []
 
@@ -45,9 +45,9 @@ async def test_setup_is_running_flag():
     assert s.is_running is False
 
 
-async def test_setup_is_running_flag_on_error():
+async def test_router_is_running_flag_on_error():
     """is_running resets to False even if _run_inner raises."""
-    s = SetupSession(cwd="/tmp")
+    s = RouterSession(cwd="/tmp")
 
     async def failing_run_inner(msg):
         raise RuntimeError("boom")
@@ -62,11 +62,11 @@ async def test_setup_is_running_flag_on_error():
 # ── Progress callbacks ───────────────────────────────────────────────────
 
 
-async def test_setup_progress_callback():
+async def test_router_progress_callback():
     """Progress callback receives text from AssistantMessage TextBlocks."""
     from claude_agent_sdk.types import TextBlock
 
-    s = SetupSession(cwd="/tmp")
+    s = RouterSession(cwd="/tmp")
     received = []
     log_received = []
 
@@ -87,11 +87,11 @@ async def test_setup_progress_callback():
     assert log_received == []
 
 
-async def test_setup_log_callback_on_tool_use():
+async def test_router_log_callback_on_tool_use():
     """Log callback receives tool use events."""
     from claude_agent_sdk.types import ToolUseBlock
 
-    s = SetupSession(cwd="/tmp")
+    s = RouterSession(cwd="/tmp")
     log_received = []
 
     async def on_log(text):
@@ -105,15 +105,15 @@ async def test_setup_log_callback_on_tool_use():
 
     assert len(log_received) == 1
     assert "Bash" in log_received[0]
-    assert "setup ->" in log_received[0]
+    assert "router ->" in log_received[0]
 
 
 # ── Session resume ───────────────────────────────────────────────────────
 
 
-async def test_setup_session_resume():
+async def test_router_session_resume():
     """session_id is preserved after a successful run for resuming."""
-    s = SetupSession(cwd="/tmp")
+    s = RouterSession(cwd="/tmp")
     assert s.session_id is None
 
     # Simulate a run that sets session_id
@@ -126,7 +126,7 @@ async def test_setup_session_resume():
 
 def test_get_config_snapshot_missing_file(tmp_path):
     """Returns default JSON when config.json doesn't exist."""
-    s = SetupSession(cwd=str(tmp_path))
+    s = RouterSession(cwd=str(tmp_path))
     snapshot = s._get_config_snapshot()
     assert "servers" in snapshot
 
@@ -136,7 +136,7 @@ def test_get_config_snapshot_reads_file(tmp_path):
     config = '{"servers": [{"name": "test"}]}'
     (tmp_path / "config.json").write_text(config)
 
-    s = SetupSession(cwd=str(tmp_path))
+    s = RouterSession(cwd=str(tmp_path))
     snapshot = s._get_config_snapshot()
     assert snapshot == config
 
