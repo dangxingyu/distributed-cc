@@ -1850,12 +1850,11 @@ const COMMANDS = [
   { name: '/stop', args: '', desc: 'Stop the current running task' },
   { name: '/status', args: '', desc: 'Show current project status' },
   { name: '/setup', args: '[user@host]', desc: 'Deploy & configure a daemon' },
-  { name: '/done', args: '', desc: 'Exit router session' },
 ];
 
 const MENTIONS = [
-  { name: '@orchestrator', args: '<message>', desc: 'Urgent interrupt to orchestrator' },
-  { name: '@router', args: '<message>', desc: 'Direct message to router/setup' },
+  { name: '@orchestrator', args: '<message>', desc: 'Direct message to orchestrator' },
+  { name: '@router', args: '<message>', desc: 'Direct message to router (sysadmin)' },
 ];
 
 let _cmdSelectedIdx = -1;

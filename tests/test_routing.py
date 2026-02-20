@@ -26,12 +26,14 @@ def _make_router(orchestrators=None):
     return router
 
 
-async def test_route_no_project_connected():
+async def test_route_no_project_connected_goes_to_router():
+    """Plain message with no project connected routes to router (sysadmin)."""
     router = _make_router([RemoteOrchestrator(project_id="test", name="test-srv")])
     send_reply = AsyncMock()
-    await router.route_message(1, "hello", send_reply)
-    send_reply.assert_called_once()
-    assert "connect" in send_reply.call_args[0][0].lower()
+
+    with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_router:
+        await router.route_message(1, "hello", send_reply)
+        mock_router.assert_called_once_with(1, "hello", send_reply, None, None)
 
 
 async def test_route_idle_starts_task():
@@ -421,8 +423,8 @@ async def test_empty_at_orchestrator_message():
 # ── Setup mode routing ────────────────────────────────────────────────
 
 
-async def test_setup_command_enters_router_session_mode():
-    """/setup enters router session and routes to _handle_router_message."""
+async def test_setup_command_routes_to_router():
+    """/setup routes to _handle_router_message."""
     router = _make_router([])
 
     send_reply = AsyncMock()
@@ -431,50 +433,17 @@ async def test_setup_command_enters_router_session_mode():
     with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_setup:
         await router.route_message(1, "/setup user@server", send_reply, send_log)
         mock_setup.assert_called_once_with(1, "/setup user@server", send_reply, send_log, None)
-        assert 1 in router._router_channels
 
 
-async def test_router_session_follow_up_routes():
-    """Follow-up messages in router session route to router session handler."""
-    router = _make_router([
-        RemoteOrchestrator(project_id="proj", name="srv", status="idle"),
-    ])
-    router._channel_project[1] = "proj"
-    router._router_channels.add(1)
-
-    send_reply = AsyncMock()
-    send_log = AsyncMock()
-
-    with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_setup:
-        await router.route_message(1, "this machine uses conda", send_reply, send_log)
-        mock_setup.assert_called_once()
-        assert mock_setup.call_args[0][1] == "this machine uses conda"
-
-
-async def test_router_session_exit_on_done():
-    """/done exits router session."""
-    router = _make_router([])
-    router._router_channels.add(1)
-
-    send_reply = AsyncMock()
-    await router.route_message(1, "/done", send_reply)
-
-    assert 1 not in router._router_channels
-    send_reply.assert_called_once()
-    assert "exited" in send_reply.call_args[0][0].lower()
-
-
-async def test_router_session_exit_on_connect():
-    """/connect exits router session and proceeds with connect handling."""
+async def test_connect_works_from_any_state():
+    """/connect works regardless of prior channel state."""
     router = _make_router([
         RemoteOrchestrator(project_id="proj", name="srv"),
     ])
-    router._router_channels.add(1)
 
     send_reply = AsyncMock()
     await router.route_message(1, "/connect proj", send_reply)
 
-    assert 1 not in router._router_channels
     assert router.get_channel_project(1) == "proj"
 
 
@@ -758,8 +727,6 @@ async def test_router_sessions_are_per_channel():
         await router.route_message(1, "/setup server-a", send_reply_1)
         await router.route_message(2, "/setup server-b", send_reply_2)
 
-        assert 1 in router._router_channels
-        assert 2 in router._router_channels
         assert mock_setup.call_count == 2
         # Each call has the correct chat_id
         assert mock_setup.call_args_list[0][0][0] == 1

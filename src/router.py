@@ -66,9 +66,8 @@ class Router:
         # Optional callback to persist channel mapping
         self._mapping_persist_callback = None  # async (chat_id, project_id|None)
 
-        # Setup mode — per-channel sessions and tasks
+        # Router sessions — per-channel sysadmin Claude sessions
         self._router_sessions: dict[int, RouterSession] = {}
-        self._router_channels: set[int] = set()
         self._router_tasks: dict[int, asyncio.Task] = {}
 
     async def init(self):
@@ -286,41 +285,20 @@ class Router:
     async def route_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None, send_typing: callable = None):
         stripped = text.strip()
 
-        # @router prefix — direct message to the router/setup session
+        # ── Direct messages (@router, @orchestrator) — always work ──
+
         addressed_to_router, router_body = self._strip_prefix(stripped, "@router")
         if addressed_to_router:
             if not router_body:
                 await send_reply("Message is empty after `@router` prefix.", sender="system")
                 return
-            self._router_channels.add(chat_id)
             await self._handle_router_message(chat_id, router_body, send_reply, send_log, send_typing)
             return
 
-        # setup mode routing (works without connected project)
-        if stripped.startswith("/setup"):
-            self._router_channels.add(chat_id)
-            await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
-            return
-
-        if chat_id in self._router_channels:
-            if stripped.startswith("/connect") or stripped == "/done":
-                self._router_channels.discard(chat_id)
-                if stripped == "/done":
-                    await send_reply("Exited router session.")
-                    return
-            elif stripped == "/stop":
-                task = self._router_tasks.get(chat_id)
-                if task and not task.done():
-                    task.cancel()
-                    await send_reply("Router session stopped.", sender="system")
-                else:
-                    await send_reply("No router task running.", sender="system")
-                return
-            else:
-                await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
-                return
-
         addressed_to_orchestrator, orchestrator_body = self._strip_prefix(stripped, "@orchestrator")
+
+        # ── Commands ──
+
         command, command_arg = self._parse_command(orchestrator_body if addressed_to_orchestrator else stripped)
 
         if command == "/connect":
@@ -335,51 +313,63 @@ class Router:
                     await send_reply(f"Not connected. Use `/connect <project-id>`. Available: {available}")
             return
 
-        project_id = self._channel_project.get(chat_id)
-        if not project_id:
-            await send_reply(
-                "No project connected. Use `/connect <project-id>` to link this channel.\n"
-                f"Available projects: {', '.join(self._orchestrators.keys()) or '(none)'}"
-            )
+        # /setup is a shorthand for @router
+        if stripped.startswith("/setup"):
+            await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
             return
 
+        project_id = self._channel_project.get(chat_id)
+
         if command == "/stop":
-            await self._stop_task(chat_id, project_id, send_reply)
+            # Stop router task if running, otherwise stop orchestrator task
+            router_task = self._router_tasks.get(chat_id)
+            if router_task and not router_task.done():
+                router_task.cancel()
+                await send_reply("Router session stopped.", sender="system")
+                return
+            if project_id:
+                await self._stop_task(chat_id, project_id, send_reply)
+            else:
+                await send_reply("Nothing to stop.", sender="system")
             return
 
         if command == "/status":
-            await self._show_status(chat_id, project_id, send_reply)
+            if project_id:
+                await self._show_status(chat_id, project_id, send_reply)
+            else:
+                await send_reply("No project connected.", sender="system")
             return
 
-        orch = self._orchestrators.get(project_id)
-        if not orch:
-            await send_reply(f"Project `{project_id}` not found in config.")
-            return
+        # ── Plain messages — route based on channel state ──
 
-        if not await self._ensure_registered(orch):
-            await send_reply(f"Cannot reach daemon for `{project_id}`. Is the daemon running and SSH tunnel open?")
-            return
+        if project_id:
+            # Project connected → orchestrator
+            orch = self._orchestrators.get(project_id)
+            if not orch:
+                await send_reply(f"Project `{project_id}` not found in config.")
+                return
 
-        effective_text = orchestrator_body if addressed_to_orchestrator else stripped
-        if not effective_text:
-            await send_reply("Message is empty after `@orchestrator` prefix.")
-            return
+            if not await self._ensure_registered(orch):
+                await send_reply(f"Cannot reach daemon for `{project_id}`. Is the daemon running and SSH tunnel open?")
+                return
 
-        if orch.status == "stuck":
-            # Orchestrator is blocked on ask_user — deliver as interrupt (the answer)
-            await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
-            return
+            effective_text = orchestrator_body if addressed_to_orchestrator else stripped
+            if not effective_text:
+                await send_reply("Message is empty after `@orchestrator` prefix.")
+                return
 
-        if orch.status in ("idle", "done", "error", "unknown"):
-            await self._start_task(chat_id, project_id, effective_text, send_reply, send_log)
-            return
-
-        if addressed_to_orchestrator:
-            await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
-            return
-
-        queue_size = self._enqueue_deferred_task(project_id, chat_id, stripped)
-        await send_reply(f"(queued as next task #{queue_size} — use `@orchestrator ...` for urgent interruption)")
+            if orch.status == "stuck":
+                await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
+            elif orch.status in ("idle", "done", "error", "unknown"):
+                await self._start_task(chat_id, project_id, effective_text, send_reply, send_log)
+            elif addressed_to_orchestrator:
+                await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
+            else:
+                queue_size = self._enqueue_deferred_task(project_id, chat_id, stripped)
+                await send_reply(f"(queued as next task #{queue_size} — use `@orchestrator ...` for urgent interruption)")
+        else:
+            # No project connected → router (sysadmin brain)
+            await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
 
     def _strip_prefix(self, text: str, prefix: str) -> tuple[bool, str]:
         stripped = text.strip()
