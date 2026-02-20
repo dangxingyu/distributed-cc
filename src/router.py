@@ -286,6 +286,16 @@ class Router:
     async def route_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None):
         stripped = text.strip()
 
+        # @router prefix — direct message to the router/setup session
+        addressed_to_router, router_body = self._strip_prefix(stripped, "@router")
+        if addressed_to_router:
+            if not router_body:
+                await send_reply("Message is empty after `@router` prefix.", sender="system")
+                return
+            self._setup_channels.add(chat_id)
+            await self._handle_setup(chat_id, router_body, send_reply, send_log)
+            return
+
         # setup mode routing (works without connected project)
         if stripped.startswith("/setup"):
             self._setup_channels.add(chat_id)
@@ -302,7 +312,7 @@ class Router:
                 await self._handle_setup(chat_id, stripped, send_reply, send_log)
                 return
 
-        addressed_to_orchestrator, orchestrator_body = self._strip_orchestrator_prefix(stripped)
+        addressed_to_orchestrator, orchestrator_body = self._strip_prefix(stripped, "@orchestrator")
         command, command_arg = self._parse_command(orchestrator_body if addressed_to_orchestrator else stripped)
 
         if command == "/connect":
@@ -363,14 +373,13 @@ class Router:
         queue_size = self._enqueue_deferred_task(project_id, chat_id, stripped)
         await send_reply(f"(queued as next task #{queue_size} — use `@orchestrator ...` for urgent interruption)")
 
-    def _strip_orchestrator_prefix(self, text: str) -> tuple[bool, str]:
+    def _strip_prefix(self, text: str, prefix: str) -> tuple[bool, str]:
         stripped = text.strip()
-        marker = "@orchestrator"
         lower = stripped.lower()
-        if not lower.startswith(marker):
+        if not lower.startswith(prefix):
             return False, stripped
 
-        remainder = stripped[len(marker):].lstrip()
+        remainder = stripped[len(prefix):].lstrip()
         return True, remainder
 
     def _parse_command(self, text: str) -> tuple[str | None, str]:
