@@ -525,7 +525,12 @@ class Router:
             self._setup_sessions[chat_id] = SetupSession(cwd=self._cwd)
 
         session = self._setup_sessions[chat_id]
-        session.set_callbacks(progress=send_reply, log=send_log)
+
+        # Wrap send_reply to tag setup messages as "router" sender
+        async def setup_reply(msg: str):
+            await send_reply(msg, sender="router")
+
+        session.set_callbacks(progress=setup_reply, log=send_log)
 
         stripped = text.strip()
         if stripped.startswith("/setup"):
@@ -548,11 +553,11 @@ class Router:
             try:
                 result = await session.run(prompt)
                 if result:
-                    await send_reply(result)
+                    await setup_reply(result)
                 self.reload_config()
             except Exception as e:
                 log.exception("Setup session error: %s", e)
-                await send_reply(f"Setup error: {e}")
+                await send_reply(f"Setup error: {e}", sender="system")
 
         # Cancel any in-flight setup task for this channel before starting a new one
         old_task = self._setup_tasks.get(chat_id)

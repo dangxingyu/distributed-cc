@@ -62,20 +62,26 @@ class Store:
 
     # ── messages ──
 
-    async def add_message(self, chat_id: int, role: str, content: str):
+    async def add_message(self, chat_id: int, role: str, content: str, sender: str = ""):
+        entry = {"role": role, "content": content, "ts": time.time()}
+        if sender:
+            entry["sender"] = sender
         data = self._load(chat_id)
-        data["messages"].append({"role": role, "content": content, "ts": time.time()})
+        data["messages"].append(entry)
         self._save(chat_id, data)
 
     async def get_recent_messages(self, chat_id: int) -> list[dict]:
         data = self._load(chat_id)
         messages = []
         for m in data["messages"]:
-            messages.append({
+            msg = {
                 "role": m.get("role", ""),
                 "content": m.get("content", ""),
                 "ts": m.get("ts"),
-            })
+            }
+            if m.get("sender"):
+                msg["sender"] = m["sender"]
+            messages.append(msg)
         return messages
 
     # ── channel management ──

@@ -465,6 +465,7 @@ body {
 .msg-user .msg-avatar { background: var(--blue-dim); color: var(--blue); border: 1px solid rgba(137, 180, 250, 0.2); }
 .msg-orchestrator .msg-avatar { background: var(--green-dim); color: var(--green); border: 1px solid rgba(166, 227, 161, 0.2); }
 .msg-worker .msg-avatar { background: var(--orange-dim); color: var(--orange); border: 1px solid rgba(250, 179, 135, 0.2); }
+.msg-router .msg-avatar { background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(203, 166, 247, 0.2); }
 .msg-system .msg-avatar { display: none; }
 
 .msg-content {
@@ -487,6 +488,7 @@ body {
 .msg-user .msg-sender { color: var(--blue); }
 .msg-orchestrator .msg-sender { color: var(--green); }
 .msg-worker .msg-sender { color: var(--orange); }
+.msg-router .msg-sender { color: var(--accent); }
 .msg-system .msg-sender { color: var(--text-muted); }
 
 .msg-time {
@@ -612,6 +614,11 @@ body {
 .msg-worker .msg-body {
   background: var(--orange-dim);
   border: 1px solid rgba(250, 179, 135, 0.12);
+}
+
+.msg-router .msg-body {
+  background: var(--accent-dim);
+  border: 1px solid rgba(203, 166, 247, 0.12);
 }
 
 .msg-system .msg-body {
@@ -1289,14 +1296,11 @@ function renderMarkdown(text) {
   return escapeHtml(text).replace(/\n/g, '<br>');
 }
 
-function classifyMessage(text) {
-  if (text.startsWith('@worker')) {
-    return 'worker';
-  }
-  if (/^\([\w\s]/.test(text)) {
-    // Router feedback: (queued...), (stopping...), (urgent interrupt queued...)
-    return 'system';
-  }
+// Fallback for old stored messages without sender field
+function classifyMessageLegacy(text) {
+  if (text.startsWith('@worker')) return 'worker';
+  if (text.startsWith('@router')) return 'router';
+  if (/^\([\w\s]/.test(text)) return 'system';
   return 'orchestrator';
 }
 
@@ -1304,20 +1308,19 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function addMessage(text, cssClass, tsSeconds) {
-  let label = 'Orchestrator';
-  let avatarLetter = 'O';
-  let body = text;
+const SENDER_CONFIG = {
+  user:         { label: 'You',          avatar: 'Y', css: 'msg-user' },
+  orchestrator: { label: 'Orchestrator', avatar: 'O', css: 'msg-orchestrator' },
+  worker:       { label: 'Worker',       avatar: 'W', css: 'msg-worker' },
+  router:       { label: 'Router',       avatar: 'R', css: 'msg-router' },
+  system:       { label: 'System',       avatar: '',  css: 'msg-system' },
+};
 
-  if (cssClass === 'msg-user') {
-    label = 'You';
-    avatarLetter = 'Y';
-  } else if (cssClass === 'msg-worker') {
-    label = 'Worker';
-    avatarLetter = 'W';
-  } else if (cssClass === 'msg-system') {
-    label = 'System';
-  }
+function addMessage(text, sender, tsSeconds) {
+  const cfg = SENDER_CONFIG[sender] || SENDER_CONFIG.orchestrator;
+  const cssClass = cfg.css;
+  const label = cfg.label;
+  const avatarLetter = cfg.avatar;
 
   const div = document.createElement('div');
   div.className = 'msg ' + cssClass;
@@ -1337,15 +1340,15 @@ function addMessage(text, cssClass, tsSeconds) {
   const header = document.createElement('div');
   header.className = 'msg-header';
 
-  const sender = document.createElement('span');
-  sender.className = 'msg-sender';
-  sender.textContent = label;
+  const senderEl = document.createElement('span');
+  senderEl.className = 'msg-sender';
+  senderEl.textContent = label;
 
   const time = document.createElement('span');
   time.className = 'msg-time';
   time.textContent = formatTime(tsSeconds);
 
-  header.appendChild(sender);
+  header.appendChild(senderEl);
   header.appendChild(time);
 
   // Body wrapper (for collapsing long messages)
@@ -1553,7 +1556,7 @@ function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || !ws || ws.readyState !== WebSocket.OPEN || activeChannel === null) return;
 
-  addMessage(text, 'msg-user', Date.now() / 1000);
+  addMessage(text, 'user', Date.now() / 1000);
   ws.send(JSON.stringify({ type: 'message', text: text }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
@@ -1566,12 +1569,8 @@ function loadHistory(channelId) {
     .then(messages => {
       messagesEl.innerHTML = '';
       for (const msg of messages) {
-        if (msg.role === 'user') {
-          addMessage(msg.content, 'msg-user', msg.ts);
-        } else {
-          const cls = classifyMessage(msg.content);
-          addMessage(msg.content, 'msg-' + cls, msg.ts);
-        }
+        const sender = msg.sender || (msg.role === 'user' ? 'user' : classifyMessageLegacy(msg.content));
+        addMessage(msg.content, sender, msg.ts);
       }
     })
     .catch(err => console.error('Failed to load history:', err));
@@ -2030,12 +2029,12 @@ function connect() {
       addLogEntry(data.text, data.ts);
 
     } else if (data.type === 'reply') {
-      const cls = classifyMessage(data.text);
-      addMessage(data.text, 'msg-' + cls, data.ts);
+      const sender = data.sender || classifyMessageLegacy(data.text);
+      addMessage(data.text, sender, data.ts);
       if (activeChannel !== null) loadMembers(activeChannel);
 
     } else if (data.type === 'error') {
-      addMessage('Error: ' + data.text, 'msg-system', data.ts);
+      addMessage('Error: ' + data.text, 'system', data.ts);
     }
   };
 }
