@@ -308,6 +308,14 @@ class Router:
                 if stripped == "/done":
                     await send_reply("Exited router session.")
                     return
+            elif stripped == "/stop":
+                task = self._router_tasks.get(chat_id)
+                if task and not task.done():
+                    task.cancel()
+                    await send_reply("Router session stopped.", sender="system")
+                else:
+                    await send_reply("No router task running.", sender="system")
+                return
             else:
                 await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
                 return
