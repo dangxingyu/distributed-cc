@@ -654,6 +654,68 @@ body {
   box-shadow: 0 0 0 2px rgba(249, 226, 175, 0.25);
 }
 
+/* ── Command palette ────────────────────────────── */
+
+#command-palette {
+  display: none;
+  position: absolute;
+  bottom: 100%;
+  left: 20px;
+  right: 20px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 4px 0;
+  margin-bottom: 4px;
+  box-shadow: 0 -4px 16px rgba(0,0,0,0.4);
+  z-index: 50;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+#command-palette.open {
+  display: block;
+}
+
+.cmd-item {
+  padding: 8px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  transition: background 0.08s ease;
+}
+
+.cmd-item:hover,
+.cmd-item.selected {
+  background: var(--bg-hover);
+}
+
+.cmd-item .cmd-name {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', monospace;
+}
+
+.cmd-item .cmd-desc {
+  color: var(--text-muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cmd-item .cmd-hint {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 11px;
+  opacity: 0.6;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ── Monitor panel ─────────────────────────────── */
 
 #monitor {
@@ -880,6 +942,7 @@ body {
 
   <div id="typing-indicator"></div>
   <div id="input-area">
+    <div id="command-palette"></div>
     <textarea id="input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
     <button id="send-btn">Send</button>
   </div>
@@ -1258,18 +1321,6 @@ function loadLogs(channelId) {
     .catch(err => console.error('Failed to load logs:', err));
 }
 
-inputEl.addEventListener('input', function() {
-  this.style.height = 'auto';
-  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-});
-
-inputEl.addEventListener('keydown', function(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
-});
-
 sendBtn.addEventListener('click', sendMessage);
 
 // ── Monitor panel ───────────────────────────────────────────────────
@@ -1387,6 +1438,155 @@ function clearAwaitingInput() {
   inputArea.classList.remove('awaiting-input');
   inputEl.placeholder = 'Type a message... (Enter to send, Shift+Enter for newline)';
 }
+
+// ── Command palette ─────────────────────────────────────────────────
+
+const commandPalette = document.getElementById('command-palette');
+
+const COMMANDS = [
+  { name: '/connect', args: '<project-id>', desc: 'Connect channel to a project' },
+  { name: '/stop', args: '', desc: 'Stop the current running task' },
+  { name: '/status', args: '', desc: 'Show current project status' },
+  { name: '/setup', args: '[user@host]', desc: 'Deploy & configure a daemon' },
+  { name: '/done', args: '', desc: 'Exit setup mode' },
+];
+
+let _cmdSelectedIdx = -1;
+let _cmdVisible = false;
+let _cmdFiltered = [];
+
+function renderCommandPalette(filter) {
+  const query = (filter || '').toLowerCase();
+  _cmdFiltered = COMMANDS.filter(c => c.name.startsWith(query));
+
+  if (_cmdFiltered.length === 0 || !query.startsWith('/')) {
+    hideCommandPalette();
+    return;
+  }
+
+  // If exact match and nothing more to show, hide
+  if (_cmdFiltered.length === 1 && query === _cmdFiltered[0].name && !_cmdFiltered[0].args) {
+    hideCommandPalette();
+    return;
+  }
+
+  _cmdSelectedIdx = 0;
+  let html = '';
+  _cmdFiltered.forEach((cmd, i) => {
+    const sel = i === _cmdSelectedIdx ? ' selected' : '';
+    html += '<div class="cmd-item' + sel + '" data-idx="' + i + '">';
+    html += '<span class="cmd-name">' + escapeHtml(cmd.name) + '</span>';
+    html += '<span class="cmd-desc">' + escapeHtml(cmd.desc) + '</span>';
+    if (cmd.args) {
+      html += '<span class="cmd-hint">' + escapeHtml(cmd.args) + '</span>';
+    }
+    html += '</div>';
+  });
+  commandPalette.innerHTML = html;
+  commandPalette.classList.add('open');
+  _cmdVisible = true;
+
+  // Click handlers
+  commandPalette.querySelectorAll('.cmd-item').forEach(el => {
+    el.addEventListener('mousedown', function(e) {
+      e.preventDefault(); // prevent input blur
+      const idx = parseInt(this.dataset.idx);
+      selectCommand(idx);
+    });
+  });
+}
+
+function hideCommandPalette() {
+  commandPalette.classList.remove('open');
+  _cmdVisible = false;
+  _cmdSelectedIdx = -1;
+  _cmdFiltered = [];
+}
+
+function selectCommand(idx) {
+  if (idx < 0 || idx >= _cmdFiltered.length) return;
+  const cmd = _cmdFiltered[idx];
+  inputEl.value = cmd.name + (cmd.args ? ' ' : '');
+  inputEl.focus();
+  hideCommandPalette();
+
+  // If /connect, fetch projects and show hint
+  if (cmd.name === '/connect') {
+    fetch('/api/projects')
+      .then(r => r.json())
+      .then(projects => {
+        if (projects.length > 0) {
+          const ids = projects.map(p => p.project_id).join(', ');
+          inputEl.placeholder = 'Available: ' + ids;
+        }
+      });
+  }
+}
+
+function updateCmdSelection(delta) {
+  if (!_cmdVisible || _cmdFiltered.length === 0) return;
+  _cmdSelectedIdx = (_cmdSelectedIdx + delta + _cmdFiltered.length) % _cmdFiltered.length;
+  commandPalette.querySelectorAll('.cmd-item').forEach((el, i) => {
+    el.classList.toggle('selected', i === _cmdSelectedIdx);
+  });
+}
+
+inputEl.addEventListener('input', function() {
+  // existing auto-resize
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+
+  // command palette
+  const text = this.value.trim();
+  if (text.startsWith('/') && !text.includes('\n')) {
+    const firstWord = text.split(/\s/)[0];
+    renderCommandPalette(firstWord);
+  } else {
+    hideCommandPalette();
+  }
+
+  // restore placeholder if input is empty
+  if (!this.value && !_pendingQuestion) {
+    this.placeholder = 'Type a message... (Enter to send, Shift+Enter for newline)';
+  }
+});
+
+inputEl.addEventListener('keydown', function(e) {
+  if (_cmdVisible) {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      updateCmdSelection(-1);
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      updateCmdSelection(1);
+      return;
+    }
+    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+      if (_cmdSelectedIdx >= 0) {
+        e.preventDefault();
+        selectCommand(_cmdSelectedIdx);
+        return;
+      }
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      hideCommandPalette();
+      return;
+    }
+  }
+
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+inputEl.addEventListener('blur', function() {
+  // Delay to allow click on palette items
+  setTimeout(hideCommandPalette, 150);
+});
 
 // Restore monitor state from localStorage
 if (localStorage.getItem('dcc_monitor_open') === 'true') {
