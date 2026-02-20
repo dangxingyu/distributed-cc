@@ -1,20 +1,8 @@
-.PHONY: run run-web run-cli run-telegram test test-e2e deploy tunnels install-dev
+.PHONY: run test test-e2e deploy tunnels install-dev
 
-# Run orchestrator with web chat frontend (default)
+# Run router + web UI (default)
 run:
 	uv run python -m src
-
-# Alias for `make run`
-run-web:
-	uv run python -m src
-
-# Run orchestrator with CLI frontend
-run-cli:
-	uv run python -m src --cli
-
-# Run orchestrator with Telegram bot frontend (requires TELEGRAM_TOKEN env var)
-run-telegram:
-	uv run python -m src --telegram
 
 # Run unit/integration tests (no real Claude calls)
 test:
@@ -35,4 +23,4 @@ tunnels:
 
 # Install development dependencies
 install-dev:
-	uv sync --extra dev --extra telegram
+	uv sync --extra dev
