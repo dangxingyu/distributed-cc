@@ -277,7 +277,12 @@ class WebChat:
                 await self._store.add_log(channel_id, msg)
                 await self._ws_send_to_channel(channel_id, {"type": "log", "text": msg, "ts": ts})
 
-            asyncio.create_task(self._router.route_message(channel_id, text, send_reply, send_log))
+            async def send_typing(active: bool, sender: str = "router"):
+                await self._ws_send_to_channel(channel_id, {
+                    "type": "typing", "active": active, "sender": sender,
+                })
+
+            asyncio.create_task(self._router.route_message(channel_id, text, send_reply, send_log, send_typing))
             return
 
         await self._ws_send_to_client(client_id, {"type": "error", "text": f"Unknown message type: {msg_type}"})

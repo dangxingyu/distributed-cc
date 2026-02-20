@@ -208,7 +208,7 @@ async def test_ws_message_broadcasts_reply_to_same_channel_viewers(aiohttp_clien
     ch_id = await store.create_channel("routed-ch")
     await router.connect_channel(ch_id, "test-proj")
 
-    async def mock_route(chat_id, text, send_reply, send_log=None):
+    async def mock_route(chat_id, text, send_reply, send_log=None, send_typing=None):
         await send_reply("got it")
 
     router.route_message = mock_route
@@ -673,7 +673,7 @@ async def test_ws_reply_only_sent_to_same_channel_viewers(aiohttp_client):
     ch_b = await store.create_channel("ch-b")
     await router.connect_channel(ch_a, "test-proj")
 
-    async def mock_route(chat_id, text, send_reply, send_log=None):
+    async def mock_route(chat_id, text, send_reply, send_log=None, send_typing=None):
         await send_reply("reply for A")
 
     router.route_message = mock_route

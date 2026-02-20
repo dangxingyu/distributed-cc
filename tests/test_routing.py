@@ -430,7 +430,7 @@ async def test_setup_command_enters_router_session_mode():
 
     with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_setup:
         await router.route_message(1, "/setup user@server", send_reply, send_log)
-        mock_setup.assert_called_once_with(1, "/setup user@server", send_reply, send_log)
+        mock_setup.assert_called_once_with(1, "/setup user@server", send_reply, send_log, None)
         assert 1 in router._router_channels
 
 

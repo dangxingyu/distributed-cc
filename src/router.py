@@ -283,7 +283,7 @@ class Router:
 
     # -- message routing ------------------------------------------------
 
-    async def route_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None):
+    async def route_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None, send_typing: callable = None):
         stripped = text.strip()
 
         # @router prefix — direct message to the router/setup session
@@ -293,13 +293,13 @@ class Router:
                 await send_reply("Message is empty after `@router` prefix.", sender="system")
                 return
             self._router_channels.add(chat_id)
-            await self._handle_router_message(chat_id, router_body, send_reply, send_log)
+            await self._handle_router_message(chat_id, router_body, send_reply, send_log, send_typing)
             return
 
         # setup mode routing (works without connected project)
         if stripped.startswith("/setup"):
             self._router_channels.add(chat_id)
-            await self._handle_router_message(chat_id, stripped, send_reply, send_log)
+            await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
             return
 
         if chat_id in self._router_channels:
@@ -309,7 +309,7 @@ class Router:
                     await send_reply("Exited router session.")
                     return
             else:
-                await self._handle_router_message(chat_id, stripped, send_reply, send_log)
+                await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
                 return
 
         addressed_to_orchestrator, orchestrator_body = self._strip_prefix(stripped, "@orchestrator")
@@ -529,7 +529,7 @@ class Router:
 
     # -- router session ------------------------------------------------
 
-    async def _handle_router_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None):
+    async def _handle_router_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None, send_typing: callable = None):
         if chat_id not in self._router_sessions:
             self._router_sessions[chat_id] = RouterSession(cwd=self._cwd)
 
@@ -559,6 +559,8 @@ class Router:
             prompt = stripped
 
         async def _run():
+            if send_typing:
+                await send_typing(True, "router")
             try:
                 result = await session.run(prompt)
                 if result:
@@ -567,6 +569,9 @@ class Router:
             except Exception as e:
                 log.exception("Router session error: %s", e)
                 await send_reply(f"Router error: {e}", sender="system")
+            finally:
+                if send_typing:
+                    await send_typing(False, "router")
 
         # Cancel any in-flight setup task for this channel before starting a new one
         old_task = self._router_tasks.get(chat_id)

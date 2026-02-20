@@ -1248,7 +1248,7 @@ function updateProjectBadge(status, iteration, data) {
 
   if (status === 'running' || status === 'busy') {
     projectBadge.textContent = iteration ? `Working (${iteration})` : 'Working...';
-    showTypingIndicator(data || 'working');
+    showTypingIndicator('orchestrator');
   } else if (status === 'stuck') {
     projectBadge.textContent = 'Needs input';
     hideTypingIndicator();
@@ -1277,9 +1277,10 @@ function showTypingIndicator(label) {
   if (_indicatorActive) return;
   _indicatorActive = true;
 
+  const displayLabel = label || 'working';
   typingIndicator.innerHTML =
     '<span class="dot-pulse"><span></span><span></span><span></span></span>' +
-    '<span class="status-label">orchestrator is working</span>';
+    `<span class="status-label">${displayLabel} is working</span>`;
   typingIndicator.classList.add('active');
 }
 
@@ -2108,6 +2109,13 @@ function connect() {
       const sender = data.sender || classifyMessageLegacy(data.text);
       addMessage(data.text, sender, data.ts);
       if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
+
+    } else if (data.type === 'typing') {
+      if (data.active) {
+        showTypingIndicator(data.sender || 'orchestrator');
+      } else {
+        hideTypingIndicator();
+      }
 
     } else if (data.type === 'error') {
       addMessage('Error: ' + data.text, 'system', data.ts);
