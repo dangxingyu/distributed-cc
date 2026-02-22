@@ -12,7 +12,7 @@ Browser → WS {"type":"message"} → WebChat → Store (persist as "user") → 
 
 | Status | What happens |
 |--------|-------------|
-| No project connected | Reply: "Use `/connect <project-id>`" |
+| No project connected | Route to router (sysadmin brain) |
 | `/connect`, `/stop`, `/status` | Handle command locally |
 | `stuck` | POST `/interrupt` to daemon (answers `ask_user`) |
 | `idle`, `done`, `error`, `unknown` | POST `/task` to daemon (starts new task) |
@@ -36,6 +36,7 @@ Events arrive via SSE or HTTP callback → `router.ingest_progress_event` → `w
 | `stuck` | `@orchestrator Needs input: {question}` | — | `progress` WS with `status:stuck` |
 | `error` | `@orchestrator Error: {msg}` | `[ERROR] {msg}` log | `progress` WS with `status:error` |
 | `task_list` | — | — | `task_list` WS (updates task list panel) |
+| `log_update` | — | — | `log_update` WS (new LOG.md entry) |
 
 Every event also triggers a `channel_status` WS broadcast to all clients (updates sidebar status dots).
 
@@ -55,6 +56,7 @@ From `orchestrator_daemon.py`, events emitted during a task:
 | Worker uses a tool | `tool_use` | `[worker] Bash: {...}` |
 | Tool error | `tool_error` | `[source] {error}` |
 | `update_task_list` | `task_list` | markdown checkbox content |
+| `append_log` | `log_update` | the log entry text |
 | `ask_user` | `stuck` | the question text |
 | `task_complete` | `done` | the summary text |
 | Exception | `error` | error message |
@@ -86,6 +88,7 @@ Messages the frontend receives and how they're handled:
 | `progress` | Update project badge, typing indicator; trigger stuck UX if `status:stuck` |
 | `channel_status` | Update sidebar status dots for all channels |
 | `task_list` | Render orchestrator's research plan in monitor task list panel |
+| `log_update` | New LOG.md entry from orchestrator |
 | `log` | Append entry to monitor panel |
 | `reply` | Classify (`@worker` → worker, `(...)` → system, else → orchestrator) and render in chat |
 | `error` | Render as system message in chat |
@@ -97,6 +100,8 @@ Messages the frontend receives and how they're handled:
 | User messages | `data/channels/{id}.json` messages[] | Yes |
 | Assistant replies | `data/channels/{id}.json` messages[] | Yes |
 | Monitor logs | `data/channels/{id}.json` logs[] | Yes |
-| Task list | WS-only (ephemeral) | No (re-emitted on next update) |
+| Task list | `{project_dir}/task_list.md` + WS | Yes (file persists on server) |
+| Research log | `{project_dir}/LOG.md` + WS | Yes (append-only file on server) |
+| Worker reports | `{project_dir}/.reports/iteration-N.md` | Yes (per-iteration file on server) |
 | Iteration progress | WS-only (ephemeral) | No |
 | Channel-project mapping | `data/channels/{id}.json` meta.project_id | Yes |

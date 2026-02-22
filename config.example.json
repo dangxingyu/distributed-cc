@@ -2,7 +2,7 @@
   "servers": [
     {
       "name": "h100",
-      "host": "ubuntu@209.20.157.135",
+      "host": "ubuntu@your-server-ip",
       "work_dir": "/home/ubuntu",
       "broker_port": 8201
     },

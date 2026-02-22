@@ -6,22 +6,26 @@ It gives you:
 - One chat UI on your laptop (`http://localhost:8080`)
 - One daemon per server (`:8200`)
 - Two agent roles per task on each daemon:
-  - `orchestrator` for planning/verification
-  - `worker` for concrete execution
+  - **Orchestrator** — PhD-student-level researcher: plans, investigates, reviews, decides
+  - **Worker** — implementation agent: executes assignments with full tool access
+
+The orchestrator maintains two persistent artifacts per project:
+- `task_list.md` — research plan (overwritten on update)
+- `LOG.md` — lab notebook (append-only record of hypotheses, findings, decisions)
 
 ## What You Type vs What Happens
 
 ```text
 You (web UI) -> Router (local) -> Daemon (remote)
-                               -> Orchestrator turn
-                               -> Worker assignment
-                               -> Worker report
-                               -> Repeat until done/stuck/error
+                               -> Orchestrator (plans, uses MCP tools)
+                               -> Worker assignment via assign_worker tool
+                               -> Worker report via submit_report tool
+                               -> Repeat until task_complete called
 ```
 
 The UI shows:
-- Chat panel: `@orchestrator -> @worker` and `@worker -> @orchestrator` messages
-- Monitor panel: tool calls, logs, and iteration progress
+- Chat panel: orchestrator/worker exchanges and status updates
+- Monitor panel: tool calls, logs, iteration progress, and task list
 
 ## Quick Start (10 Minutes)
 
@@ -55,8 +59,7 @@ The setup agent will:
 - update local `config.json`
 - tell you tunnel commands
 
-Use follow-up messages to provide context (conda path, project path, cluster constraints).  
-Use `/done` to exit setup mode.
+Use follow-up messages to provide context (conda path, project path, cluster constraints).
 
 ### 4. Open SSH tunnel(s)
 
@@ -83,18 +86,24 @@ Investigate why training loss plateaus; maybe reward hacking.
 | `/connect <project-id>` | Connect current channel to a project |
 | `/connect` | Show current connection |
 | `/status` | Show daemon/task status |
-| `/stop` | Stop current running task |
-| `/setup <user@host>` | Interactive server setup |
+| `/stop` | Stop current running task (router or orchestrator) |
+| `/setup <user@host>` | Interactive server setup via router |
 | `/setup` | Health check configured servers |
-| `/done` | Exit setup mode |
 
-### While a task is running
+### Mentions (always work)
 
 | You send | Behavior |
 |---|---|
-| Normal message | queued as next task |
-| `@orchestrator <msg>` | urgent interrupt at next iteration boundary |
-| `@orchestrator /stop` | command form also works with prefix |
+| `@router <msg>` | Direct message to the router (sysadmin) |
+| `@orchestrator <msg>` | Direct message to orchestrator (interrupt if running) |
+
+### Routing without mentions
+
+| Channel state | Plain message goes to |
+|---|---|
+| No project connected | Router (sysadmin brain) |
+| Project connected, idle | Orchestrator (starts new task) |
+| Project connected, running | Queued as next task |
 
 ## Configuration
 
@@ -119,8 +128,7 @@ Current common format:
     }
   ],
   "orchestrator": {
-    "model": "claude-opus-4-6",
-    "session_model": "claude-opus-4-6"
+    "model": "claude-opus-4-6"
   }
 }
 ```
@@ -187,22 +195,23 @@ make test-e2e  # real Claude API calls (costs money)
 
 ```text
 src/
-  main.py      entrypoint (router + web + callback server)
-  router.py    command routing, daemon IO, status, queueing
-  web.py       HTTP/WebSocket chat backend
-  setup.py     local setup agent for /setup mode
-  store.py     JSON persistence
+  main.py            entrypoint (router + web + callback server)
+  router.py          command routing, daemon IO, status, queueing
+  router_session.py  local sysadmin Claude session (@router, /setup)
+  web.py             HTTP/WebSocket chat backend
+  store.py           JSON persistence
   static/
-    index.html frontend
+    index.html       frontend
 
 tools/
-  orchestrator_daemon.py  remote daemon (orchestrator + worker loop)
+  orchestrator_daemon.py  remote daemon (orchestrator + worker MCP tools)
   deploy.sh               helper to copy/install daemon remotely
   start_tunnels.sh        helper for SSH tunnels
 
 docs/
-  design-philosophy.md
-  broker-guide.md
+  message-flow.md       event routing and message classification
+  broker-guide.md       daemon deployment and operations
+  design-philosophy.md  architecture rationale
 ```
 
 ## Requirements

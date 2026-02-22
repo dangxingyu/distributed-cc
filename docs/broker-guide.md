@@ -60,12 +60,15 @@ The daemon is a per-server process — start it once per server:
     --callback-url http://127.0.0.1:9120
 ```
 
-The daemon runs a split-channel autonomous RALPH loop when tasks are submitted:
-- **Orchestrator channel**: plans, verifies worker reports, decides next step
-- **Worker channel**: executes assignments with tools (Read, Write, Bash, Grep, etc.)
+The daemon runs a split-channel architecture when tasks are submitted:
+- **Orchestrator**: plans, investigates, reviews worker reports, decides next step.
+  Uses MCP tools: `assign_worker`, `task_complete`, `ask_user`, `update_task_list`, `append_log`, `update_worker_config`.
+- **Worker**: executes assignments with full tool access (Read, Write, Bash, Grep, etc.).
+  Submits results via `submit_report` MCP tool.
 
-The orchestrator decides progress/completion via markers (`[ASSIGN_WORKER]`,
-`[TASK_COMPLETE]`, `[NEED_USER_INPUT]`), and worker turns return `[WORKER_REPORT]`.
+The orchestrator maintains two persistent files per project:
+- `task_list.md` — research plan (overwritten on each update)
+- `LOG.md` — lab notebook (append-only, timestamped record of investigation)
 
 ### HTTP API
 
@@ -188,9 +191,9 @@ with values from `config.json`:
 
 | Placeholder | Source |
 |---|---|
-| `{host}` | `config.json` → `orchestrators[].host` |
-| `{server_name}` | `config.json` → `orchestrators[].name` |
-| `{local_port}` | `config.json` → `orchestrators[].broker_port` |
+| `{host}` | `config.json` → `servers[].host` |
+| `{server_name}` | `config.json` → `servers[].name` |
+| `{local_port}` | `config.json` → `servers[].broker_port` |
 | `{daemon_dir}` | Default: `~/.distributed-cc` |
 | `{env_file}` | Per-server env/bashrc to source |
 | `{log_dir}` | Log directory |

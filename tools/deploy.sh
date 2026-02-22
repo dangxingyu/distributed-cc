@@ -20,11 +20,6 @@ echo "Deploying orchestrator daemon to $REMOTE:$REMOTE_DIR ..."
 ssh "$REMOTE" "mkdir -p $REMOTE_DIR"
 scp tools/orchestrator_daemon.py "$REMOTE:$REMOTE_DIR/orchestrator_daemon.py"
 
-# Keep remote_broker.py for backward compat during migration
-if [ -f tools/remote_broker.py ]; then
-    scp tools/remote_broker.py "$REMOTE:$REMOTE_DIR/remote_broker.py"
-fi
-
 echo "Installing uv (if not present) ..."
 ssh "$REMOTE" "command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh"
 
