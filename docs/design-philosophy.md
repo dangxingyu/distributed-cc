@@ -63,3 +63,18 @@ Key principles:
 - **One persistent session** — the orchestrator is a single Claude session (via `--resume`) that accumulates context across all interactions, not a pipeline of separate calls
 - **Workers get curated context** — workers see the orchestrator's prompt, not the full channel history. The orchestrator's job is to distill relevant context.
 - **Natural decision-making** — instead of separate verify/reflect/suggest pipelines, the orchestrator sees worker results and naturally decides: accept, retry, try differently, escalate, or suggest next steps
+
+## Owner Clarification: Autonomy-First Operation
+
+The orchestrator should be treated as a fully capable Claude Code researcher.
+Workers are acceleration and parallelization tools, not hard capability boundaries.
+
+Operational guidance:
+- Keep wrappers light. Prefer prompt/MCP design over heavy policy gating.
+- Do not hard-restrict orchestrator implementation ability at runtime.
+- Use two interruption levels:
+  - Normal channel message = non-urgent guidance for later incorporation.
+  - `@orchestrator ...` = urgent direction that should be handled ASAP.
+- Avoid over-engineering strict queue semantics; urgency is the main distinction.
+- Default behavior is continuous autonomous progress: when no fresh user input is available,
+  the orchestrator continues driving work from its own task list.

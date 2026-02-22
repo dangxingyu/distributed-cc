@@ -7,6 +7,7 @@ and report file I/O.
 import asyncio
 import sys
 import os
+import json
 
 import pytest
 
@@ -161,7 +162,35 @@ def test_interrupt_queue_is_bounded_and_typed():
     oldest = queue.get_nowait()
     assert isinstance(oldest, dict)
     assert oldest["kind"] == "user_message"
+    assert oldest["urgency"] == "normal"
     assert _interrupt_payload_text(oldest) == "msg-5"
+
+    interrupt_queues.pop(project_id, None)
+
+
+def test_enqueue_interrupt_stores_urgency():
+    from orchestrator_daemon import (
+        _ensure_interrupt_queue,
+        _enqueue_interrupt,
+        interrupt_queues,
+    )
+
+    project_id = "urgency-test"
+    interrupt_queues.pop(project_id, None)
+    _ensure_interrupt_queue(project_id)
+
+    _enqueue_interrupt(project_id, "normal msg")
+    _enqueue_interrupt(project_id, "urgent msg", urgency="urgent")
+    _enqueue_interrupt(project_id, "bad urgency", urgency="unexpected")
+
+    queue = interrupt_queues[project_id]
+    first = queue.get_nowait()
+    second = queue.get_nowait()
+    third = queue.get_nowait()
+
+    assert first["urgency"] == "normal"
+    assert second["urgency"] == "urgent"
+    assert third["urgency"] == "normal"
 
     interrupt_queues.pop(project_id, None)
 
@@ -185,3 +214,69 @@ async def test_wait_for_interrupt_text_skips_empty_payloads():
     assert result == "hello"
 
     interrupt_queues.pop(project_id, None)
+
+
+def test_parse_bool_helper():
+    from orchestrator_daemon import _parse_bool
+
+    assert _parse_bool(True, default=False) is True
+    assert _parse_bool("true", default=False) is True
+    assert _parse_bool("YES", default=False) is True
+    assert _parse_bool("0", default=True) is False
+    assert _parse_bool("off", default=True) is False
+    assert _parse_bool("unexpected", default=True) is True
+
+
+def test_hydrate_sessions_from_state(tmp_path):
+    from orchestrator_daemon import (
+        _hydrate_sessions_from_state,
+        orchestrator_sessions,
+        worker_sessions,
+    )
+    import orchestrator_daemon as daemon_mod
+
+    project_id = "hydrate-state-test"
+    state_file = tmp_path / f"{project_id}.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "orchestrator_session_id": "orch-sid",
+                "worker_session_id": "worker-sid",
+                "sdk_session_id": "orch-sid",
+            }
+        )
+    )
+
+    old_state_dir = daemon_mod.STATE_DIR
+    daemon_mod.STATE_DIR = tmp_path
+    orchestrator_sessions.pop(project_id, None)
+    worker_sessions.pop(project_id, None)
+    try:
+        assert _hydrate_sessions_from_state(project_id) is True
+        assert orchestrator_sessions[project_id] == "orch-sid"
+        assert worker_sessions[project_id] == "worker-sid"
+    finally:
+        daemon_mod.STATE_DIR = old_state_dir
+        orchestrator_sessions.pop(project_id, None)
+        worker_sessions.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_handle_interrupt_returns_urgency():
+    from orchestrator_daemon import handle_interrupt, projects, Project
+
+    project_id = "interrupt-urgency-test"
+    projects[project_id] = Project(project_id=project_id, project_dir="/tmp", name="x")
+
+    class _Req:
+        async def json(self):
+            return {"project_id": project_id, "message": "hello", "urgency": "urgent"}
+
+    try:
+        resp = await handle_interrupt(_Req())
+        assert resp.status == 200
+        payload = json.loads(resp.text)
+        assert payload["urgency"] == "urgent"
+        assert payload["queued"] is True
+    finally:
+        projects.pop(project_id, None)

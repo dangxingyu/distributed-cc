@@ -377,11 +377,17 @@ class Router:
                 return
 
             if orch.status == "stuck":
-                await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
+                await self._interrupt_task(
+                    chat_id,
+                    project_id,
+                    effective_text,
+                    send_reply,
+                    urgency="urgent" if addressed_to_orchestrator else "normal",
+                )
             elif orch.status in ("idle", "done", "error", "stopped", "unknown"):
                 await self._start_task(chat_id, project_id, effective_text, send_reply, send_log)
             elif addressed_to_orchestrator:
-                await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
+                await self._interrupt_task(chat_id, project_id, effective_text, send_reply, urgency="urgent")
             else:
                 queue_size = self._enqueue_deferred_task(project_id, chat_id, stripped)
                 await send_reply(f"(queued as next task #{queue_size} — use `@orchestrator ...` for urgent interruption)")
@@ -512,12 +518,22 @@ class Router:
 
         await send_reply(f"Failed to start task: {error}")
 
-    async def _interrupt_task(self, chat_id: int, project_id: str, message: str, send_reply: callable):
+    async def _interrupt_task(
+        self,
+        chat_id: int,
+        project_id: str,
+        message: str,
+        send_reply: callable,
+        urgency: str = "normal",
+    ):
         orch = self._orchestrators[project_id]
         url = f"{self._daemon_url(orch)}/interrupt"
 
         try:
-            async with self._http.post(url, json={"project_id": project_id, "message": message}) as resp:
+            async with self._http.post(
+                url,
+                json={"project_id": project_id, "message": message, "urgency": urgency},
+            ) as resp:
                 status = self._resp_status(resp)
                 try:
                     result = await self._resp_json(resp)
@@ -526,7 +542,10 @@ class Router:
                     await send_reply(f"Interrupt failed (HTTP {status}): {body}")
                     return
                 if status == 200 and result.get("ok"):
-                    await send_reply("(urgent interrupt queued — injected after current action)")
+                    if urgency == "urgent":
+                        await send_reply("(urgent interrupt queued — injected after current action)")
+                    else:
+                        await send_reply("(message queued for orchestrator)")
                 else:
                     await send_reply(f"Failed to interrupt: {result.get('error', f'HTTP {status}')}")
         except aiohttp.ClientError as e:

@@ -19,6 +19,13 @@ Browser → WS {"type":"message"} → WebChat → Store (persist as "user") → 
 | `running` + `@orchestrator` prefix | POST `/interrupt` to daemon (urgent interrupt) |
 | `running` + normal message | Queued as deferred task |
 
+`/interrupt` supports urgency metadata (`normal` or `urgent`) so the daemon can
+forward intent without enforcing heavy policy.
+
+`/task` supports `continuous_mode` (default: `true`), where the orchestrator
+keeps autonomously progressing from session context + `task_list.md`/`LOG.md`
+until stopped or explicitly completed.
+
 Router replies (e.g. "queued as next task", "stopping...") go through `send_reply` → persisted as `"assistant"` message → WS `"reply"` to channel viewers.
 
 ## 2. Daemon emits progress events

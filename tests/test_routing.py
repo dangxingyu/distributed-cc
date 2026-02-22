@@ -100,6 +100,7 @@ async def test_route_running_orchestrator_mention_interrupts():
     assert "/interrupt" in call_args[0][0]
     payload = call_args[1]["json"]
     assert payload["message"] == "also check tests"
+    assert payload["urgency"] == "urgent"
 
 
 async def test_route_stuck_sends_interrupt():
@@ -124,6 +125,7 @@ async def test_route_stuck_sends_interrupt():
     assert "/interrupt" in call_args[0][0]
     payload = call_args[1]["json"]
     assert payload["message"] == "use the staging API key"
+    assert payload["urgency"] == "normal"
 
 
 async def test_route_stop_command():

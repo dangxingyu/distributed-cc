@@ -52,6 +52,12 @@ CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
 MAX_ITERATIONS = 20
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 INTERRUPT_QUEUE_MAX = 100
+CONTINUOUS_MODE_DEFAULT = os.environ.get("CONTINUOUS_MODE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 
 # -- split-role prompts ------------------------------------------------
@@ -69,6 +75,7 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
   The worker has full tool access (Edit, Write, Bash, etc). Returns their report.
 - **task_complete(summary)** — mark the overall task as done.
 - **ask_user(question)** — ask the professor a blocking question (use sparingly).
+- **pull_user_messages()** — fetch queued user guidance/urgent interruptions when useful.
 - **update_task_list(content)** — update your research plan (task_list.md).
 - **append_log(entry)** — append an entry to your research log (LOG.md).
 - **update_worker_config(content)** — update standing worker instructions (.claude/CLAUDE.md).
@@ -78,7 +85,7 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 1. Start: Read task_list.md and LOG.md (if they exist) to resume context.
 2. Investigate: Read files, search the codebase, understand the problem.
 3. Plan: Call update_task_list with a research-level plan.
-4. Execute: Call assign_worker with concrete tasks and review their reports.
+4. Execute: Choose direct implementation and/or worker delegation based on leverage.
 5. Iterate: Refine based on evidence until the goal is met.
 6. Complete: Call task_complete with a summary.
 
@@ -106,7 +113,9 @@ your reasoning, see what you tried, and understand why you made each decision.
 
 - Investigate before assigning work — don't delegate blindly.
 - Worker assignments should be concrete and actionable.
-- Never edit code/config/tests yourself — use assign_worker for all implementation.
+- You may implement directly or delegate to workers; use assign_worker when it improves
+  leverage (parallelism, isolation, or clearer ownership).
+- Pull queued user messages periodically so urgent direction is integrated quickly.
 - Keep task_list at PhD-level granularity (experiments, milestones), not micro-steps.
 - Only update worker config (.claude/CLAUDE.md) when conventions genuinely change.
 - Use ask_user only for genuine blocking decisions, not routine status updates.
@@ -171,6 +180,7 @@ class TaskState:
     status: str = "running"  # running, done, stuck, error, stopped
     iteration: int = 0
     max_iterations: int = MAX_ITERATIONS
+    continuous_mode: bool = CONTINUOUS_MODE_DEFAULT
     sdk_session_id: str = ""  # backward-compat alias of orchestrator_session_id
     orchestrator_session_id: str = ""
     worker_session_id: str = ""
@@ -211,10 +221,51 @@ def _interrupt_payload_text(payload) -> str:
     return str(payload or "").strip()
 
 
-def _enqueue_interrupt(project_id: str, message: str, kind: str = "user_message") -> int:
+def _normalize_urgency(raw: str) -> str:
+    value = str(raw or "normal").strip().lower()
+    return value if value in ("normal", "urgent") else "normal"
+
+
+def _parse_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _interrupt_payload_meta(payload) -> dict:
+    if isinstance(payload, dict):
+        text = str(payload.get("text", "")).strip()
+        urgency = _normalize_urgency(payload.get("urgency", "normal"))
+        kind = str(payload.get("kind", "user_message")).strip() or "user_message"
+        ts = payload.get("ts")
+        if not isinstance(ts, (int, float)):
+            ts = time.time()
+        return {"text": text, "urgency": urgency, "kind": kind, "ts": float(ts)}
+    text = _interrupt_payload_text(payload)
+    return {"text": text, "urgency": "normal", "kind": "user_message", "ts": time.time()}
+
+
+def _enqueue_interrupt(
+    project_id: str,
+    message: str,
+    kind: str = "user_message",
+    urgency: str = "normal",
+) -> int:
     """Append a typed interrupt payload; bounded by queue size."""
     queue = _ensure_interrupt_queue(project_id)
-    payload = {"kind": kind, "text": message, "ts": time.time()}
+    payload = {
+        "kind": kind,
+        "text": message,
+        "urgency": _normalize_urgency(urgency),
+        "ts": time.time(),
+    }
 
     if queue.full():
         try:
@@ -411,7 +462,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
     async def assign_worker(args):
         state.iteration += 1
 
-        if state.iteration > state.max_iterations:
+        if state.max_iterations > 0 and state.iteration > state.max_iterations:
             return {
                 "content": [{"type": "text", "text":
                     f"Worker assignment limit ({state.max_iterations}) reached. "
@@ -428,7 +479,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         task_desc = args["task"]
 
         # Drain any pending user interrupts
-        interrupts = _drain_interruptions(project_id)
+        interrupts = _drain_interrupt_payloads(project_id)
 
         await emit_progress(
             project_id,
@@ -490,8 +541,8 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         result_text = report
         if interrupts:
             result_text += "\n\n[USER INTERRUPTIONS]\n"
-            for msg in interrupts:
-                result_text += f"- {msg}\n"
+            for item in interrupts:
+                result_text += f"- ({item['urgency']}) {item['text']}\n"
 
         return {"content": [{"type": "text", "text": result_text}]}
 
@@ -520,6 +571,30 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         return {"content": [{"type": "text", "text": f"Task marked complete: {args['summary']}"}]}
 
     @tool(
+        "pull_user_messages",
+        "Fetch queued user messages with urgency metadata. "
+        "Use this periodically to integrate non-urgent guidance and urgent interruptions.",
+        {},
+    )
+    async def pull_user_messages(_args):
+        pending = _drain_interrupt_payloads(project_id)
+        if not pending:
+            return {"content": [{"type": "text", "text": "No queued user messages."}]}
+
+        lines = []
+        for idx, item in enumerate(pending, start=1):
+            lines.append(f"{idx}. [{item['urgency']}] {item['text']}")
+
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Queued user messages:\n" + "\n".join(lines),
+                }
+            ]
+        }
+
+    @tool(
         "ask_user",
         "Ask the professor/user a blocking question. "
         "Use sparingly — only for genuine decisions or information "
@@ -532,6 +607,11 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
         state.status = "stuck"
         state.summary = f"Needs input: {question}"
+        _save_state(
+            state,
+            orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
+            worker_session_id=worker_sessions.get(project_id, ""),
+        )
 
         await emit_progress(
             project_id,
@@ -542,10 +622,20 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             answer = await _wait_for_interrupt_text(project_id, timeout=600)
             state.status = "running"
             state.summary = ""
+            _save_state(
+                state,
+                orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
+                worker_session_id=worker_sessions.get(project_id, ""),
+            )
             return {"content": [{"type": "text", "text": f"User responded: {answer}"}]}
         except asyncio.TimeoutError:
             state.status = "running"
             state.summary = ""
+            _save_state(
+                state,
+                orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
+                worker_session_id=worker_sessions.get(project_id, ""),
+            )
             return {"content": [{"type": "text", "text":
                 "No user response after 10 minutes. "
                 "Proceed with your best judgment or call task_complete with current progress."}]}
@@ -618,20 +708,54 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
     return create_sdk_mcp_server(
         "daemon",
-        tools=[assign_worker, task_complete, ask_user, update_task_list, append_log, update_worker_config],
+        tools=[
+            assign_worker,
+            task_complete,
+            pull_user_messages,
+            ask_user,
+            update_task_list,
+            append_log,
+            update_worker_config,
+        ],
     )
 
 
 # -- main task runner --------------------------------------------------
 
 
-async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_ITERATIONS):
-    """Run autonomous task with MCP tool-driven orchestrator.
+def _build_orchestrator_options(
+    project_dir: str,
+    mcp_server,
+    max_iterations: int,
+    session_id: str,
+) -> ClaudeAgentOptions:
+    if max_iterations > 0:
+        max_turns = max(8, max_iterations * 8)
+    else:
+        # Unlimited worker assignments still need a practical per-query turn cap.
+        max_turns = 160
 
-    The orchestrator runs as a single continuous query() call. It uses MCP tools
-    (assign_worker, task_complete, etc.) to drive the workflow — no outer loop
-    or text-marker parsing needed.
-    """
+    options = ClaudeAgentOptions(
+        permission_mode="bypassPermissions",
+        model="claude-opus-4-6",
+        cwd=project_dir,
+        mcp_servers={"daemon": mcp_server},
+        max_turns=max_turns,
+    )
+    if session_id:
+        options.resume = session_id
+    else:
+        options.system_prompt = ORCHESTRATOR_PROMPT
+    return options
+
+
+async def run_task(
+    project_id: str,
+    task_text: str,
+    max_iterations: int = MAX_ITERATIONS,
+    continuous_mode: bool = CONTINUOUS_MODE_DEFAULT,
+):
+    """Run autonomous task with MCP tool-driven orchestrator."""
     os.environ.pop("CLAUDECODE", None)
 
     project = projects.get(project_id)
@@ -645,6 +769,7 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         project_id=project_id,
         task_text=task_text,
         max_iterations=max_iterations,
+        continuous_mode=continuous_mode,
     )
     task_states[project_id] = state
 
@@ -665,53 +790,81 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
 
     prompt = f"[TASK]\n{task_text}"
 
-    options = ClaudeAgentOptions(
-        permission_mode="bypassPermissions",
-        model="claude-opus-4-6",
-        cwd=project.project_dir,
-        mcp_servers={"daemon": mcp_server},
-        max_turns=max_iterations * 8,
-    )
-
-    if orchestrator_session_id:
-        options.resume = orchestrator_session_id
-    else:
-        options.system_prompt = ORCHESTRATOR_PROMPT
-
-    done_event = asyncio.Event()
-
     try:
-        async for message in query(
-            prompt=_prompt_stream(prompt, done_event), options=options
-        ):
-            if isinstance(message, AssistantMessage):
-                await _forward_assistant_message(
-                    project_id, message, state.iteration, source="orchestrator"
-                )
-            elif isinstance(message, ResultMessage):
-                orchestrator_session_id = message.session_id
-                orchestrator_sessions[project_id] = orchestrator_session_id
-                state.orchestrator_session_id = orchestrator_session_id
-                state.sdk_session_id = orchestrator_session_id
-                done_event.set()
+        next_prompt = prompt
+        while True:
+            done_event = asyncio.Event()
+            options = _build_orchestrator_options(
+                project_dir=project.project_dir,
+                mcp_server=mcp_server,
+                max_iterations=max_iterations,
+                session_id=orchestrator_session_id,
+            )
+            saw_result = False
 
-        # If orchestrator ended without calling task_complete
-        if state.status == "running":
-            state.status = "done"
-            state.summary = "Orchestrator session ended naturally"
-            state.finished_at = time.time()
-            # Empty data so web layer only shows progress status, not a chat message
-            # (only explicit task_complete summaries should appear in chat)
+            async for message in query(
+                prompt=_prompt_stream(next_prompt, done_event), options=options
+            ):
+                if isinstance(message, AssistantMessage):
+                    await _forward_assistant_message(
+                        project_id, message, state.iteration, source="orchestrator"
+                    )
+                elif isinstance(message, ResultMessage):
+                    sid = (message.session_id or "").strip()
+                    if sid:
+                        orchestrator_session_id = sid
+                        orchestrator_sessions[project_id] = sid
+                        state.orchestrator_session_id = sid
+                        state.sdk_session_id = sid
+                    saw_result = True
+                    done_event.set()
+
+            if state.status != "running":
+                break
+
+            if not continuous_mode:
+                state.status = "done"
+                state.summary = "Orchestrator session ended naturally"
+                state.finished_at = time.time()
+                # Empty data so web layer only shows progress status, not a chat message
+                # (only explicit task_complete summaries should appear in chat)
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(type="done", data="", iteration=state.iteration),
+                )
+                break
+
+            if not saw_result:
+                log.warning(
+                    "Orchestrator query ended without ResultMessage for %s; continuing in continuous mode",
+                    project_id,
+                )
+
             await emit_progress(
                 project_id,
-                ProgressEvent(type="done", data="", iteration=state.iteration),
+                ProgressEvent(
+                    type="iteration",
+                    data="Continuing autonomously from task_list and current context",
+                    iteration=state.iteration,
+                ),
             )
+            _save_state(
+                state,
+                orchestrator_session_id=orchestrator_session_id,
+                worker_session_id=worker_sessions.get(project_id, ""),
+            )
+
+            next_prompt = (
+                "[CONTINUE]\n"
+                "No new user instruction. Continue autonomously from task_list.md and LOG.md. "
+                "Pull queued user messages if needed, then keep driving progress."
+            )
+            await asyncio.sleep(0.2)
 
     except asyncio.CancelledError:
         state.status = "stopped"
         state.summary = "Task cancelled"
         state.finished_at = time.time()
-        done_event.set()
         await emit_progress(
             project_id,
             ProgressEvent(type="stopped", data="Task cancelled", iteration=state.iteration),
@@ -721,7 +874,6 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         state.status = "error"
         state.error = str(e)
         state.finished_at = time.time()
-        done_event.set()
         await emit_progress(
             project_id,
             ProgressEvent(type="error", data=str(e), iteration=state.iteration),
@@ -735,22 +887,27 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         )
 
 
-def _drain_interruptions(project_id: str) -> list[str]:
-    """Drain all pending interruption messages for a project."""
+def _drain_interrupt_payloads(project_id: str) -> list[dict]:
+    """Drain all pending interruption payloads for a project."""
     queue = interrupt_queues.get(project_id)
     if not queue:
         return []
 
-    msgs = []
+    payloads: list[dict] = []
     while not queue.empty():
         try:
             payload = queue.get_nowait()
-            text = _interrupt_payload_text(payload)
-            if text:
-                msgs.append(text)
+            meta = _interrupt_payload_meta(payload)
+            if meta["text"]:
+                payloads.append(meta)
         except asyncio.QueueEmpty:
             break
-    return msgs
+    return payloads
+
+
+def _drain_interruptions(project_id: str) -> list[str]:
+    """Drain pending interruptions and return text-only messages."""
+    return [item["text"] for item in _drain_interrupt_payloads(project_id)]
 
 
 
@@ -842,6 +999,7 @@ def _save_state(
         "status": state.status,
         "iteration": state.iteration,
         "max_iterations": state.max_iterations,
+        "continuous_mode": state.continuous_mode,
         "sdk_session_id": orchestrator_session_id,
         "orchestrator_session_id": orchestrator_session_id,
         "worker_session_id": worker_session_id,
@@ -865,6 +1023,26 @@ def _load_state(project_id: str) -> dict | None:
         return json.load(f)
 
 
+def _hydrate_sessions_from_state(project_id: str) -> bool:
+    """Restore orchestrator/worker session IDs from persisted state."""
+    data = _load_state(project_id)
+    if not data:
+        return False
+
+    orch_sid = str(
+        data.get("orchestrator_session_id")
+        or data.get("sdk_session_id")
+        or ""
+    ).strip()
+    worker_sid = str(data.get("worker_session_id") or "").strip()
+
+    if orch_sid:
+        orchestrator_sessions[project_id] = orch_sid
+    if worker_sid:
+        worker_sessions[project_id] = worker_sid
+    return bool(orch_sid or worker_sid)
+
+
 # -- http handlers -----------------------------------------------------
 
 
@@ -878,6 +1056,8 @@ async def handle_register(request: web.Request) -> web.Response:
 
     name = data.get("name", project_id)
     projects[project_id] = Project(project_id=project_id, project_dir=project_dir, name=name)
+    if _hydrate_sessions_from_state(project_id):
+        log.info("Restored persisted session IDs for %s", project_id)
     log.info("Registered project %s: %s", project_id, project_dir)
     return web.json_response({"ok": True, "project_id": project_id})
 
@@ -887,10 +1067,18 @@ async def handle_task(request: web.Request) -> web.Response:
     data = await request.json()
     project_id = data.get("project_id")
     task_text = data.get("task")
-    max_iter = data.get("max_iterations", MAX_ITERATIONS)
+    max_iter_raw = data.get("max_iterations", MAX_ITERATIONS)
+    continuous_mode = _parse_bool(data.get("continuous_mode"), CONTINUOUS_MODE_DEFAULT)
 
     if not project_id or not task_text:
         return web.json_response({"error": "project_id and task required"}, status=400)
+
+    try:
+        max_iter = int(max_iter_raw)
+    except (TypeError, ValueError):
+        return web.json_response({"error": "max_iterations must be an integer"}, status=400)
+    if max_iter < 0:
+        return web.json_response({"error": "max_iterations must be >= 0"}, status=400)
 
     if project_id not in projects:
         return web.json_response(
@@ -908,10 +1096,24 @@ async def handle_task(request: web.Request) -> web.Response:
             status=409,
         )
 
-    task = asyncio.create_task(run_task(project_id, task_text, max_iter))
+    task = asyncio.create_task(
+        run_task(
+            project_id,
+            task_text,
+            max_iter,
+            continuous_mode=continuous_mode,
+        )
+    )
     running_tasks[project_id] = task
 
-    return web.json_response({"ok": True, "project_id": project_id, "status": "started"})
+    return web.json_response(
+        {
+            "ok": True,
+            "project_id": project_id,
+            "status": "started",
+            "continuous_mode": continuous_mode,
+        }
+    )
 
 
 async def handle_interrupt(request: web.Request) -> web.Response:
@@ -919,6 +1121,7 @@ async def handle_interrupt(request: web.Request) -> web.Response:
     data = await request.json()
     project_id = data.get("project_id")
     message = str(data.get("message", "")).strip()
+    urgency = _normalize_urgency(data.get("urgency", "normal"))
 
     if not project_id:
         return web.json_response({"error": "project_id required"}, status=400)
@@ -927,10 +1130,16 @@ async def handle_interrupt(request: web.Request) -> web.Response:
     if not message:
         return web.json_response({"error": "message required"}, status=400)
 
-    qsize = _enqueue_interrupt(project_id, message)
+    qsize = _enqueue_interrupt(project_id, message, urgency=urgency)
 
-    log.info("Interrupt queued for %s (size=%s): %s", project_id, qsize, message[:100])
-    return web.json_response({"ok": True, "queued": True, "queue_size": qsize})
+    log.info(
+        "Interrupt queued for %s urgency=%s (size=%s): %s",
+        project_id,
+        urgency,
+        qsize,
+        message[:100],
+    )
+    return web.json_response({"ok": True, "queued": True, "urgency": urgency, "queue_size": qsize})
 
 
 async def handle_status(request: web.Request) -> web.Response:
@@ -946,6 +1155,7 @@ async def handle_status(request: web.Request) -> web.Response:
                 "status": state.status if state else "idle",
                 "iteration": state.iteration if state else 0,
                 "max_iterations": state.max_iterations if state else MAX_ITERATIONS,
+                "continuous_mode": state.continuous_mode if state else CONTINUOUS_MODE_DEFAULT,
                 "summary": state.summary if state else "",
             }
         return web.json_response(result)
@@ -963,6 +1173,7 @@ async def handle_status(request: web.Request) -> web.Response:
             "status": state.status,
             "iteration": state.iteration,
             "max_iterations": state.max_iterations,
+            "continuous_mode": state.continuous_mode,
             "task_text": state.task_text[:500],
             "summary": state.summary,
             "error": state.error,
