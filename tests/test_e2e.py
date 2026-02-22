@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,27 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
         await done.wait()
 
 
+def _unique_project_id(prefix: str) -> str:
+    """Generate a collision-resistant project_id for test isolation."""
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _base_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+async def _start_test_server(app: web.Application) -> tuple[web.AppRunner, int]:
+    """Start an aiohttp test server on an ephemeral localhost port."""
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    sockets = site._server.sockets if site._server else []
+    assert sockets, "Test server did not expose a bound socket"
+    port = int(sockets[0].getsockname()[1])
+    return runner, port
+
+
 # ── Daemon helpers ────────────────────────────────────────────────────
 
 
@@ -62,31 +84,60 @@ def _setup_daemon_app():
 def _patch_daemon_globals(name: str, callback_url: str):
     """Patch daemon module globals and return a restore function."""
     import tools.orchestrator_daemon as daemon_mod
+
+    state_dir_ctx = tempfile.TemporaryDirectory(prefix="dcc_e2e_state_")
+    state_dir = Path(state_dir_ctx.name)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
     orig = {
         "DAEMON_NAME": daemon_mod.DAEMON_NAME,
         "CALLBACK_URL": daemon_mod.CALLBACK_URL,
+        "STATE_DIR": daemon_mod.STATE_DIR,
         "projects": dict(daemon_mod.projects),
         "task_states": dict(daemon_mod.task_states),
         "running_tasks": dict(daemon_mod.running_tasks),
+        "interrupt_queues": dict(daemon_mod.interrupt_queues),
+        "cancel_events": dict(daemon_mod.cancel_events),
+        "sse_subscribers": dict(daemon_mod.sse_subscribers),
         "orchestrator_sessions": dict(daemon_mod.orchestrator_sessions),
         "worker_sessions": dict(daemon_mod.worker_sessions),
     }
     daemon_mod.DAEMON_NAME = name
     daemon_mod.CALLBACK_URL = callback_url
+    daemon_mod.STATE_DIR = state_dir
+    daemon_mod.projects.clear()
+    daemon_mod.task_states.clear()
+    daemon_mod.running_tasks.clear()
+    daemon_mod.interrupt_queues.clear()
+    daemon_mod.cancel_events.clear()
+    daemon_mod.sse_subscribers.clear()
+    daemon_mod.orchestrator_sessions.clear()
+    daemon_mod.worker_sessions.clear()
 
     def restore():
+        for task in list(daemon_mod.running_tasks.values()):
+            if not task.done():
+                task.cancel()
         daemon_mod.DAEMON_NAME = orig["DAEMON_NAME"]
         daemon_mod.CALLBACK_URL = orig["CALLBACK_URL"]
+        daemon_mod.STATE_DIR = orig["STATE_DIR"]
         daemon_mod.projects.clear()
         daemon_mod.projects.update(orig["projects"])
         daemon_mod.task_states.clear()
         daemon_mod.task_states.update(orig["task_states"])
         daemon_mod.running_tasks.clear()
         daemon_mod.running_tasks.update(orig["running_tasks"])
+        daemon_mod.interrupt_queues.clear()
+        daemon_mod.interrupt_queues.update(orig["interrupt_queues"])
+        daemon_mod.cancel_events.clear()
+        daemon_mod.cancel_events.update(orig["cancel_events"])
+        daemon_mod.sse_subscribers.clear()
+        daemon_mod.sse_subscribers.update(orig["sse_subscribers"])
         daemon_mod.orchestrator_sessions.clear()
         daemon_mod.orchestrator_sessions.update(orig["orchestrator_sessions"])
         daemon_mod.worker_sessions.clear()
         daemon_mod.worker_sessions.update(orig["worker_sessions"])
+        state_dir_ctx.cleanup()
 
     return restore
 
@@ -158,14 +209,12 @@ async def test_e2e_daemon_health():
 
     restore = _patch_daemon_globals(name="test", callback_url="http://127.0.0.1:19999")
     app = _setup_daemon_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 18300)
-    await site.start()
+    runner, port = await _start_test_server(app)
+    base = _base_url(port)
 
     try:
         async with ClientSession() as http:
-            async with http.get("http://127.0.0.1:18300/health") as resp:
+            async with http.get(f"{base}/health") as resp:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["status"] == "ok"
@@ -184,24 +233,23 @@ async def test_e2e_daemon_task():
     """Register a project on the daemon and start a task that runs RALPH loop."""
     _clear_nesting_guard()
 
+    project_id = _unique_project_id("e2e-task")
     restore = _patch_daemon_globals(
         name="e2e-test",
         callback_url="http://127.0.0.1:19999",  # dummy — won't trigger escalation
     )
 
     app = _setup_daemon_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 18301)
-    await site.start()
+    runner, port = await _start_test_server(app)
+    base = _base_url(port)
 
     try:
         async with ClientSession() as http:
             # Register project
             async with http.post(
-                "http://127.0.0.1:18301/register",
+                f"{base}/register",
                 json={
-                    "project_id": "e2e-test",
+                    "project_id": project_id,
                     "project_dir": "/tmp",
                     "name": "E2E Test",
                 },
@@ -212,23 +260,28 @@ async def test_e2e_daemon_task():
 
             # Start task
             async with http.post(
-                "http://127.0.0.1:18301/task",
+                f"{base}/task",
                 json={
-                    "project_id": "e2e-test",
+                    "project_id": project_id,
                     "task": "Reply with 'TASK_OK' and call task_complete immediately.",
-                    "max_iterations": 3,
                 },
             ) as resp:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["ok"] is True
                 assert data["status"] == "started"
+                assert data["project_id"] == project_id
+
+            # Verify /task default max_iterations=0 is applied when omitted.
+            async with http.get(f"{base}/status?project_id={project_id}") as resp:
+                status = await resp.json()
+                assert status["max_iterations"] == 0
 
             # Wait for completion
             for _ in range(60):
                 await asyncio.sleep(2)
                 async with http.get(
-                    "http://127.0.0.1:18301/status?project_id=e2e-test"
+                    f"{base}/status?project_id={project_id}"
                 ) as resp:
                     status = await resp.json()
                     if status.get("status") in ("done", "error", "stuck"):
@@ -253,54 +306,77 @@ async def test_e2e_daemon_interrupt():
     """Interrupt a running daemon task — verify interrupt is queued."""
     _clear_nesting_guard()
 
+    project_id = _unique_project_id("e2e-int")
     restore = _patch_daemon_globals(
         name="e2e-int",
         callback_url="http://127.0.0.1:19999",
     )
 
     app = _setup_daemon_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 18302)
-    await site.start()
+    runner, port = await _start_test_server(app)
+    base = _base_url(port)
 
     try:
         async with ClientSession() as http:
             # Register
-            await http.post(
-                "http://127.0.0.1:18302/register",
-                json={"project_id": "int-test", "project_dir": "/tmp"},
-            )
+            async with http.post(
+                f"{base}/register",
+                json={"project_id": project_id, "project_dir": "/tmp"},
+            ) as resp:
+                assert resp.status == 200
 
             # Start a longer task
-            await http.post(
-                "http://127.0.0.1:18302/task",
+            async with http.post(
+                f"{base}/task",
                 json={
-                    "project_id": "int-test",
+                    "project_id": project_id,
                     "task": "List all files in /tmp and summarize. Call task_complete when done.",
                     "max_iterations": 5,
                 },
-            )
+            ) as resp:
+                assert resp.status == 200
 
             # Wait a moment then interrupt
             await asyncio.sleep(1)
             async with http.post(
-                "http://127.0.0.1:18302/interrupt",
-                json={"project_id": "int-test", "message": "Also check /tmp/test if it exists"},
+                f"{base}/interrupt",
+                json={
+                    "project_id": project_id,
+                    "message": "Also check /tmp/test if it exists",
+                    "urgency": "normal",
+                },
             ) as resp:
                 data = await resp.json()
                 assert data["ok"] is True
                 assert data["queued"] is True
+                assert data["urgency"] == "normal"
+
+            # Urgent interrupts should preserve urgency metadata.
+            async with http.post(
+                f"{base}/interrupt",
+                json={
+                    "project_id": project_id,
+                    "message": "Urgent: prioritize /tmp/test now",
+                    "urgency": "urgent",
+                },
+            ) as resp:
+                data = await resp.json()
+                assert data["ok"] is True
+                assert data["queued"] is True
+                assert data["urgency"] == "urgent"
 
             # Wait for completion
+            status = {}
             for _ in range(60):
                 await asyncio.sleep(2)
                 async with http.get(
-                    "http://127.0.0.1:18302/status?project_id=int-test"
+                    f"{base}/status?project_id={project_id}"
                 ) as resp:
                     status = await resp.json()
                     if status.get("status") in ("done", "error", "stuck"):
                         break
+            else:
+                pytest.fail("Interrupt test did not complete within timeout")
 
             print(f"Interrupt test final status: {status}")
             # Task should finish (done or stuck, not error)
@@ -323,43 +399,59 @@ async def test_e2e_sdk_can_use_tool():
     """
     _clear_nesting_guard()
 
-    tool_calls = []
+    with tempfile.TemporaryDirectory(prefix="dcc_e2e_tools_") as sandbox:
+        expected_name = f"tool_probe_{uuid.uuid4().hex[:8]}.py"
+        (Path(sandbox) / expected_name).write_text("print('probe')\n")
 
-    async def track_tools(tool_name, input_data, context=None):
-        tool_calls.append(tool_name)
-        return PermissionResultAllow()
+        tool_calls = []
 
-    done_event = asyncio.Event()
-    options = ClaudeAgentOptions(
-        model="haiku",
-        cwd="/tmp",
-        can_use_tool=track_tools,
-        allowed_tools=["Read", "Glob"],
-    )
+        async def track_tools(tool_name, input_data, context=None):
+            tool_calls.append(tool_name)
+            return PermissionResultAllow()
 
-    got_result = False
-    async for message in query(
-        prompt=_prompt_stream("List .py files in /tmp (if any). Reply with the count.", done_event),
-        options=options,
-    ):
-        if isinstance(message, ResultMessage):
-            got_result = True
-            done_event.set()
-            print(f"can_use_tool result: {message.result[:200]}")
-            print(f"Tools used: {tool_calls}")
+        done_event = asyncio.Event()
+        options = ClaudeAgentOptions(
+            model="haiku",
+            cwd=sandbox,
+            can_use_tool=track_tools,
+            allowed_tools=["Read", "Glob"],
+        )
 
-    assert got_result, "Never received a ResultMessage"
+        got_result = False
+        result_text = ""
+        async for message in query(
+            prompt=_prompt_stream(
+                "There is exactly one .py file in the current directory. "
+                "Use Glob to find it, then reply with that filename only.",
+                done_event,
+            ),
+            options=options,
+        ):
+            if isinstance(message, ResultMessage):
+                got_result = True
+                result_text = message.result or ""
+                done_event.set()
+                print(f"can_use_tool result: {result_text[:200]}")
+                print(f"Tools used: {tool_calls}")
+
+        assert got_result, "Never received a ResultMessage"
+        assert tool_calls, "Expected can_use_tool callback to be invoked at least once"
+        assert any("glob" in str(name).lower() for name in tool_calls), (
+            f"Expected Glob tool usage. Saw: {tool_calls}"
+        )
+        assert expected_name in result_text, (
+            f"Model did not identify expected file {expected_name!r}: {result_text!r}"
+        )
 
 
 # ── Daemon E2E helper ─────────────────────────────────────────────────
 
 
 async def _run_daemon_task(
-    port: int,
     sandbox: str,
     project_id: str,
     task: str,
-    max_iterations: int = 5,
+    max_iterations: int | None = None,
     timeout_secs: int = 180,
 ) -> dict:
     """Spin up a daemon, register a sandbox project, run a task, return final status."""
@@ -368,12 +460,9 @@ async def _run_daemon_task(
         callback_url="http://127.0.0.1:19999",
     )
     app = _setup_daemon_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", port)
-    await site.start()
+    runner, port = await _start_test_server(app)
 
-    base = f"http://127.0.0.1:{port}"
+    base = _base_url(port)
     try:
         async with ClientSession(timeout=ClientTimeout(total=timeout_secs + 30)) as http:
             # Register project
@@ -384,9 +473,12 @@ async def _run_daemon_task(
                 assert resp.status == 200
 
             # Start task
+            task_payload = {"project_id": project_id, "task": task}
+            if max_iterations is not None:
+                task_payload["max_iterations"] = max_iterations
             async with http.post(
                 f"{base}/task",
-                json={"project_id": project_id, "task": task, "max_iterations": max_iterations},
+                json=task_payload,
             ) as resp:
                 assert resp.status == 200
 
@@ -413,10 +505,10 @@ async def test_e2e_mcp_assign_worker_and_complete():
     _clear_nesting_guard()
 
     with tempfile.TemporaryDirectory(prefix="dcc_e2e_mcp_") as sandbox:
+        project_id = _unique_project_id("mcp-worker")
         status = await _run_daemon_task(
-            port=18310,
             sandbox=sandbox,
-            project_id="mcp-worker",
+            project_id=project_id,
             task=(
                 "Do the following steps in order:\n"
                 "1. Call update_task_list with a short plan (2-3 items)\n"
@@ -457,30 +549,29 @@ async def test_e2e_mcp_ask_user_with_interrupt():
     _clear_nesting_guard()
 
     with tempfile.TemporaryDirectory(prefix="dcc_e2e_ask_") as sandbox:
+        project_id = _unique_project_id("ask-test")
         restore = _patch_daemon_globals(
             name="e2e-ask",
             callback_url="http://127.0.0.1:19999",
         )
         app = _setup_daemon_app()
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", 18311)
-        await site.start()
+        runner, port = await _start_test_server(app)
 
-        base = "http://127.0.0.1:18311"
+        base = _base_url(port)
         try:
             async with ClientSession(timeout=ClientTimeout(total=210)) as http:
                 # Register
-                await http.post(
+                async with http.post(
                     f"{base}/register",
-                    json={"project_id": "ask-test", "project_dir": sandbox, "name": "ask-test"},
-                )
+                    json={"project_id": project_id, "project_dir": sandbox, "name": project_id},
+                ) as resp:
+                    assert resp.status == 200
 
                 # Start task that requires user input
-                await http.post(
+                async with http.post(
                     f"{base}/task",
                     json={
-                        "project_id": "ask-test",
+                        "project_id": project_id,
                         "task": (
                             "You need to create a config file. "
                             "First, call ask_user to ask: 'What should the project name be?' "
@@ -490,13 +581,15 @@ async def test_e2e_mcp_ask_user_with_interrupt():
                         ),
                         "max_iterations": 5,
                     },
-                )
+                ) as resp:
+                    assert resp.status == 200
 
                 # Wait for stuck status (ask_user blocks)
                 got_stuck = False
+                status = {}
                 for _ in range(60):
                     await asyncio.sleep(2)
-                    async with http.get(f"{base}/status?project_id=ask-test") as resp:
+                    async with http.get(f"{base}/status?project_id={project_id}") as resp:
                         status = await resp.json()
                         st = status.get("status", "")
                         if st == "stuck":
@@ -506,19 +599,23 @@ async def test_e2e_mcp_ask_user_with_interrupt():
                         if st in ("done", "error"):
                             break
 
-                if got_stuck:
-                    # Provide the answer via interrupt
-                    async with http.post(
-                        f"{base}/interrupt",
-                        json={"project_id": "ask-test", "message": "my-awesome-project"},
-                    ) as resp:
-                        data = await resp.json()
-                        assert data["ok"] is True
+                assert got_stuck, (
+                    f"Expected ask_user to block in 'stuck' state before interrupt. Last status: {status}"
+                )
+                assert str(status.get("summary", "")).strip(), "Stuck status should include the question summary"
+
+                # Provide the answer via interrupt
+                async with http.post(
+                    f"{base}/interrupt",
+                    json={"project_id": project_id, "message": "my-awesome-project"},
+                ) as resp:
+                    data = await resp.json()
+                    assert data["ok"] is True
 
                 # Wait for final completion
                 for _ in range(60):
                     await asyncio.sleep(2)
-                    async with http.get(f"{base}/status?project_id=ask-test") as resp:
+                    async with http.get(f"{base}/status?project_id={project_id}") as resp:
                         status = await resp.json()
                         if status.get("status") in ("done", "error"):
                             break
@@ -532,9 +629,15 @@ async def test_e2e_mcp_ask_user_with_interrupt():
 
                 # Verify config.json was created
                 config_path = Path(sandbox) / "config.json"
-                if config_path.exists():
-                    config_content = config_path.read_text()
-                    print(f"config.json content: {config_content}")
+                assert config_path.exists(), (
+                    f"Expected worker to create config.json after ask_user. Files: {os.listdir(sandbox)}"
+                )
+                config_content = config_path.read_text()
+                print(f"config.json content: {config_content}")
+                parsed = json.loads(config_content)
+                assert parsed.get("name") == "my-awesome-project", (
+                    f"Unexpected config content: {parsed}"
+                )
 
         finally:
             restore()
@@ -558,22 +661,10 @@ async def test_e2e_full_stack_web_to_worker():
     """
     _clear_nesting_guard()
 
-    DAEMON_PORT = 18320
-    CALLBACK_PORT = 18321
-    WEB_PORT = 18322
+    project_id = _unique_project_id("full-test")
 
     with tempfile.TemporaryDirectory(prefix="dcc_e2e_full_") as sandbox:
-        # ── 1. Start daemon ──────────────────────────────────────────
-        restore = _patch_daemon_globals(
-            name="e2e-full",
-            callback_url=f"http://127.0.0.1:{CALLBACK_PORT}",
-        )
-        daemon_app = _setup_daemon_app()
-        daemon_runner = web.AppRunner(daemon_app)
-        await daemon_runner.setup()
-        await web.TCPSite(daemon_runner, "127.0.0.1", DAEMON_PORT).start()
-
-        # ── 2. Set up Router + Store ─────────────────────────────────
+        # ── 1. Set up Router + Store ─────────────────────────────────
         from src.router import Router, RemoteOrchestrator
         from src.store import Store
         from src.web import WebChat
@@ -583,14 +674,8 @@ async def test_e2e_full_stack_web_to_worker():
 
         router = Router()
         await router.init()
-        router._orchestrators["full-test"] = RemoteOrchestrator(
-            project_id="full-test",
-            name="full-test",
-            broker_port=DAEMON_PORT,
-            project_dir=sandbox,
-        )
 
-        # ── 3. Start callback server (daemon → router) ──────────────
+        # ── 2. Start callback server (daemon → router) ──────────────
         callback_app = web.Application()
 
         async def handle_callback_progress(request):
@@ -601,9 +686,24 @@ async def test_e2e_full_stack_web_to_worker():
             return web.json_response({"ok": True})
 
         callback_app.router.add_post("/progress", handle_callback_progress)
-        callback_runner = web.AppRunner(callback_app)
-        await callback_runner.setup()
-        await web.TCPSite(callback_runner, "127.0.0.1", CALLBACK_PORT).start()
+        callback_runner, callback_port = await _start_test_server(callback_app)
+        callback_url = f"{_base_url(callback_port)}/progress"
+
+        # ── 3. Start daemon ──────────────────────────────────────────
+        restore = _patch_daemon_globals(
+            name="e2e-full",
+            callback_url=callback_url,
+        )
+        daemon_app = _setup_daemon_app()
+        daemon_runner, daemon_port = await _start_test_server(daemon_app)
+
+        # Register router's remote orchestrator after daemon port is known.
+        router._orchestrators[project_id] = RemoteOrchestrator(
+            project_id=project_id,
+            name=project_id,
+            broker_port=daemon_port,
+            project_dir=sandbox,
+        )
 
         # ── 4. Start WebChat ─────────────────────────────────────────
         web_chat = WebChat(router=router, store=store)
@@ -619,29 +719,28 @@ async def test_e2e_full_stack_web_to_worker():
         web_app.router.add_get("/api/projects", web_chat._handle_projects_list)
         web_app.router.add_get("/ws", web_chat._handle_ws)
 
-        web_runner = web.AppRunner(web_app)
-        await web_runner.setup()
-        await web.TCPSite(web_runner, "127.0.0.1", WEB_PORT).start()
+        web_runner, web_port = await _start_test_server(web_app)
+        web_base = _base_url(web_port)
 
         # ── 5. Drive test via WebSocket ──────────────────────────────
         try:
             async with ClientSession() as http:
                 # Create channel connected to our project
                 async with http.post(
-                    f"http://127.0.0.1:{WEB_PORT}/api/channels",
-                    json={"name": "e2e-full", "project_id": "full-test"},
+                    f"{web_base}/api/channels",
+                    json={"name": "e2e-full", "project_id": project_id},
                 ) as resp:
                     assert resp.status == 200
                     channel_data = await resp.json()
                     channel_id = channel_data["id"]
 
                 # Connect WebSocket
-                async with http.ws_connect(f"http://127.0.0.1:{WEB_PORT}/ws") as ws:
+                async with http.ws_connect(f"{web_base}/ws") as ws:
                     # Switch to channel
                     await ws.send_json({"type": "switch_channel", "channel_id": channel_id})
                     switch_msg = await asyncio.wait_for(ws.receive_json(), timeout=5)
                     assert switch_msg["type"] == "channel_switched"
-                    assert switch_msg["project_id"] == "full-test"
+                    assert switch_msg["project_id"] == project_id
                     print(f"Channel switched: {switch_msg}")
 
                     # Send task message
