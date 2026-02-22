@@ -20,7 +20,7 @@ You (web UI) -> Router (local) -> Daemon (remote)
                                -> Orchestrator (plans, uses MCP tools)
                                -> Worker assignment via assign_worker tool
                                -> Worker report via submit_report tool
-                               -> Repeat until task_complete called
+                               -> Continue autonomously (continuous_mode=true) until /stop or task_complete
 ```
 
 The UI shows:
@@ -95,7 +95,7 @@ Investigate why training loss plateaus; maybe reward hacking.
 | You send | Behavior |
 |---|---|
 | `@router <msg>` | Direct message to the router (sysadmin) |
-| `@orchestrator <msg>` | Direct message to orchestrator (interrupt if running) |
+| `@orchestrator <msg>` | Direct message to orchestrator (urgent interrupt if running) |
 
 ### Routing without mentions
 
@@ -103,7 +103,18 @@ Investigate why training loss plateaus; maybe reward hacking.
 |---|---|
 | No project connected | Router (sysadmin brain) |
 | Project connected, idle | Orchestrator (starts new task) |
-| Project connected, running | Queued as next task |
+| Project connected, running | Queued as next task (non-urgent guidance) |
+
+Interruption levels while running:
+- Plain channel message: non-urgent guidance (buffered as next-task context)
+- `@orchestrator ...`: urgent interrupt (`urgency=urgent`)
+
+## Daemon HTTP API (Quick Reference)
+
+| Endpoint | Notes |
+|---|---|
+| `POST /task` | Supports `max_iterations` (set `0` for unlimited worker-assignment cap) and `continuous_mode` (default `true`) |
+| `POST /interrupt` | Supports `urgency`: `normal` (default) or `urgent` |
 
 ## Configuration
 
