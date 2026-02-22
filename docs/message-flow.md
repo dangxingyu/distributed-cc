@@ -54,7 +54,7 @@ From `orchestrator_daemon.py`, events emitted during a task:
 | When | Event type | `data` format |
 |------|-----------|--------------|
 | Task starts | `iteration` | `Starting task: {text}` |
-| `assign_worker` called | `iteration` | `Worker assignment 2/20` |
+| `assign_worker` called | `iteration` | `Worker assignment 2/N` (or `Worker assignment 2 (no cap)` if unbounded) |
 | `assign_worker` called | `tool_use` | `[orchestrator -> worker] {task}` |
 | `assign_worker` called | `text` | `@orchestrator -> @worker: {task}` |
 | Worker completes | `text` | `@worker -> @orchestrator: {report}` |

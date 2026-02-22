@@ -32,7 +32,7 @@ class RemoteOrchestrator:
     host: str | None = None
     broker_port: int = 8200
     project_dir: str = ""
-    max_iterations: int = 20
+    max_iterations: int = 0
     status: str = "unknown"  # idle/running/done/stuck/error/disconnected
 
 
@@ -108,7 +108,7 @@ class Router:
                     host=o.get("host"),
                     broker_port=o.get("broker_port", 8200),
                     project_dir=o.get("project_dir", ""),
-                    max_iterations=o.get("max_iterations", 20),
+                    max_iterations=o.get("max_iterations", 0),
                 )
                 self._orchestrators[project_id] = orch
             return
@@ -124,7 +124,7 @@ class Router:
                 host=s.get("host"),
                 broker_port=s.get("broker_port", 8200),
                 project_dir=s.get("work_dir", s.get("project_dir", "")),
-                max_iterations=s.get("max_iterations", 20),
+                max_iterations=s.get("max_iterations", 0),
             )
             self._orchestrators[project_id] = orch
 
@@ -601,7 +601,10 @@ class Router:
 
                 lines = [f"**{orch.name}** ({project_id}): {status}"]
                 if status == "running":
-                    lines.append(f"Iteration: {iteration}/{max_iter}")
+                    if isinstance(max_iter, int) and max_iter > 0:
+                        lines.append(f"Iteration: {iteration}/{max_iter}")
+                    else:
+                        lines.append(f"Iteration: {iteration} (no cap)")
                 if queued:
                     lines.append(f"Queued tasks: {queued}")
                 if summary:

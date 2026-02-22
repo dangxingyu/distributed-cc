@@ -49,7 +49,7 @@ log = logging.getLogger("daemon")
 
 DAEMON_NAME = os.environ.get("DAEMON_NAME", "unknown")
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
-MAX_ITERATIONS = 20
+MAX_ITERATIONS = 0
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 INTERRUPT_QUEUE_MAX = 100
 CONTINUOUS_MODE_DEFAULT = os.environ.get("CONTINUOUS_MODE", "1").strip().lower() not in (
@@ -490,7 +490,11 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             project_id,
             ProgressEvent(
                 type="iteration",
-                data=f"Worker assignment {state.iteration}/{state.max_iterations}",
+                data=(
+                    f"Worker assignment {state.iteration}/{state.max_iterations}"
+                    if state.max_iterations > 0
+                    else f"Worker assignment {state.iteration} (no cap)"
+                ),
                 iteration=state.iteration,
             ),
         )

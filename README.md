@@ -137,10 +137,7 @@ Current common format:
       "work_dir": "/Users/you/project",
       "broker_port": 8200
     }
-  ],
-  "orchestrator": {
-    "model": "claude-opus-4-6"
-  }
+  ]
 }
 ```
 
@@ -149,6 +146,7 @@ Field meanings:
 - `host`: SSH destination, or `null` for local
 - `work_dir`: project directory on that machine
 - `broker_port`: local forwarded port that maps to remote `:8200`
+- `max_iterations` (optional): worker-assignment cap (`0` means no cap, default)
 
 Start from:
 

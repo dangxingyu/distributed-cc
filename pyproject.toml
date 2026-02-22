@@ -2,11 +2,17 @@
 name = "distributed-cc"
 version = "0.1.0"
 description = "Distribute Claude Code sessions across multiple servers"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "aiohttp>=3.9.0",
     "claude-agent-sdk",
 ]
+
+[project.urls]
+Homepage = "https://github.com/dangxingyu/distributed-cc"
+Repository = "https://github.com/dangxingyu/distributed-cc"
 
 [project.optional-dependencies]
 daemon = ["claude-agent-sdk", "aiohttp>=3.9.0"]

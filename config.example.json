@@ -4,17 +4,15 @@
       "name": "h100",
       "host": "ubuntu@your-server-ip",
       "work_dir": "/home/ubuntu",
-      "broker_port": 8201
+      "broker_port": 8201,
+      "max_iterations": 0
     },
     {
       "name": "local",
       "host": null,
       "work_dir": "/path/to/project",
-      "broker_port": 8200
+      "broker_port": 8200,
+      "max_iterations": 0
     }
-  ],
-
-  "orchestrator": {
-    "model": "claude-opus-4-6"
-  }
+  ]
 }

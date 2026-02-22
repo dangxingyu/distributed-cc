@@ -103,13 +103,10 @@ The config.json has this structure:
       "name": "server-name",
       "host": "user@hostname",    // SSH destination, null for local
       "work_dir": "/path/to/project",
-      "broker_port": 8200         // local port for SSH tunnel
+      "broker_port": 8200,        // local port for SSH tunnel
+      "max_iterations": 0         // optional, 0 means no cap
     }
-  ],
-  "orchestrator": {
-    "model": "claude-opus-4-6",
-    "session_model": "claude-opus-4-6"
-  }
+  ]
 }
 ```
 

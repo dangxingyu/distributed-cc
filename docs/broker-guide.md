@@ -75,7 +75,7 @@ The orchestrator maintains two persistent files per project:
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/register` | POST | Register a project (project_id, project_dir, name) |
-| `/task` | POST | Start autonomous loop (supports `max_iterations` and `continuous_mode`) |
+| `/task` | POST | Start autonomous loop (supports `max_iterations`, default `0` = no cap, and `continuous_mode`) |
 | `/interrupt` | POST | Inject user message (supports `urgency`: `normal`/`urgent`) |
 | `/status` | GET | Current status (idle/running/done/stuck/error) |
 | `/stream` | GET | SSE stream of progress events |
