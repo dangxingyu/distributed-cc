@@ -131,6 +131,19 @@ class Router:
     def _daemon_url(self, orch: RemoteOrchestrator) -> str:
         return f"http://127.0.0.1:{orch.broker_port}"
 
+    def _resp_status(self, resp) -> int:
+        """Best-effort status code extraction for real responses and test mocks."""
+        status = getattr(resp, "status", 200)
+        return status if isinstance(status, int) else 200
+
+    async def _resp_json(self, resp):
+        """Parse JSON even when Content-Type is wrong, with mock compatibility."""
+        try:
+            return await resp.json(content_type=None)
+        except TypeError:
+            # AsyncMock in tests may not accept keyword args
+            return await resp.json()
+
     async def _register_project(self, orch: RemoteOrchestrator):
         url = f"{self._daemon_url(orch)}/register"
         try:
@@ -177,6 +190,9 @@ class Router:
                     # Sync state on (re)connect to catch events missed during gap
                     await self._sync_daemon_status(orch, http)
                     async with http.get(url) as resp:
+                        if resp.status != 200:
+                            body = (await resp.text())[:200]
+                            raise RuntimeError(f"SSE connect failed ({resp.status}): {body}")
                         async for line in resp.content:
                             text = line.decode("utf-8", errors="replace").strip()
                             if not text or text.startswith(":"):
@@ -406,10 +422,11 @@ class Router:
         if not orch or orch.status == "running":
             return
 
-        next_task = queue.pop(0)
-        remaining = len(queue)
+        next_task = queue[0]
         ok, error = await self._start_task_request(project_id, next_task["text"])
         if ok:
+            queue.pop(0)
+            remaining = len(queue)
             orch.status = "running"
             # Notify via progress callback so the web layer can inform the user
             if self._progress_callback:
@@ -427,7 +444,28 @@ class Router:
                 except Exception:
                     pass
         else:
-            log.warning("Failed to start deferred task for %s: %s", project_id, error)
+            retries = int(next_task.get("retries", 0)) + 1
+            next_task["retries"] = retries
+            log.warning(
+                "Failed to start deferred task for %s (attempt %s): %s",
+                project_id,
+                retries,
+                error,
+            )
+            if self._progress_callback:
+                snippet = next_task["text"][:200]
+                try:
+                    await self._progress_callback(project_id, {
+                        "type": "text",
+                        "data": (
+                            "@orchestrator Failed to start queued task: "
+                            f"{snippet} (attempt {retries}, will retry)"
+                        ),
+                        "iteration": 0,
+                        "ts": time.time(),
+                    })
+                except Exception:
+                    pass
 
     async def _start_task_request(self, project_id: str, task_text: str) -> tuple[bool, str]:
         orch = self._orchestrators[project_id]
@@ -441,10 +479,15 @@ class Router:
                     "max_iterations": orch.max_iterations,
                 },
             ) as resp:
-                result = await resp.json()
-                if result.get("ok"):
+                status = self._resp_status(resp)
+                try:
+                    result = await self._resp_json(resp)
+                except Exception:
+                    body = (await resp.text())[:300]
+                    return False, f"Daemon returned non-JSON response (HTTP {status}): {body}"
+                if status == 200 and result.get("ok"):
                     return True, ""
-                return False, result.get("error", "Unknown error")
+                return False, result.get("error", f"HTTP {status}")
         except aiohttp.ClientError as e:
             orch.status = "disconnected"
             return False, str(e)
@@ -473,11 +516,17 @@ class Router:
 
         try:
             async with self._http.post(url, json={"project_id": project_id, "message": message}) as resp:
-                result = await resp.json()
-                if result.get("ok"):
+                status = self._resp_status(resp)
+                try:
+                    result = await self._resp_json(resp)
+                except Exception:
+                    body = (await resp.text())[:300]
+                    await send_reply(f"Interrupt failed (HTTP {status}): {body}")
+                    return
+                if status == 200 and result.get("ok"):
                     await send_reply("(urgent interrupt queued — injected after current action)")
                 else:
-                    await send_reply(f"Failed to interrupt: {result.get('error', '?')}")
+                    await send_reply(f"Failed to interrupt: {result.get('error', f'HTTP {status}')}")
         except aiohttp.ClientError as e:
             await send_reply(f"Cannot reach daemon: {e}")
 
@@ -490,8 +539,14 @@ class Router:
         url = f"{self._daemon_url(orch)}/stop"
         try:
             async with self._http.post(url, json={"project_id": project_id}) as resp:
-                result = await resp.json()
-                if result.get("ok"):
+                status = self._resp_status(resp)
+                try:
+                    result = await self._resp_json(resp)
+                except Exception:
+                    body = (await resp.text())[:300]
+                    await send_reply(f"Stop failed (HTTP {status}): {body}")
+                    return
+                if status == 200 and result.get("ok"):
                     await send_reply("(stopping task...)")
                 else:
                     await send_reply(f"Stop: {result.get('reason', 'No running task')}")
@@ -507,7 +562,16 @@ class Router:
         url = f"{self._daemon_url(orch)}/status?project_id={project_id}"
         try:
             async with self._http.get(url) as resp:
-                data = await resp.json()
+                status_code = self._resp_status(resp)
+                try:
+                    data = await self._resp_json(resp)
+                except Exception:
+                    body = (await resp.text())[:300]
+                    await send_reply(f"Status failed (HTTP {status_code}): {body}")
+                    return
+                if status_code != 200:
+                    await send_reply(f"Status failed: {data.get('error', f'HTTP {status_code}')}")
+                    return
                 status = data.get("status", "unknown")
                 iteration = data.get("iteration", 0)
                 max_iter = data.get("max_iterations", 0)

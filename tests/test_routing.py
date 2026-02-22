@@ -650,6 +650,28 @@ async def test_error_event_starts_deferred_task():
     assert mock_http.post.call_args[1]["json"]["task"] == "retry task"
 
 
+async def test_deferred_task_start_failure_keeps_queue_head():
+    """Failed starts should keep the task queued for retry."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="done")])
+    router._deferred_tasks["proj"] = [{"chat_id": 1, "text": "queued task", "ts": 1.0}]
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 503
+    mock_resp.json = AsyncMock(return_value={"error": "daemon unavailable"})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.post = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    await router._maybe_start_deferred_task("proj")
+
+    assert len(router._deferred_tasks["proj"]) == 1
+    assert router._deferred_tasks["proj"][0]["text"] == "queued task"
+    assert router._deferred_tasks["proj"][0]["retries"] == 1
+
+
 # ── Mapping persistence callback ─────────────────────────────────────
 
 

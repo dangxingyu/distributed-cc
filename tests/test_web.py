@@ -190,6 +190,19 @@ async def test_ws_switch_channel(aiohttp_client):
     await store.close()
 
 
+async def test_ws_switch_channel_rejects_unknown_channel(aiohttp_client):
+    client, _, _, store = await _make_web(aiohttp_client)
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": 999999})
+
+    msg = await ws.receive_json()
+    assert msg["type"] == "error"
+    assert "unknown channel_id" in msg["text"]
+
+    await ws.close()
+    await store.close()
+
+
 async def test_ws_message_requires_channel(aiohttp_client):
     client, _, _, store = await _make_web(aiohttp_client)
     ws = await client.ws_connect("/ws")
@@ -198,6 +211,44 @@ async def test_ws_message_requires_channel(aiohttp_client):
     msg = await ws.receive_json()
     assert msg["type"] == "error"
     assert "No channel" in msg["text"]
+
+    await ws.close()
+    await store.close()
+
+
+async def test_ws_route_failure_surfaces_to_user_and_logs(aiohttp_client):
+    client, _, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("route-fail")
+    await router.connect_channel(ch_id, "test-proj")
+
+    async def failing_route(chat_id, text, send_reply, send_log=None, send_typing=None):
+        raise RuntimeError("simulated route failure")
+
+    router.route_message = failing_route
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await ws.send_json({"type": "message", "text": "trigger failure"})
+
+    msg1 = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    msg2 = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    types = {msg1["type"], msg2["type"]}
+    assert "log" in types
+    assert "reply" in types
+
+    reply = msg1 if msg1["type"] == "reply" else msg2
+    assert reply["sender"] == "system"
+    assert "Routing failure" in reply["text"]
+
+    logs = await store.get_logs(ch_id)
+    assert any("Routing failure" in entry["text"] for entry in logs)
+    messages = await store.get_recent_messages(ch_id)
+    assert any(
+        m["role"] == "assistant" and m.get("sender") == "system" and "Routing failure" in m["content"]
+        for m in messages
+    )
 
     await ws.close()
     await store.close()
@@ -777,6 +828,14 @@ async def test_progress_log_update_sent_to_ws(aiohttp_client):
     log_msg = next(m for m in messages if m["type"] == "log_update")
     assert "reward hacking" in log_msg["data"]
     assert log_msg["iteration"] == 1
+
+    # Persisted to monitor logs for history/reload
+    logs = await store.get_logs(ch_id)
+    assert any("reward hacking" in entry["text"] for entry in logs)
+
+    # Not persisted as a chat message
+    history = await store.get_recent_messages(ch_id)
+    assert not any("reward hacking" in m["content"] for m in history)
 
     await ws.close()
     await store.close()

@@ -241,14 +241,25 @@ class WebChat:
                 await self._ws_send_to_client(client_id, {"type": "error", "text": "missing channel_id"})
                 return
 
-            self._client_active_channel[client_id] = int(channel_id)
-            project_id = self._router.get_channel_project(int(channel_id))
+            try:
+                channel_id = int(channel_id)
+            except (TypeError, ValueError):
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "invalid channel_id"})
+                return
+
+            channel_ids = set(await self._store.get_all_channel_ids())
+            if channel_id not in channel_ids:
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "unknown channel_id"})
+                return
+
+            self._client_active_channel[client_id] = channel_id
+            project_id = self._router.get_channel_project(channel_id)
             status = self._router.get_project_status(project_id) if project_id else "unconnected"
             await self._ws_send_to_client(
                 client_id,
                 {
                     "type": "channel_switched",
-                    "channel_id": int(channel_id),
+                    "channel_id": channel_id,
                     "project_id": project_id,
                     "project_status": status,
                 },
@@ -282,7 +293,27 @@ class WebChat:
                     "type": "typing", "active": active, "sender": sender,
                 })
 
-            asyncio.create_task(self._router.route_message(channel_id, text, send_reply, send_log, send_typing))
+            async def _route_message():
+                try:
+                    await self._router.route_message(channel_id, text, send_reply, send_log, send_typing)
+                except Exception as e:
+                    log.exception("Routing failed for channel %s", channel_id)
+                    ts = time.time()
+                    line = f"[ERROR] Routing failure: {e}"
+                    await self._store.add_log(channel_id, line)
+                    await self._ws_send_to_channel(channel_id, {"type": "log", "text": line, "ts": ts})
+                    await self._store.add_message(
+                        channel_id,
+                        "assistant",
+                        f"Routing failure: {e}",
+                        sender="system",
+                    )
+                    await self._ws_send_to_channel(
+                        channel_id,
+                        {"type": "reply", "text": f"Routing failure: {e}", "sender": "system", "ts": ts},
+                    )
+
+            asyncio.create_task(_route_message())
             return
 
         await self._ws_send_to_client(client_id, {"type": "error", "text": f"Unknown message type: {msg_type}"})
@@ -373,6 +404,7 @@ class WebChat:
                 {"type": "task_list", "data": data_text, "iteration": iteration, "ts": ts},
             )
         elif event_type == "log_update":
+            await self._store.add_log(chat_id, data_text)
             await self._ws_send_to_channel(
                 chat_id,
                 {"type": "log_update", "data": data_text, "iteration": iteration, "ts": ts},

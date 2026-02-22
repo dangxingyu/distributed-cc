@@ -1236,6 +1236,22 @@ function formatTime(tsSeconds) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function fetchJson(url, options) {
+  return fetch(url, options).then(async (res) => {
+    let payload = {};
+    try {
+      payload = await res.json();
+    } catch (_) {
+      payload = {};
+    }
+    if (!res.ok) {
+      const message = payload.error || payload.reason || ('HTTP ' + res.status);
+      throw new Error(message);
+    }
+    return payload;
+  });
+}
+
 // ── Status display ──────────────────────────────────────────────────
 
 function updateProjectBadge(status, iteration, data) {
@@ -1458,8 +1474,7 @@ function renderChannelList() {
 
 function deleteChannel(channelId, name) {
   if (!confirm('Delete #' + name + '? This cannot be undone.')) return;
-  fetch('/api/channels/' + channelId, { method: 'DELETE' })
-    .then(r => r.json())
+  fetchJson('/api/channels/' + channelId, { method: 'DELETE' })
     .then(() => {
       channels = channels.filter(c => c.id !== channelId);
       if (activeChannel === channelId) {
@@ -1473,6 +1488,10 @@ function deleteChannel(channelId, name) {
         }
       }
       renderChannelList();
+    })
+    .catch((err) => {
+      console.error('Failed to delete channel:', err);
+      alert('Failed to delete channel: ' + err.message);
     });
 }
 
@@ -1504,12 +1523,15 @@ function onChannelSwitched(data) {
 }
 
 function loadChannels() {
-  return fetch('/api/channels')
-    .then(r => r.json())
+  return fetchJson('/api/channels')
     .then(list => {
       channels = list;
       renderChannelList();
       return list;
+    })
+    .catch((err) => {
+      console.error('Failed to load channels:', err);
+      return [];
     });
 }
 
@@ -1518,8 +1540,7 @@ function createChannel() {
   if (!name || !name.trim()) return;
 
   // Ask which project to connect
-  fetch('/api/projects')
-    .then(r => r.json())
+  fetchJson('/api/projects')
     .then(projects => {
       let projectId = '';
       if (projects.length > 0) {
@@ -1527,17 +1548,24 @@ function createChannel() {
         projectId = prompt('Connect to project? (' + choices + ')\nLeave empty to connect later:') || '';
       }
 
-      fetch('/api/channels', {
+      fetchJson('/api/channels', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: name.trim(), project_id: projectId.trim() }),
       })
-        .then(r => r.json())
         .then(ch => {
           channels.push(ch);
           renderChannelList();
           switchChannel(ch.id);
+        })
+        .catch((err) => {
+          console.error('Failed to create channel:', err);
+          alert('Failed to create channel: ' + err.message);
         });
+    })
+    .catch((err) => {
+      console.error('Failed to load projects:', err);
+      alert('Failed to load projects: ' + err.message);
     });
 }
 
@@ -1570,8 +1598,7 @@ function refreshActiveChannelData(channelId) {
 }
 
 function loadMembers(channelId, req = beginScopedRequest('members')) {
-  fetch('/api/channels/' + channelId + '/members', { signal: req.signal })
-    .then(r => r.json())
+  fetchJson('/api/channels/' + channelId + '/members', { signal: req.signal })
     .then(members => {
       if (!isActiveRequest('members', req.token, channelId)) return;
       channelMembers = members;
@@ -1624,8 +1651,7 @@ function sendMessage() {
 }
 
 function loadHistory(channelId, req = beginScopedRequest('history')) {
-  fetch('/api/history?channel=' + channelId, { signal: req.signal })
-    .then(r => r.json())
+  fetchJson('/api/history?channel=' + channelId, { signal: req.signal })
     .then(messages => {
       if (!isActiveRequest('history', req.token, channelId)) return;
       messagesEl.innerHTML = '';
@@ -1642,8 +1668,7 @@ function loadHistory(channelId, req = beginScopedRequest('history')) {
 }
 
 function loadLogs(channelId, req = beginScopedRequest('logs')) {
-  fetch('/api/logs?channel=' + channelId, { signal: req.signal })
-    .then(r => r.json())
+  fetchJson('/api/logs?channel=' + channelId, { signal: req.signal })
     .then(logs => {
       if (!isActiveRequest('logs', req.token, channelId)) return;
       monitorLog.innerHTML = '';
@@ -1929,8 +1954,7 @@ function selectCommand(idx) {
 
   // If /connect, fetch projects and show hint
   if (cmd.name === '/connect') {
-    fetch('/api/projects')
-      .then(r => r.json())
+    fetchJson('/api/projects')
       .then(projects => {
         if (projects.length > 0) {
           const ids = projects.map(p => p.project_id).join(', ');
@@ -2108,6 +2132,9 @@ function connect() {
 
     } else if (data.type === 'task_list') {
       updateTaskList(data.data);
+
+    } else if (data.type === 'log_update') {
+      addLogEntry('[LOG] ' + data.data, data.ts);
 
     } else if (data.type === 'log') {
       addLogEntry(data.text, data.ts);
