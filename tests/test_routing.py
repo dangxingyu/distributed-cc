@@ -586,6 +586,12 @@ async def test_ingest_done_sets_status_done():
     assert router._orchestrators["proj"].status == "done"
 
 
+async def test_ingest_stopped_sets_status_stopped():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="running")])
+    await router.ingest_progress_event("proj", {"event_id": "e1", "type": "stopped", "data": "cancelled"})
+    assert router._orchestrators["proj"].status == "stopped"
+
+
 async def test_ingest_stuck_sets_status_stuck():
     router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="running")])
     await router.ingest_progress_event("proj", {"event_id": "e1", "type": "stuck", "data": "help"})

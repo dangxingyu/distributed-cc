@@ -239,6 +239,8 @@ class Router:
         if orch:
             if event_type == "done":
                 orch.status = "done"
+            elif event_type == "stopped":
+                orch.status = "stopped"
             elif event_type == "stuck":
                 orch.status = "stuck"
             elif event_type == "error":
@@ -252,7 +254,7 @@ class Router:
             except Exception:
                 log.warning("Progress callback failed", exc_info=True)
 
-        if event_type in ("done", "error"):
+        if event_type in ("done", "error", "stopped"):
             await self._maybe_start_deferred_task(project_id)
 
         return True
@@ -376,7 +378,7 @@ class Router:
 
             if orch.status == "stuck":
                 await self._interrupt_task(chat_id, project_id, effective_text, send_reply)
-            elif orch.status in ("idle", "done", "error", "unknown"):
+            elif orch.status in ("idle", "done", "error", "stopped", "unknown"):
                 await self._start_task(chat_id, project_id, effective_text, send_reply, send_log)
             elif addressed_to_orchestrator:
                 await self._interrupt_task(chat_id, project_id, effective_text, send_reply)

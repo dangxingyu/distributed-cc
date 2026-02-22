@@ -275,8 +275,19 @@ class WebChat:
             text = data.get("text", "").strip()
             if not text:
                 return
+            client_msg_id = data.get("client_msg_id")
 
-            await self._store.add_message(channel_id, "user", text, sender="user")
+            try:
+                await self._store.add_message(channel_id, "user", text, sender="user")
+            except Exception as e:
+                await self._ws_send_to_client(client_id, {"type": "error", "text": f"Failed to persist message: {e}"})
+                return
+
+            if client_msg_id:
+                await self._ws_send_to_client(
+                    client_id,
+                    {"type": "message_ack", "client_msg_id": str(client_msg_id), "ts": time.time()},
+                )
 
             async def send_reply(msg: str, sender: str = "system"):
                 ts = time.time()
@@ -383,6 +394,20 @@ class WebChat:
                 msg = f"@orchestrator Task complete: {data_text}"
                 await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
                 await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "sender": "orchestrator", "ts": ts})
+        elif event_type == "stopped":
+            await self._ws_send_to_channel(
+                chat_id,
+                {
+                    "type": "progress",
+                    "data": data_text,
+                    "iteration": iteration,
+                    "status": "stopped",
+                    "ts": ts,
+                },
+            )
+            msg = f"@orchestrator Task stopped: {data_text or 'stopped by user'}"
+            await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
+            await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "sender": "orchestrator", "ts": ts})
         elif event_type == "stuck":
             await self._ws_send_to_channel(
                 chat_id,

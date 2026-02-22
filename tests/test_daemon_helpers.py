@@ -136,3 +136,52 @@ def test_append_log_unknown_project():
     """append_log returns empty string for unknown project."""
     from orchestrator_daemon import _append_log
     assert _append_log("nonexistent", "test") == ""
+
+
+def test_interrupt_queue_is_bounded_and_typed():
+    """Interrupt queue should be typed and bounded, dropping oldest when full."""
+    from orchestrator_daemon import (
+        INTERRUPT_QUEUE_MAX,
+        _ensure_interrupt_queue,
+        _enqueue_interrupt,
+        _interrupt_payload_text,
+        interrupt_queues,
+    )
+
+    project_id = "queue-test"
+    interrupt_queues.pop(project_id, None)
+    _ensure_interrupt_queue(project_id)
+
+    for i in range(INTERRUPT_QUEUE_MAX + 5):
+        _enqueue_interrupt(project_id, f"msg-{i}")
+
+    queue = interrupt_queues[project_id]
+    assert queue.qsize() == INTERRUPT_QUEUE_MAX
+
+    oldest = queue.get_nowait()
+    assert isinstance(oldest, dict)
+    assert oldest["kind"] == "user_message"
+    assert _interrupt_payload_text(oldest) == "msg-5"
+
+    interrupt_queues.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_interrupt_text_skips_empty_payloads():
+    """wait_for_interrupt_text should ignore empty payloads and return first text."""
+    from orchestrator_daemon import (
+        _ensure_interrupt_queue,
+        _wait_for_interrupt_text,
+        interrupt_queues,
+    )
+
+    project_id = "queue-test-async"
+    interrupt_queues.pop(project_id, None)
+    queue = _ensure_interrupt_queue(project_id)
+    queue.put_nowait({"kind": "user_message", "text": "   ", "ts": 0})
+    queue.put_nowait({"kind": "user_message", "text": "hello", "ts": 0})
+
+    result = await _wait_for_interrupt_text(project_id, timeout=1)
+    assert result == "hello"
+
+    interrupt_queues.pop(project_id, None)

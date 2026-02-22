@@ -51,6 +51,7 @@ DAEMON_NAME = os.environ.get("DAEMON_NAME", "unknown")
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
 MAX_ITERATIONS = 20
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
+INTERRUPT_QUEUE_MAX = 100
 
 
 # -- split-role prompts ------------------------------------------------
@@ -190,6 +191,53 @@ sse_subscribers: dict[str, list[asyncio.Queue]] = {}
 
 orchestrator_sessions: dict[str, str] = {}  # project_id -> orchestrator session
 worker_sessions: dict[str, str] = {}  # project_id -> worker session
+
+
+def _ensure_interrupt_queue(project_id: str) -> asyncio.Queue:
+    """Create or fetch a bounded interrupt queue for a project."""
+    queue = interrupt_queues.get(project_id)
+    if queue is None:
+        queue = asyncio.Queue(maxsize=INTERRUPT_QUEUE_MAX)
+        interrupt_queues[project_id] = queue
+    return queue
+
+
+def _interrupt_payload_text(payload) -> str:
+    """Normalize interrupt payloads from old/new queue formats to text."""
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, dict):
+        return str(payload.get("text", "")).strip()
+    return str(payload or "").strip()
+
+
+def _enqueue_interrupt(project_id: str, message: str, kind: str = "user_message") -> int:
+    """Append a typed interrupt payload; bounded by queue size."""
+    queue = _ensure_interrupt_queue(project_id)
+    payload = {"kind": kind, "text": message, "ts": time.time()}
+
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+    queue.put_nowait(payload)
+    return queue.qsize()
+
+
+async def _wait_for_interrupt_text(project_id: str, timeout: float) -> str:
+    """Wait for the next non-empty interrupt text."""
+    queue = _ensure_interrupt_queue(project_id)
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        payload = await asyncio.wait_for(queue.get(), timeout=remaining)
+        text = _interrupt_payload_text(payload)
+        if text:
+            return text
 
 
 # -- progress streaming ------------------------------------------------
@@ -491,9 +539,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         )
 
         try:
-            answer = await asyncio.wait_for(
-                interrupt_queues[project_id].get(), timeout=600
-            )
+            answer = await _wait_for_interrupt_text(project_id, timeout=600)
             state.status = "running"
             state.summary = ""
             return {"content": [{"type": "text", "text": f"User responded: {answer}"}]}
@@ -602,8 +648,7 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
     )
     task_states[project_id] = state
 
-    if project_id not in interrupt_queues:
-        interrupt_queues[project_id] = asyncio.Queue()
+    _ensure_interrupt_queue(project_id)
     if project_id not in cancel_events:
         cancel_events[project_id] = asyncio.Event()
     cancel_events[project_id].clear()
@@ -669,7 +714,7 @@ async def run_task(project_id: str, task_text: str, max_iterations: int = MAX_IT
         done_event.set()
         await emit_progress(
             project_id,
-            ProgressEvent(type="done", data="Task cancelled", iteration=state.iteration),
+            ProgressEvent(type="stopped", data="Task cancelled", iteration=state.iteration),
         )
     except Exception as e:
         log.exception("Orchestrator error: %s", e)
@@ -699,7 +744,10 @@ def _drain_interruptions(project_id: str) -> list[str]:
     msgs = []
     while not queue.empty():
         try:
-            msgs.append(queue.get_nowait())
+            payload = queue.get_nowait()
+            text = _interrupt_payload_text(payload)
+            if text:
+                msgs.append(text)
         except asyncio.QueueEmpty:
             break
     return msgs
@@ -870,17 +918,19 @@ async def handle_interrupt(request: web.Request) -> web.Response:
     """POST /interrupt — inject a user message into the running task."""
     data = await request.json()
     project_id = data.get("project_id")
-    message = data.get("message", "")
+    message = str(data.get("message", "")).strip()
 
     if not project_id:
         return web.json_response({"error": "project_id required"}, status=400)
+    if project_id not in projects:
+        return web.json_response({"error": "Unknown project"}, status=404)
+    if not message:
+        return web.json_response({"error": "message required"}, status=400)
 
-    if project_id not in interrupt_queues:
-        interrupt_queues[project_id] = asyncio.Queue()
-    interrupt_queues[project_id].put_nowait(message)
+    qsize = _enqueue_interrupt(project_id, message)
 
-    log.info("Interrupt queued for %s: %s", project_id, message[:100])
-    return web.json_response({"ok": True, "queued": True})
+    log.info("Interrupt queued for %s (size=%s): %s", project_id, qsize, message[:100])
+    return web.json_response({"ok": True, "queued": True, "queue_size": qsize})
 
 
 async def handle_status(request: web.Request) -> web.Response:

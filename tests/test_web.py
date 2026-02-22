@@ -216,6 +216,33 @@ async def test_ws_message_requires_channel(aiohttp_client):
     await store.close()
 
 
+async def test_ws_message_ack(aiohttp_client):
+    client, _, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("ack-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    async def no_op_route(chat_id, text, send_reply, send_log=None, send_typing=None):
+        return
+
+    router.route_message = no_op_route
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await ws.send_json({"type": "message", "text": "hello ack", "client_msg_id": "cmsg-1"})
+
+    msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    assert msg["type"] == "message_ack"
+    assert msg["client_msg_id"] == "cmsg-1"
+
+    history = await store.get_recent_messages(ch_id)
+    assert any(m["role"] == "user" and m["content"] == "hello ack" for m in history)
+
+    await ws.close()
+    await store.close()
+
+
 async def test_ws_route_failure_surfaces_to_user_and_logs(aiohttp_client):
     client, _, router, store = await _make_web(aiohttp_client)
     ch_id = await store.create_channel("route-fail")
@@ -444,6 +471,38 @@ async def test_progress_done_sends_chat_reply(aiohttp_client):
     # Verify persisted as assistant message
     msgs = await store.get_recent_messages(ch_id)
     assert any("all tests pass" in m["content"] for m in msgs)
+
+    await ws.close()
+    await store.close()
+
+
+async def test_progress_stopped_sends_chat_reply(aiohttp_client):
+    """'stopped' progress event produces a stopped status and a chat reply."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("stopped-ch")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await web_chat._handle_progress(
+        "test-proj",
+        {"type": "stopped", "data": "Task cancelled", "iteration": 4, "ts": 100.0},
+    )
+
+    messages = []
+    for _ in range(3):  # progress + reply + channel_status
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        messages.append(msg)
+
+    progress = next(m for m in messages if m["type"] == "progress")
+    assert progress.get("status") == "stopped"
+    reply = next(m for m in messages if m["type"] == "reply")
+    assert "Task stopped" in reply["text"]
+
+    history = await store.get_recent_messages(ch_id)
+    assert any("Task stopped" in m["content"] for m in history)
 
     await ws.close()
     await store.close()

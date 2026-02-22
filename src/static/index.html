@@ -138,6 +138,7 @@ body {
 .channel-item .ch-status.running { background: var(--green); animation: pulse 2s infinite; }
 .channel-item .ch-status.idle { background: var(--text-muted); }
 .channel-item .ch-status.done { background: var(--blue); }
+.channel-item .ch-status.stopped { background: var(--orange); }
 .channel-item .ch-status.stuck { background: var(--yellow); }
 .channel-item .ch-status.error { background: var(--red); }
 .channel-item .ch-status.disconnected { background: var(--red); opacity: 0.5; }
@@ -244,6 +245,11 @@ body {
 #project-badge.stuck {
   border-color: rgba(249, 226, 175, 0.3);
   color: var(--yellow);
+}
+
+#project-badge.stopped {
+  border-color: rgba(250, 179, 135, 0.3);
+  color: var(--orange);
 }
 
 #project-badge.error {
@@ -632,6 +638,23 @@ body {
 }
 
 .msg-system { padding-left: 40px; }
+
+.msg-delivery {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.msg-pending .msg-body {
+  opacity: 0.75;
+}
+
+.msg-failed .msg-body {
+  border-color: rgba(243, 139, 168, 0.35);
+}
+
+.msg-failed .msg-delivery {
+  color: var(--red);
+}
 
 /* ── Message collapsing ─────────────────────────── */
 
@@ -1219,6 +1242,7 @@ let channelMembers = [];
 let currentProjectId = null;
 let currentProjectStatus = 'unknown';
 let currentIteration = 0;
+const pendingUserMessages = new Map();
 const requestScopes = {
   history: { token: 0, controller: null },
   members: { token: 0, controller: null },
@@ -1270,6 +1294,9 @@ function updateProjectBadge(status, iteration, data) {
     hideTypingIndicator();
   } else if (status === 'done') {
     projectBadge.textContent = 'Done';
+    hideTypingIndicator();
+  } else if (status === 'stopped') {
+    projectBadge.textContent = 'Stopped';
     hideTypingIndicator();
   } else if (status === 'error') {
     projectBadge.textContent = 'Error';
@@ -1358,6 +1385,47 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+function makeClientMessageId() {
+  return 'm_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function clearPendingUserMessages() {
+  for (const entry of pendingUserMessages.values()) {
+    clearTimeout(entry.timeout);
+  }
+  pendingUserMessages.clear();
+}
+
+function markPendingUserMessageDelivered(clientMsgId) {
+  const entry = pendingUserMessages.get(clientMsgId);
+  if (!entry) return;
+  clearTimeout(entry.timeout);
+  const msgEl = entry.el;
+  msgEl.classList.remove('msg-pending', 'msg-failed');
+  const delivery = msgEl.querySelector('.msg-delivery');
+  if (delivery) {
+    delivery.textContent = 'Sent';
+    setTimeout(() => {
+      if (delivery.parentNode) delivery.remove();
+    }, 1200);
+  }
+  pendingUserMessages.delete(clientMsgId);
+}
+
+function markPendingUserMessageFailed(clientMsgId, reason) {
+  const entry = pendingUserMessages.get(clientMsgId);
+  if (!entry) return;
+  clearTimeout(entry.timeout);
+  const msgEl = entry.el;
+  msgEl.classList.remove('msg-pending');
+  msgEl.classList.add('msg-failed');
+  const delivery = msgEl.querySelector('.msg-delivery');
+  if (delivery) {
+    delivery.textContent = reason ? ('Failed (' + reason + ')') : 'Failed';
+  }
+  pendingUserMessages.delete(clientMsgId);
+}
+
 const SENDER_CONFIG = {
   user:         { label: 'You',          avatar: 'Y', css: 'msg-user' },
   orchestrator: { label: 'Orchestrator', avatar: 'O', css: 'msg-orchestrator' },
@@ -1366,7 +1434,8 @@ const SENDER_CONFIG = {
   system:       { label: 'System',       avatar: '',  css: 'msg-system' },
 };
 
-function addMessage(text, sender, tsSeconds) {
+function addMessage(text, sender, tsSeconds, opts) {
+  const options = opts || {};
   const body = typeof text === 'string' ? text : String(text ?? '');
   const cfg = SENDER_CONFIG[sender] || SENDER_CONFIG.orchestrator;
   const cssClass = cfg.css;
@@ -1375,6 +1444,12 @@ function addMessage(text, sender, tsSeconds) {
 
   const div = document.createElement('div');
   div.className = 'msg ' + cssClass;
+  if (options.clientMsgId) {
+    div.dataset.clientMsgId = options.clientMsgId;
+  }
+  if (options.pending) {
+    div.classList.add('msg-pending');
+  }
 
   // Avatar (hidden for system messages via CSS)
   if (cssClass !== 'msg-system') {
@@ -1401,6 +1476,12 @@ function addMessage(text, sender, tsSeconds) {
 
   header.appendChild(senderEl);
   header.appendChild(time);
+  if (options.pending) {
+    const delivery = document.createElement('span');
+    delivery.className = 'msg-delivery';
+    delivery.textContent = 'Sending...';
+    header.appendChild(delivery);
+  }
 
   // Body wrapper (for collapsing long messages)
   const bodyWrapper = document.createElement('div');
@@ -1445,6 +1526,7 @@ function addMessage(text, sender, tsSeconds) {
   });
 
   scrollToBottom();
+  return div;
 }
 
 // ── Channel management ──────────────────────────────────────────────
@@ -1501,6 +1583,7 @@ function switchChannel(channelId) {
 }
 
 function onChannelSwitched(data) {
+  clearPendingUserMessages();
   activeChannel = data.channel_id;
   currentProjectId = data.project_id || null;
   currentProjectStatus = data.project_status || 'unknown';
@@ -1643,8 +1726,14 @@ function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || !ws || ws.readyState !== WebSocket.OPEN || activeChannel === null) return;
 
-  addMessage(text, 'user', Date.now() / 1000);
-  ws.send(JSON.stringify({ type: 'message', text: text }));
+  const clientMsgId = makeClientMessageId();
+  const node = addMessage(text, 'user', Date.now() / 1000, { pending: true, clientMsgId: clientMsgId });
+  const timeout = setTimeout(() => {
+    markPendingUserMessageFailed(clientMsgId, 'timeout');
+  }, 15000);
+  pendingUserMessages.set(clientMsgId, { el: node, timeout: timeout });
+
+  ws.send(JSON.stringify({ type: 'message', text: text, client_msg_id: clientMsgId }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
   clearAwaitingInput();
@@ -2074,6 +2163,10 @@ function connect() {
   ws.onclose = function() {
     statusDot.className = 'disconnected';
     statusText.textContent = 'disconnected';
+    const pendingIds = Array.from(pendingUserMessages.keys());
+    for (const id of pendingIds) {
+      markPendingUserMessageFailed(id, 'offline');
+    }
     reconnectTimer = setTimeout(connect, 2000);
   };
 
@@ -2096,7 +2189,7 @@ function connect() {
     } else if (data.type === 'progress') {
       const pStatus = data.status || data.type;
       currentIteration = data.iteration || currentIteration;
-      if (pStatus === 'done' || pStatus === 'stuck' || pStatus === 'error') {
+      if (pStatus === 'done' || pStatus === 'stuck' || pStatus === 'error' || pStatus === 'stopped') {
         currentProjectStatus = pStatus;
       } else {
         currentProjectStatus = 'running';
@@ -2106,7 +2199,7 @@ function connect() {
       // Stuck/ask_user UX
       if (pStatus === 'stuck') {
         setAwaitingInput(data.data);
-      } else if (pStatus === 'done' || pStatus === 'error' || pStatus === 'running') {
+      } else if (pStatus === 'done' || pStatus === 'error' || pStatus === 'stopped' || pStatus === 'running') {
         clearAwaitingInput();
       }
 
@@ -2143,6 +2236,11 @@ function connect() {
       const sender = data.sender || classifyMessageLegacy(data.text);
       addMessage(data.text, sender, data.ts);
       if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
+
+    } else if (data.type === 'message_ack') {
+      if (data.client_msg_id) {
+        markPendingUserMessageDelivered(String(data.client_msg_id));
+      }
 
     } else if (data.type === 'typing') {
       if (data.active) {
