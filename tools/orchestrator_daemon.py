@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,8 @@ log = logging.getLogger("daemon")
 
 DAEMON_NAME = os.environ.get("DAEMON_NAME", "unknown")
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
+DEFAULT_ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "claude-opus-4-6")
+DEFAULT_SESSION_MODEL = os.environ.get("ORCHESTRATOR_SESSION_MODEL", DEFAULT_ORCHESTRATOR_MODEL)
 MAX_ITERATIONS = 0
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 INTERRUPT_QUEUE_MAX = 100
@@ -189,6 +192,8 @@ class TaskState:
     status: str = "running"  # running, done, stuck, error, stopped
     iteration: int = 0
     max_iterations: int = MAX_ITERATIONS
+    model: str = DEFAULT_ORCHESTRATOR_MODEL
+    session_model: str = DEFAULT_SESSION_MODEL
     continuous_mode: bool = CONTINUOUS_MODE_DEFAULT
     sdk_session_id: str = ""  # backward-compat alias of orchestrator_session_id
     orchestrator_session_id: str = ""
@@ -212,6 +217,9 @@ orchestrator_sessions: dict[str, str] = {}  # project_id -> orchestrator session
 worker_sessions: dict[str, str] = {}  # project_id -> worker session
 orchestrator_prompt_hashes: dict[str, str] = {}  # project_id -> orchestrator prompt hash
 worker_prompt_hashes: dict[str, str] = {}  # project_id -> worker prompt hash
+current_worker_tasks: dict[str, asyncio.Task] = {}  # project_id -> active worker task
+callback_http_session: ClientSession | None = None
+callback_http_lock = asyncio.Lock()
 
 
 def _ensure_interrupt_queue(project_id: str) -> asyncio.Queue:
@@ -338,6 +346,15 @@ async def _wait_for_interrupt_text(project_id: str, timeout: float) -> str:
 # -- progress streaming ------------------------------------------------
 
 
+async def _get_callback_http_session() -> ClientSession:
+    """Return a shared aiohttp session for callback POSTs."""
+    global callback_http_session
+    async with callback_http_lock:
+        if callback_http_session is None or callback_http_session.closed:
+            callback_http_session = ClientSession(timeout=ClientTimeout(total=5))
+        return callback_http_session
+
+
 async def emit_progress(project_id: str, event: ProgressEvent):
     """Send progress event to SSE subscribers and HTTP callback."""
     for q in sse_subscribers.get(project_id, []):
@@ -347,21 +364,29 @@ async def emit_progress(project_id: str, event: ProgressEvent):
             pass
 
     try:
-        async with ClientSession(timeout=ClientTimeout(total=5)) as http:
-            await http.post(
-                f"{CALLBACK_URL}/progress",
-                json={
-                    "project_id": project_id,
-                    "daemon_name": DAEMON_NAME,
-                    "event": {
-                        "event_id": event.event_id,
-                        "type": event.type,
-                        "data": event.data,
-                        "iteration": event.iteration,
-                        "ts": event.timestamp,
-                    },
+        http = await _get_callback_http_session()
+        async with http.post(
+            f"{CALLBACK_URL}/progress",
+            json={
+                "project_id": project_id,
+                "daemon_name": DAEMON_NAME,
+                "event": {
+                    "event_id": event.event_id,
+                    "type": event.type,
+                    "data": event.data,
+                    "iteration": event.iteration,
+                    "ts": event.timestamp,
                 },
-            )
+            },
+        ) as resp:
+            if resp.status >= 400:
+                await resp.read()
+                log.debug(
+                    "Progress callback failed: status=%s project_id=%s event=%s",
+                    resp.status,
+                    project_id,
+                    event.type,
+                )
     except Exception:
         pass
 
@@ -425,6 +450,7 @@ async def _run_worker_turn(
     assignment: str,
     iteration: int,
     worker_session_id: str = "",
+    model: str = DEFAULT_SESSION_MODEL,
 ) -> tuple[str, str]:
     """Execute one worker assignment in an independent worker session."""
     project = projects.get(project_id)
@@ -449,7 +475,7 @@ async def _run_worker_turn(
 
     options = ClaudeAgentOptions(
         permission_mode="bypassPermissions",
-        model="claude-opus-4-6",
+        model=model,
         cwd=project.project_dir,
         max_turns=50,
         setting_sources=["project"],  # loads CLAUDE.md from project dir natively
@@ -477,6 +503,8 @@ async def _run_worker_turn(
     except Exception as e:
         done_event.set()
         log.exception("Worker SDK error on iteration %s: %s", iteration, e)
+        tb = traceback.format_exc()
+        tb_short = tb[-1200:] if tb else ""
         await emit_progress(
             project_id,
             ProgressEvent(
@@ -485,7 +513,8 @@ async def _run_worker_turn(
                 iteration=iteration,
             ),
         )
-        return f"Worker failed: {e}", worker_session_id
+        details = f"\nTraceback (truncated):\n{tb_short}" if tb_short else ""
+        return f"Worker failed: {e}{details}", worker_session_id
 
     # Use the report submitted via MCP tool; fall back to session result
     if captured_report:
@@ -568,16 +597,25 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
         worker_sid = worker_sessions.get(project_id, "")
         try:
-            report, new_sid = await _run_worker_turn(
-                project_id=project_id,
-                assignment=task_desc,
-                iteration=state.iteration,
-                worker_session_id=worker_sid,
+            worker_task = asyncio.create_task(
+                _run_worker_turn(
+                    project_id=project_id,
+                    assignment=task_desc,
+                    iteration=state.iteration,
+                    worker_session_id=worker_sid,
+                    model=state.session_model or state.model,
+                )
             )
+            current_worker_tasks[project_id] = worker_task
+            report, new_sid = await worker_task
         except Exception as e:
             log.exception("Worker turn failed: %s", e)
             report = f"Worker failed with error: {e}"
             new_sid = worker_sid
+        finally:
+            existing = current_worker_tasks.get(project_id)
+            if existing and existing.done():
+                current_worker_tasks.pop(project_id, None)
 
         worker_sessions[project_id] = new_sid
         state.worker_session_id = new_sid
@@ -799,6 +837,8 @@ def _build_orchestrator_options(
     max_iterations: int,
     session_id: str,
     system_prompt: str,
+    model: str,
+    session_model: str,
 ) -> ClaudeAgentOptions:
     if max_iterations > 0:
         max_turns = max(8, max_iterations * 8)
@@ -806,9 +846,10 @@ def _build_orchestrator_options(
         # Unlimited worker assignments still need a practical per-query turn cap.
         max_turns = 160
 
+    active_model = session_model if session_id and session_model else model
     options = ClaudeAgentOptions(
         permission_mode="bypassPermissions",
-        model="claude-opus-4-6",
+        model=active_model,
         cwd=project_dir,
         setting_sources=["project"],  # load shared CLAUDE.md natively
         mcp_servers={"daemon": mcp_server},
@@ -826,6 +867,8 @@ async def run_task(
     task_text: str,
     max_iterations: int = MAX_ITERATIONS,
     continuous_mode: bool = CONTINUOUS_MODE_DEFAULT,
+    model: str = DEFAULT_ORCHESTRATOR_MODEL,
+    session_model: str = DEFAULT_SESSION_MODEL,
 ):
     """Run autonomous task with MCP tool-driven orchestrator."""
     os.environ.pop("CLAUDECODE", None)
@@ -842,6 +885,8 @@ async def run_task(
         task_text=task_text,
         max_iterations=max_iterations,
         continuous_mode=continuous_mode,
+        model=model,
+        session_model=session_model or model,
     )
     task_states[project_id] = state
 
@@ -888,6 +933,8 @@ async def run_task(
                 max_iterations=max_iterations,
                 session_id=orchestrator_session_id,
                 system_prompt=orchestrator_prompt,
+                model=state.model,
+                session_model=state.session_model,
             )
             saw_result = False
 
@@ -1088,6 +1135,8 @@ def _save_state(
         "status": state.status,
         "iteration": state.iteration,
         "max_iterations": state.max_iterations,
+        "model": state.model,
+        "session_model": state.session_model,
         "continuous_mode": state.continuous_mode,
         "sdk_session_id": orchestrator_session_id,
         "orchestrator_session_id": orchestrator_session_id,
@@ -1166,6 +1215,8 @@ async def handle_task(request: web.Request) -> web.Response:
     task_text = data.get("task")
     max_iter_raw = data.get("max_iterations", MAX_ITERATIONS)
     continuous_mode = _parse_bool(data.get("continuous_mode"), CONTINUOUS_MODE_DEFAULT)
+    model = str(data.get("model") or DEFAULT_ORCHESTRATOR_MODEL).strip() or DEFAULT_ORCHESTRATOR_MODEL
+    session_model = str(data.get("session_model") or model).strip() or model
 
     if not project_id or not task_text:
         return web.json_response({"error": "project_id and task required"}, status=400)
@@ -1199,6 +1250,8 @@ async def handle_task(request: web.Request) -> web.Response:
             task_text,
             max_iter,
             continuous_mode=continuous_mode,
+            model=model,
+            session_model=session_model,
         )
     )
     running_tasks[project_id] = task
@@ -1209,6 +1262,8 @@ async def handle_task(request: web.Request) -> web.Response:
             "project_id": project_id,
             "status": "started",
             "continuous_mode": continuous_mode,
+            "model": model,
+            "session_model": session_model,
         }
     )
 
@@ -1252,6 +1307,8 @@ async def handle_status(request: web.Request) -> web.Response:
                 "status": state.status if state else "idle",
                 "iteration": state.iteration if state else 0,
                 "max_iterations": state.max_iterations if state else MAX_ITERATIONS,
+                "model": state.model if state else DEFAULT_ORCHESTRATOR_MODEL,
+                "session_model": state.session_model if state else DEFAULT_SESSION_MODEL,
                 "continuous_mode": state.continuous_mode if state else CONTINUOUS_MODE_DEFAULT,
                 "summary": state.summary if state else "",
             }
@@ -1270,6 +1327,8 @@ async def handle_status(request: web.Request) -> web.Response:
             "status": state.status,
             "iteration": state.iteration,
             "max_iterations": state.max_iterations,
+            "model": state.model,
+            "session_model": state.session_model,
             "continuous_mode": state.continuous_mode,
             "task_text": state.task_text[:500],
             "summary": state.summary,
@@ -1331,6 +1390,16 @@ async def handle_stop(request: web.Request) -> web.Response:
     if project_id in cancel_events:
         cancel_events[project_id].set()
 
+    worker_task = current_worker_tasks.get(project_id)
+    if worker_task and not worker_task.done():
+        try:
+            # Graceful drain: let active worker turn finish briefly before cancellation.
+            await asyncio.wait_for(asyncio.shield(worker_task), timeout=10)
+        except asyncio.TimeoutError:
+            log.info("Stop drain timed out for %s; cancelling orchestrator task", project_id)
+        except Exception as e:
+            log.debug("Stop drain error for %s: %s", project_id, e)
+
     task = running_tasks.get(project_id)
     if task and not task.done():
         task.cancel()
@@ -1349,6 +1418,16 @@ async def handle_health(request: web.Request) -> web.Response:
             "running": [pid for pid, t in running_tasks.items() if not t.done()],
         }
     )
+
+
+# -- app lifecycle -----------------------------------------------------
+
+
+async def on_cleanup(_app: web.Application):
+    global callback_http_session
+    if callback_http_session and not callback_http_session.closed:
+        await callback_http_session.close()
+    callback_http_session = None
 
 
 # -- main --------------------------------------------------------------
@@ -1384,6 +1463,7 @@ def main():
     app.router.add_get("/stream", handle_stream)
     app.router.add_post("/stop", handle_stop)
     app.router.add_get("/health", handle_health)
+    app.on_cleanup.append(on_cleanup)
 
     web.run_app(app, host="127.0.0.1", port=args.port)
 

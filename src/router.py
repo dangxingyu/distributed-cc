@@ -33,6 +33,8 @@ class RemoteOrchestrator:
     broker_port: int = 8200
     project_dir: str = ""
     max_iterations: int = 0
+    model: str = ""
+    session_model: str = ""
     status: str = "unknown"  # idle/running/done/stuck/error/disconnected
 
 
@@ -96,6 +98,10 @@ class Router:
             cfg = json.load(f)
         log.info("Loaded config.json from %s", self._cwd)
 
+        orch_cfg = cfg.get("orchestrator", {})
+        default_model = str(orch_cfg.get("model", "")).strip()
+        default_session_model = str(orch_cfg.get("session_model", "")).strip()
+
         orchestrators = cfg.get("orchestrators")
         if orchestrators:
             for o in orchestrators:
@@ -109,6 +115,8 @@ class Router:
                     broker_port=o.get("broker_port", 8200),
                     project_dir=o.get("project_dir", ""),
                     max_iterations=o.get("max_iterations", 0),
+                    model=str(o.get("model", default_model)).strip(),
+                    session_model=str(o.get("session_model", default_session_model)).strip(),
                 )
                 self._orchestrators[project_id] = orch
             return
@@ -125,6 +133,8 @@ class Router:
                 broker_port=s.get("broker_port", 8200),
                 project_dir=s.get("work_dir", s.get("project_dir", "")),
                 max_iterations=s.get("max_iterations", 0),
+                model=str(s.get("model", default_model)).strip(),
+                session_model=str(s.get("session_model", default_session_model)).strip(),
             )
             self._orchestrators[project_id] = orch
 
@@ -184,6 +194,7 @@ class Router:
 
     async def _sse_listen_loop(self, orch: RemoteOrchestrator):
         url = f"{self._daemon_url(orch)}/stream?project_id={orch.project_id}"
+        backoff_seconds = 2
         while True:
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as http:
@@ -203,12 +214,14 @@ class Router:
                                 except json.JSONDecodeError:
                                     continue
                                 await self.ingest_progress_event(orch.project_id, event, source="sse")
+                backoff_seconds = 2
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.warning("SSE connection lost for %s: %s", orch.project_id, e)
                 orch.status = "disconnected"
-                await asyncio.sleep(5)
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, 30)
 
     async def _sync_daemon_status(self, orch: RemoteOrchestrator, http: aiohttp.ClientSession):
         """Poll /status to sync orch.status after SSE (re)connect."""
@@ -551,14 +564,19 @@ class Router:
     async def _start_task_request(self, project_id: str, task_text: str) -> tuple[bool, str]:
         orch = self._orchestrators[project_id]
         url = f"{self._daemon_url(orch)}/task"
+        payload = {
+            "project_id": project_id,
+            "task": task_text,
+            "max_iterations": orch.max_iterations,
+        }
+        if orch.model:
+            payload["model"] = orch.model
+        if orch.session_model:
+            payload["session_model"] = orch.session_model
         try:
             async with self._http.post(
                 url,
-                json={
-                    "project_id": project_id,
-                    "task": task_text,
-                    "max_iterations": orch.max_iterations,
-                },
+                json=payload,
             ) as resp:
                 status = self._resp_status(resp)
                 try:

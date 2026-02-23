@@ -135,7 +135,7 @@ Interruption levels while running:
 
 | Endpoint | Notes |
 |---|---|
-| `POST /task` | Supports `max_iterations` (set `0` for unlimited worker-assignment cap) and `continuous_mode` (default `true`) |
+| `POST /task` | Supports `max_iterations` (set `0` for unlimited worker-assignment cap), `continuous_mode` (default `true`), `model`, and `session_model` |
 | `POST /interrupt` | Supports `urgency`: `normal` (default) or `urgent` |
 
 ## Configuration
@@ -159,7 +159,11 @@ Current common format:
       "work_dir": "/Users/you/project",
       "broker_port": 8200
     }
-  ]
+  ],
+  "orchestrator": {
+    "model": "claude-opus-4-6",
+    "session_model": "claude-opus-4-6"
+  }
 }
 ```
 
@@ -169,12 +173,16 @@ Field meanings:
 - `work_dir`: project directory on that machine
 - `broker_port`: local forwarded port that maps to remote `:8200`
 - `max_iterations` (optional): worker-assignment cap (`0` means no cap, default)
+- `orchestrator.model` (optional): model for new orchestrator turns
+- `orchestrator.session_model` (optional): model for resumed orchestrator sessions and worker turns
 
 Start from:
 
 ```bash
 cp config.example.json config.json
 ```
+
+`config.json` is intentionally local-only (gitignored). Keep real hosts/tokens there, never in committed files.
 
 ## Manual Setup (If You Skip `/setup`)
 

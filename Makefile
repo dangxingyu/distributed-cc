@@ -9,7 +9,7 @@ run:
 test:
 	uv run pytest tests/ -v --ignore=tests/test_e2e.py
 
-# Run end-to-end tests (calls real Claude, costs money)
+# Run end-to-end tests (calls real Claude)
 test-e2e:
 ifeq ($(E2E_JOBS),1)
 	uv run pytest tests/test_e2e.py -v

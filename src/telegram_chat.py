@@ -14,6 +14,7 @@ import time
 import aiohttp
 
 from .router import Router
+from .progress_rules import chat_messages_from_event, log_entries_from_event
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -345,45 +346,11 @@ class TelegramChat:
         iteration: int,
         ts: float | None,
     ):
-        if event_type == "text":
-            await self._store.add_log(chat_id, data_text)
-            if data_text.startswith("@orchestrator") or data_text.startswith("@worker"):
-                sender = "worker" if data_text.startswith("@worker") else "orchestrator"
-                await self._store.add_message(chat_id, "assistant", data_text, sender=sender)
-                await self._send_text(chat_id, self._format_assistant_text(data_text, sender))
-            elif data_text.startswith("[orchestrator]"):
-                clean_text = data_text[len("[orchestrator]"):].strip()
-                if clean_text:
-                    await self._store.add_message(chat_id, "assistant", clean_text, sender="orchestrator")
-                    await self._send_text(chat_id, self._format_assistant_text(clean_text, "orchestrator"))
-        elif event_type == "tool_use":
-            line = f"-> {data_text}"
+        for line in log_entries_from_event(event_type, data_text, tool_use_prefix="->"):
             await self._store.add_log(chat_id, line)
-        elif event_type == "tool_error":
-            line = f"[ERROR] {data_text}"
-            await self._store.add_log(chat_id, line)
-            await self._send_text(chat_id, line)
-        elif event_type == "done":
-            if data_text:
-                msg = f"@orchestrator Task complete: {data_text}"
-                await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-                await self._send_text(chat_id, self._format_assistant_text(msg, "orchestrator"))
-        elif event_type == "stopped":
-            msg = f"@orchestrator Task stopped: {data_text or 'stopped by user'}"
-            await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-            await self._send_text(chat_id, self._format_assistant_text(msg, "orchestrator"))
-        elif event_type == "stuck":
-            if data_text:
-                msg = f"@orchestrator Needs input: {data_text}"
-                await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-                await self._send_text(chat_id, self._format_assistant_text(msg, "orchestrator"))
-        elif event_type == "log_update":
-            await self._store.add_log(chat_id, data_text)
-        elif event_type == "error":
-            if data_text:
-                line = f"[ERROR] {data_text}"
-                await self._store.add_log(chat_id, line)
+            if line.startswith("[ERROR]"):
                 await self._send_text(chat_id, line)
-                msg = f"@orchestrator Error: {data_text}"
-                await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-                await self._send_text(chat_id, self._format_assistant_text(msg, "orchestrator"))
+
+        for sender, text in chat_messages_from_event(event_type, data_text):
+            await self._store.add_message(chat_id, "assistant", text, sender=sender)
+            await self._send_text(chat_id, self._format_assistant_text(text, sender))

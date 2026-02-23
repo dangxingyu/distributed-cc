@@ -61,6 +61,38 @@ async def test_route_idle_starts_task():
     assert payload["task"] == "fix the bug"
 
 
+async def test_route_idle_starts_task_with_model_overrides():
+    router = _make_router([
+        RemoteOrchestrator(
+            project_id="myproj",
+            name="srv",
+            status="idle",
+            model="claude-opus-4-6",
+            session_model="claude-sonnet-4-6",
+        )
+    ])
+    router._channel_project[1] = "myproj"
+
+    mock_resp = AsyncMock()
+    mock_resp.json = AsyncMock(return_value={"ok": True})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.post = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "fix the bug", send_reply)
+
+    mock_http.post.assert_called_once()
+    payload = mock_http.post.call_args[1]["json"]
+    assert payload["project_id"] == "myproj"
+    assert payload["task"] == "fix the bug"
+    assert payload["model"] == "claude-opus-4-6"
+    assert payload["session_model"] == "claude-sonnet-4-6"
+
+
 async def test_route_running_non_mention_is_deferred():
     router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
     router._channel_project[1] = "myproj"
@@ -536,6 +568,31 @@ async def test_load_config_servers_schema(tmp_path):
     orch = router._orchestrators["srv-a"]
     assert orch.project_dir == "/tmp"
     assert orch.broker_port == 8201
+
+
+async def test_load_config_servers_schema_with_orchestrator_defaults(tmp_path):
+    config = {
+        "orchestrator": {
+            "model": "claude-opus-4-6",
+            "session_model": "claude-sonnet-4-6",
+        },
+        "servers": [
+            {"name": "srv-a", "work_dir": "/tmp/a"},
+            {"name": "srv-b", "work_dir": "/tmp/b", "model": "claude-haiku-4-5"},
+        ],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    router = Router(cwd=str(tmp_path))
+    router._load_config()
+
+    orch_a = router._orchestrators["srv-a"]
+    assert orch_a.model == "claude-opus-4-6"
+    assert orch_a.session_model == "claude-sonnet-4-6"
+
+    orch_b = router._orchestrators["srv-b"]
+    assert orch_b.model == "claude-haiku-4-5"
+    assert orch_b.session_model == "claude-sonnet-4-6"
 
 
 async def test_load_config_orchestrators_schema(tmp_path):

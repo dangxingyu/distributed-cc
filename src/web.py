@@ -15,6 +15,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from .router import Router
+from .progress_rules import chat_messages_from_event, log_entries_from_event
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -353,28 +354,16 @@ class WebChat:
         iteration: int,
         ts: float | None,
     ):
-        if event_type == "text":
-            await self._store.add_log(chat_id, data_text)
-            await self._ws_send_to_channel(chat_id, {"type": "log", "text": data_text, "ts": ts})
-            if data_text.startswith("@orchestrator") or data_text.startswith("@worker"):
-                sender = "worker" if data_text.startswith("@worker") else "orchestrator"
-                await self._store.add_message(chat_id, "assistant", data_text, sender=sender)
-                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": data_text, "sender": sender, "ts": ts})
-            elif data_text.startswith("[orchestrator]"):
-                # Surface orchestrator's own text in chat (strip prefix)
-                clean_text = data_text[len("[orchestrator]"):].strip()
-                if clean_text:
-                    await self._store.add_message(chat_id, "assistant", clean_text, sender="orchestrator")
-                    await self._ws_send_to_channel(chat_id, {"type": "reply", "text": clean_text, "sender": "orchestrator", "ts": ts})
-        elif event_type == "tool_use":
-            line = f"→ {data_text}"
+        for line in log_entries_from_event(event_type, data_text, tool_use_prefix="→"):
             await self._store.add_log(chat_id, line)
-            await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
-        elif event_type == "tool_error":
-            line = f"[ERROR] {data_text}"
-            await self._store.add_log(chat_id, line)
-            await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
-        elif event_type == "iteration":
+            if event_type != "log_update":
+                await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
+
+        for sender, text in chat_messages_from_event(event_type, data_text):
+            await self._store.add_message(chat_id, "assistant", text, sender=sender)
+            await self._ws_send_to_channel(chat_id, {"type": "reply", "text": text, "sender": sender, "ts": ts})
+
+        if event_type == "iteration":
             await self._ws_send_to_channel(
                 chat_id,
                 {"type": "progress", "data": data_text, "iteration": iteration, "ts": ts},
@@ -390,10 +379,6 @@ class WebChat:
                     "ts": ts,
                 },
             )
-            if data_text:
-                msg = f"@orchestrator Task complete: {data_text}"
-                await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "sender": "orchestrator", "ts": ts})
         elif event_type == "stopped":
             await self._ws_send_to_channel(
                 chat_id,
@@ -405,9 +390,6 @@ class WebChat:
                     "ts": ts,
                 },
             )
-            msg = f"@orchestrator Task stopped: {data_text or 'stopped by user'}"
-            await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-            await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "sender": "orchestrator", "ts": ts})
         elif event_type == "stuck":
             await self._ws_send_to_channel(
                 chat_id,
@@ -419,17 +401,12 @@ class WebChat:
                     "ts": ts,
                 },
             )
-            if data_text:
-                msg = f"@orchestrator Needs input: {data_text}"
-                await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "sender": "orchestrator", "ts": ts})
         elif event_type == "task_list":
             await self._ws_send_to_channel(
                 chat_id,
                 {"type": "task_list", "data": data_text, "iteration": iteration, "ts": ts},
             )
         elif event_type == "log_update":
-            await self._store.add_log(chat_id, data_text)
             await self._ws_send_to_channel(
                 chat_id,
                 {"type": "log_update", "data": data_text, "iteration": iteration, "ts": ts},
@@ -445,13 +422,6 @@ class WebChat:
                     "ts": ts,
                 },
             )
-            if data_text:
-                line = f"[ERROR] {data_text}"
-                await self._store.add_log(chat_id, line)
-                await self._ws_send_to_channel(chat_id, {"type": "log", "text": line, "ts": ts})
-                msg = f"@orchestrator Error: {data_text}"
-                await self._store.add_message(chat_id, "assistant", msg, sender="orchestrator")
-                await self._ws_send_to_channel(chat_id, {"type": "reply", "text": msg, "sender": "orchestrator", "ts": ts})
 
         project_status = self._router.get_project_status(project_id)
         await self._ws_broadcast(
