@@ -208,7 +208,7 @@ class WebChat:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        client_id = uuid.uuid4().hex[:12]
+        client_id = uuid.uuid4().hex
         self._clients[client_id] = ws
         self._client_active_channel[client_id] = None
 

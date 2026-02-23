@@ -202,7 +202,7 @@ class Router:
                     await self._sync_daemon_status(orch, http)
                     async with http.get(url) as resp:
                         if resp.status != 200:
-                            body = (await resp.text())[:200]
+                            body = await resp.text()
                             raise RuntimeError(f"SSE connect failed ({resp.status}): {body}")
                         async for line in resp.content:
                             text = line.decode("utf-8", errors="replace").strip()
@@ -524,7 +524,7 @@ class Router:
             orch.status = "running"
             # Notify via progress callback so the web layer can inform the user
             if self._progress_callback:
-                snippet = next_task["text"][:200]
+                snippet = next_task["text"]
                 note = f"Starting queued task: {snippet}"
                 if remaining:
                     note += f" ({remaining} more in queue)"
@@ -547,7 +547,7 @@ class Router:
                 error,
             )
             if self._progress_callback:
-                snippet = next_task["text"][:200]
+                snippet = next_task["text"]
                 try:
                     await self._progress_callback(project_id, {
                         "type": "text",
@@ -582,7 +582,7 @@ class Router:
                 try:
                     result = await self._resp_json(resp)
                 except Exception:
-                    body = (await resp.text())[:300]
+                    body = await resp.text()
                     return False, f"Daemon returned non-JSON response (HTTP {status}): {body}"
                 if status == 200 and result.get("ok"):
                     return True, ""
@@ -629,7 +629,7 @@ class Router:
                 try:
                     result = await self._resp_json(resp)
                 except Exception:
-                    body = (await resp.text())[:300]
+                    body = await resp.text()
                     await send_reply(f"Interrupt failed (HTTP {status}): {body}")
                     return
                 if status == 200 and result.get("ok"):
@@ -655,7 +655,7 @@ class Router:
                 try:
                     result = await self._resp_json(resp)
                 except Exception:
-                    body = (await resp.text())[:300]
+                    body = await resp.text()
                     await send_reply(f"Stop failed (HTTP {status}): {body}")
                     return
                 if status == 200 and result.get("ok"):
@@ -678,7 +678,7 @@ class Router:
                 try:
                     data = await self._resp_json(resp)
                 except Exception:
-                    body = (await resp.text())[:300]
+                    body = await resp.text()
                     await send_reply(f"Status failed (HTTP {status_code}): {body}")
                     return
                 if status_code != 200:
@@ -799,7 +799,7 @@ class Router:
                 await send_typing(True, "router")
             try:
                 result = await session.run(prompt)
-                if result:
+                if session.should_emit_final_result(result):
                     await setup_reply(result)
                 self.reload_config()
             except Exception as e:

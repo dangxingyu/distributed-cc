@@ -38,6 +38,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import (
     AssistantMessage,
+    SystemMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -48,6 +49,35 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("daemon")
+
+
+def _install_sdk_event_compat() -> None:
+    """Treat unknown CLI *_event payloads as SystemMessage to avoid stream aborts."""
+    try:
+        import claude_agent_sdk._internal.client as sdk_client_internal
+        import claude_agent_sdk._internal.message_parser as sdk_message_parser
+    except Exception:
+        return
+
+    parse_message_fn = getattr(sdk_message_parser, "parse_message", None)
+    if not callable(parse_message_fn):
+        return
+    if getattr(parse_message_fn, "_dcc_event_compat", False):
+        return
+
+    def parse_message_compat(data):
+        msg_type = data.get("type") if isinstance(data, dict) else None
+        if isinstance(msg_type, str) and msg_type.endswith("_event"):
+            return SystemMessage(subtype=msg_type, data=data)
+        return parse_message_fn(data)
+
+    setattr(parse_message_compat, "_dcc_event_compat", True)
+    sdk_message_parser.parse_message = parse_message_compat
+    if hasattr(sdk_client_internal, "parse_message"):
+        sdk_client_internal.parse_message = parse_message_compat
+
+
+_install_sdk_event_compat()
 
 DAEMON_NAME = os.environ.get("DAEMON_NAME", "unknown")
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
@@ -164,7 +194,7 @@ class ProgressEvent:
     """An event streamed to SSE subscribers and the router callback."""
 
     type: str
-    event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     data: str = ""
     iteration: int = 0
     timestamp: float = field(default_factory=time.time)
@@ -496,6 +526,15 @@ async def _run_worker_turn(
                 await _forward_assistant_message(
                     project_id, message, iteration, source="worker"
                 )
+            elif isinstance(message, SystemMessage):
+                await emit_progress(
+                    project_id,
+                    ProgressEvent(
+                        type="log_update",
+                        data=f"[worker system] {message.subtype}",
+                        iteration=iteration,
+                    ),
+                )
             elif isinstance(message, ResultMessage):
                 result_text = message.result or ""
                 worker_session_id = message.session_id
@@ -504,7 +543,6 @@ async def _run_worker_turn(
         done_event.set()
         log.exception("Worker SDK error on iteration %s: %s", iteration, e)
         tb = traceback.format_exc()
-        tb_short = tb[-1200:] if tb else ""
         await emit_progress(
             project_id,
             ProgressEvent(
@@ -513,7 +551,7 @@ async def _run_worker_turn(
                 iteration=iteration,
             ),
         )
-        details = f"\nTraceback (truncated):\n{tb_short}" if tb_short else ""
+        details = f"\nTraceback:\n{tb}" if tb else ""
         return f"Worker failed: {e}{details}", worker_session_id
 
     # Use the report submitted via MCP tool; fall back to session result
@@ -582,7 +620,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             project_id,
             ProgressEvent(
                 type="tool_use",
-                data=f"[orchestrator -> worker] {task_desc[:400]}",
+                data=f"[orchestrator -> worker] {task_desc}",
                 iteration=state.iteration,
             ),
         )
@@ -590,7 +628,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             project_id,
             ProgressEvent(
                 type="text",
-                data=f"@orchestrator -> @worker: {task_desc[:1500]}",
+                data=f"@orchestrator -> @worker: {task_desc}",
                 iteration=state.iteration,
             ),
         )
@@ -624,7 +662,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             project_id,
             ProgressEvent(
                 type="text",
-                data=f"@worker -> @orchestrator: {report[:1800]}",
+                data=f"@worker -> @orchestrator: {report}",
                 iteration=state.iteration,
             ),
         )
@@ -878,7 +916,7 @@ async def run_task(
         log.error("Unknown project: %s", project_id)
         return
 
-    task_id = uuid.uuid4().hex[:12]
+    task_id = uuid.uuid4().hex
     state = TaskState(
         task_id=task_id,
         project_id=project_id,
@@ -902,7 +940,7 @@ async def run_task(
 
     await emit_progress(
         project_id,
-        ProgressEvent(type="iteration", data=f"Starting task: {task_text[:200]}", iteration=0),
+        ProgressEvent(type="iteration", data=f"Starting task: {task_text}", iteration=0),
     )
 
     prompt = f"[TASK]\n{task_text}"
@@ -944,6 +982,15 @@ async def run_task(
                 if isinstance(message, AssistantMessage):
                     await _forward_assistant_message(
                         project_id, message, state.iteration, source="orchestrator"
+                    )
+                elif isinstance(message, SystemMessage):
+                    await emit_progress(
+                        project_id,
+                        ProgressEvent(
+                            type="log_update",
+                            data=f"[orchestrator system] {message.subtype}",
+                            iteration=state.iteration,
+                        ),
                     )
                 elif isinstance(message, ResultMessage):
                     sid = (message.session_id or "").strip()
@@ -1087,14 +1134,14 @@ async def _forward_assistant_message(
                     project_id,
                     ProgressEvent(
                         type="text",
-                        data=f"[{source}] {text[:2000]}",
+                        data=f"[{source}] {text}",
                         iteration=iteration,
                     ),
                 )
         elif isinstance(block, ToolUseBlock):
             tool_msg = f"{block.name}"
             if block.name in ("Bash", "Write", "Edit"):
-                snippet = json.dumps(block.input, ensure_ascii=False)[:300]
+                snippet = json.dumps(block.input, ensure_ascii=False)
                 tool_msg += f": {snippet}"
             await emit_progress(
                 project_id,
@@ -1111,7 +1158,7 @@ async def _forward_assistant_message(
                     project_id,
                     ProgressEvent(
                         type="tool_error",
-                        data=f"[{source}] {content[:500]}",
+                        data=f"[{source}] {content}",
                         iteration=iteration,
                     ),
                 )
@@ -1289,7 +1336,7 @@ async def handle_interrupt(request: web.Request) -> web.Response:
         project_id,
         urgency,
         qsize,
-        message[:100],
+        message,
     )
     return web.json_response({"ok": True, "queued": True, "urgency": urgency, "queue_size": qsize})
 
@@ -1330,7 +1377,7 @@ async def handle_status(request: web.Request) -> web.Response:
             "model": state.model,
             "session_model": state.session_model,
             "continuous_mode": state.continuous_mode,
-            "task_text": state.task_text[:500],
+            "task_text": state.task_text,
             "summary": state.summary,
             "error": state.error,
             "started_at": state.started_at,

@@ -108,6 +108,36 @@ async def test_router_log_callback_on_tool_use():
     assert "router ->" in log_received[0]
 
 
+# ── Final result dedupe ───────────────────────────────────────────────────
+
+
+async def test_should_emit_final_result_false_when_same_as_last_stream_text():
+    from claude_agent_sdk.types import TextBlock
+
+    s = RouterSession(cwd="/tmp")
+    mock_msg = MagicMock()
+    mock_msg.content = [TextBlock(text="final summary")]
+    await s._forward_progress(mock_msg)
+
+    assert s.should_emit_final_result("final summary") is False
+
+
+def test_should_emit_final_result_true_when_no_stream_text():
+    s = RouterSession(cwd="/tmp")
+    assert s.should_emit_final_result("final summary") is True
+
+
+async def test_should_emit_final_result_true_when_different_from_last_stream_text():
+    from claude_agent_sdk.types import TextBlock
+
+    s = RouterSession(cwd="/tmp")
+    mock_msg = MagicMock()
+    mock_msg.content = [TextBlock(text="progress chunk")]
+    await s._forward_progress(mock_msg)
+
+    assert s.should_emit_final_result("different final summary") is True
+
+
 # ── Session resume ───────────────────────────────────────────────────────
 
 

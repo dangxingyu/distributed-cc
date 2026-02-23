@@ -96,11 +96,11 @@ class TelegramChat:
         async with self._http.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             text = await resp.text()
             if resp.status != 200:
-                raise RuntimeError(f"Telegram API {method} failed ({resp.status}): {text[:200]}")
+                raise RuntimeError(f"Telegram API {method} failed ({resp.status}): {text}")
             try:
                 data = json.loads(text)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Telegram API {method} returned non-JSON: {text[:200]}") from e
+                raise RuntimeError(f"Telegram API {method} returned non-JSON: {text}") from e
             if not data.get("ok"):
                 raise RuntimeError(f"Telegram API {method} error: {data}")
             return data.get("result")
@@ -112,11 +112,11 @@ class TelegramChat:
         async with self._http.post(url, json=payload or {}, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             text = await resp.text()
             if resp.status != 200:
-                raise RuntimeError(f"Telegram API {method} failed ({resp.status}): {text[:200]}")
+                raise RuntimeError(f"Telegram API {method} failed ({resp.status}): {text}")
             try:
                 data = json.loads(text)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Telegram API {method} returned non-JSON: {text[:200]}") from e
+                raise RuntimeError(f"Telegram API {method} returned non-JSON: {text}") from e
             if not data.get("ok"):
                 raise RuntimeError(f"Telegram API {method} error: {data}")
             return data.get("result")

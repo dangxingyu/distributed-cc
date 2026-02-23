@@ -22,12 +22,42 @@ import os
 from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 from claude_agent_sdk.types import (
     AssistantMessage,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _install_sdk_event_compat() -> None:
+    """Treat unknown CLI *_event payloads as SystemMessage to avoid stream aborts."""
+    try:
+        import claude_agent_sdk._internal.client as sdk_client_internal
+        import claude_agent_sdk._internal.message_parser as sdk_message_parser
+    except Exception:
+        return
+
+    parse_message_fn = getattr(sdk_message_parser, "parse_message", None)
+    if not callable(parse_message_fn):
+        return
+    if getattr(parse_message_fn, "_dcc_event_compat", False):
+        return
+
+    def parse_message_compat(data):
+        msg_type = data.get("type") if isinstance(data, dict) else None
+        if isinstance(msg_type, str) and msg_type.endswith("_event"):
+            return SystemMessage(subtype=msg_type, data=data)
+        return parse_message_fn(data)
+
+    setattr(parse_message_compat, "_dcc_event_compat", True)
+    sdk_message_parser.parse_message = parse_message_compat
+    if hasattr(sdk_client_internal, "parse_message"):
+        sdk_client_internal.parse_message = parse_message_compat
+
+
+_install_sdk_event_compat()
 
 
 # ── System Prompt ────────────────────────────────────────────────────────
@@ -209,6 +239,8 @@ class RouterSession:
         self._is_running = False
         self._progress_callback: callable | None = None
         self._log_callback: callable | None = None
+        self._last_stream_text: str = ""
+        self._saw_stream_text: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -238,6 +270,9 @@ class RouterSession:
             self._is_running = False
 
     async def _run_inner(self, user_message: str) -> str:
+        self._last_stream_text = ""
+        self._saw_stream_text = False
+
         options = ClaudeAgentOptions(
             permission_mode="bypassPermissions",
             model="sonnet",
@@ -258,6 +293,12 @@ class RouterSession:
         ):
             if isinstance(message, AssistantMessage):
                 await self._forward_progress(message)
+            elif isinstance(message, SystemMessage):
+                if self._log_callback:
+                    try:
+                        await self._log_callback(f"router -> [{message.subtype}]")
+                    except Exception:
+                        pass
             elif isinstance(message, ResultMessage):
                 result_text = message.result or ""
                 self._session_id = message.session_id
@@ -270,6 +311,9 @@ class RouterSession:
         for block in message.content:
             if isinstance(block, TextBlock):
                 text = block.text.strip()
+                if text:
+                    self._saw_stream_text = True
+                    self._last_stream_text = text
                 if text and self._progress_callback:
                     try:
                         await self._progress_callback(text)
@@ -278,7 +322,7 @@ class RouterSession:
             elif isinstance(block, ToolUseBlock):
                 tool_msg = f"{block.name}"
                 if block.name in ("Bash", "Write", "Edit"):
-                    snippet = json.dumps(block.input, ensure_ascii=False)[:300]
+                    snippet = json.dumps(block.input, ensure_ascii=False)
                     tool_msg += f": {snippet}"
                 if self._log_callback:
                     try:
@@ -289,9 +333,18 @@ class RouterSession:
                 if block.is_error and self._log_callback:
                     content = block.content if isinstance(block.content, str) else str(block.content or "")
                     try:
-                        await self._log_callback(f"[router ERROR] {content[:500]}")
+                        await self._log_callback(f"[router ERROR] {content}")
                     except Exception:
                         pass
+
+    def should_emit_final_result(self, result_text: str) -> bool:
+        """Whether the final ResultMessage text should be surfaced to the UI."""
+        final_text = (result_text or "").strip()
+        if not final_text:
+            return False
+        if self._saw_stream_text and final_text == self._last_stream_text.strip():
+            return False
+        return True
 
 
 # ── SDK Helper ───────────────────────────────────────────────────────────
