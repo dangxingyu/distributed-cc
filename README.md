@@ -57,13 +57,21 @@ The setup agent will:
 - SSH into the server
 - install daemon dependencies
 - update local `config.json`
-- tell you tunnel commands
+- auto-start/refresh local SSH tunnel in background (default)
 
 Use follow-up messages to provide context (conda path, project path, cluster constraints).
 
-### 4. Open SSH tunnel(s)
+### 4. Confirm SSH tunnel(s)
 
-One tunnel command per server:
+By default, `/setup user@host` now attempts to start the tunnel for you.
+
+If you want manual mode, run:
+
+```text
+/setup user@your-server --manual-tunnel
+```
+
+Manual tunnel command (one per server):
 
 ```bash
 ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@your-server
@@ -87,8 +95,9 @@ Investigate why training loss plateaus; maybe reward hacking.
 | `/connect` | Show current connection |
 | `/status` | Show daemon/task status |
 | `/stop` | Stop current running task (router or orchestrator) |
-| `/setup <user@host>` | Interactive server setup via router |
+| `/setup <user@host> [--full\|--manual-tunnel]` | Interactive server setup via router (default auto-tunnel) |
 | `/setup` | Health check configured servers |
+| `/setup-project <workdir or instruction>` | Add/update one project entry (reuses existing machine when possible) |
 
 ### Mentions (always work)
 

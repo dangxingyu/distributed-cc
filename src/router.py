@@ -331,8 +331,8 @@ class Router:
                     await send_reply(f"Not connected. Use `/connect <project-id>`. Available: {available}")
             return
 
-        # /setup is a shorthand for @router
-        if stripped.startswith("/setup"):
+        # /setup* is a shorthand for @router
+        if stripped.startswith("/setup-project") or stripped.startswith("/setup"):
             await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
             return
 
@@ -415,6 +415,79 @@ class Router:
         if cmd in ("/connect", "/stop", "/status"):
             return cmd, arg
         return None, ""
+
+    def _parse_setup_command(self, text: str) -> dict[str, object]:
+        """Parse /setup command forms.
+
+        Supported:
+          /setup
+          /setup --health
+          /setup user@host
+          /setup user@host --full
+          /setup user@host --manual-tunnel
+        """
+        body = text[len("/setup") :].strip()
+        if not body:
+            return {"mode": "health"}
+
+        tokens = body.split()
+        flags = [t.lower() for t in tokens if t.startswith("--")]
+        args = [t for t in tokens if not t.startswith("--")]
+
+        allowed_flags = {"--full", "--manual-tunnel", "--health"}
+        unknown_flags = [f for f in flags if f not in allowed_flags]
+        if unknown_flags:
+            return {
+                "mode": "error",
+                "error": (
+                    f"Unknown /setup flag(s): {', '.join(unknown_flags)}. "
+                    "Usage: `/setup`, `/setup --health`, or "
+                    "`/setup user@host [--full|--manual-tunnel]`."
+                ),
+            }
+
+        if "--health" in flags:
+            if args or len(flags) > 1:
+                return {
+                    "mode": "error",
+                    "error": (
+                        "`--health` cannot be combined with a host or other flags. "
+                        "Use `/setup --health`."
+                    ),
+                }
+            return {"mode": "health"}
+
+        if not args:
+            return {
+                "mode": "error",
+                "error": (
+                    "Missing host. Usage: `/setup user@host [--full|--manual-tunnel]` "
+                    "or `/setup --health`."
+                ),
+            }
+
+        host = args[0]
+        auto_tunnel = "--manual-tunnel" not in flags
+        if "--full" in flags:
+            auto_tunnel = True
+        return {"mode": "setup", "host": host, "auto_tunnel": auto_tunnel}
+
+    def _parse_setup_project_command(self, text: str) -> dict[str, object]:
+        """Parse /setup-project command forms.
+
+        Supported:
+          /setup-project <workdir>
+          /setup-project <free-form instruction>
+        """
+        body = text[len("/setup-project") :].strip()
+        if not body:
+            return {
+                "mode": "error",
+                "error": (
+                    "Missing instruction. Usage: `/setup-project <workdir or instruction>`."
+                ),
+            }
+        return {"mode": "setup_project", "instruction": body}
 
     def _enqueue_deferred_task(self, project_id: str, chat_id: int, text: str) -> int:
         queue = self._deferred_tasks.setdefault(project_id, [])
@@ -628,14 +701,67 @@ class Router:
         session.set_callbacks(progress=setup_reply, log=send_log)
 
         stripped = text.strip()
-        if stripped.startswith("/setup"):
-            arg = stripped[len("/setup") :].strip()
-            if arg:
-                prompt = (
-                    f"Set up a new server: {arg}\n\n"
-                    "Probe the environment via SSH, deploy the daemon, "
-                    "and update config.json. Follow the deployment procedure."
-                )
+        if stripped.startswith("/setup-project"):
+            setup_project_req = self._parse_setup_project_command(stripped)
+            if setup_project_req.get("mode") == "error":
+                await setup_reply(str(setup_project_req.get("error", "Invalid /setup-project command.")))
+                return
+            instruction = str(setup_project_req["instruction"])
+            prompt = (
+                "Set up a PROJECT configuration entry using the template below.\n\n"
+                "USER INSTRUCTION (verbatim, do not ignore):\n"
+                f"{instruction}\n\n"
+                "TEMPLATE GOAL:\n"
+                "- Configure a project (project_id + work_dir) so the user can run `/connect <project_id>`.\n"
+                "- Reuse an existing machine/daemon/tunnel when possible.\n"
+                "- Do NOT redeploy daemon or create new tunnel unless required by the instruction or current state.\n\n"
+                "REQUIRED ACTIONS:\n"
+                "1) Read current config.json.\n"
+                "2) Decide target host and broker_port from existing machine setup when possible.\n"
+                "3) Add/update one project entry in config.json (show diff before write).\n"
+                "4) Validate daemon reachability (curl /health on the selected broker_port).\n"
+                "5) Return a concise result with:\n"
+                "   - project_id\n"
+                "   - work_dir\n"
+                "   - host\n"
+                "   - broker_port\n"
+                "   - exact `/connect <project_id>` command\n"
+            )
+        elif stripped.startswith("/setup"):
+            setup_req = self._parse_setup_command(stripped)
+            mode = setup_req.get("mode")
+            if mode == "error":
+                await setup_reply(str(setup_req.get("error", "Invalid /setup command.")))
+                return
+            if mode == "setup":
+                host = str(setup_req["host"])
+                auto_tunnel = bool(setup_req.get("auto_tunnel", True))
+                if auto_tunnel:
+                    prompt = (
+                        f"Set up a new server with FULL automation: {host}\n\n"
+                        "Goal: after this run, the router can immediately talk to the daemon "
+                        "without any manual tunnel step.\n\n"
+                        "Do all of the following:\n"
+                        "1) Probe remote environment via SSH and install prerequisites.\n"
+                        "2) Deploy and start the daemon persistently.\n"
+                        "3) Update local config.json with an entry for this server and a unique broker_port.\n"
+                        "4) Start or refresh a LOCAL background SSH tunnel for this server using that broker_port:\n"
+                        f"   ssh -N -L BROKER_PORT:localhost:8200 -R 9120:localhost:9120 "
+                        f"-o ServerAliveInterval=30 -o ServerAliveCountMax=3 "
+                        f"-o ExitOnForwardFailure=yes -o BatchMode=yes {host}\n"
+                        "   Prefer tmux session `dcc-tunnel-<host-slug>`; fallback to nohup + PID/log files.\n"
+                        "   Do NOT leave a blocking foreground process.\n"
+                        "5) Verify health locally: curl http://127.0.0.1:BROKER_PORT/health\n\n"
+                        "At the end report concise outputs: project_id, broker_port, daemon status, "
+                        "tunnel status, and stop/restart commands."
+                    )
+                else:
+                    prompt = (
+                        f"Set up a new server: {host}\n\n"
+                        "Probe the environment via SSH, deploy the daemon, and update config.json. "
+                        "Do not auto-start local tunnel. Instead, print the exact tunnel command the "
+                        "user should run and then verify health after they confirm tunnel is up."
+                    )
             else:
                 prompt = (
                     "Run a health check on all configured servers. "

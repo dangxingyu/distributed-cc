@@ -43,6 +43,8 @@ local config.json.
   Use `ssh user@host "command"` via the Bash tool.
 - **Deploy daemon**: Copy `tools/orchestrator_daemon.py` to the remote server,
   set up a Python venv with dependencies, and launch the daemon.
+- **Manage local tunnels**: Create/refresh local SSH tunnels in the background
+  so the router can reach remote daemons without extra manual steps.
 - **Write CLAUDE.md**: Generate a CLAUDE.md on the remote server that documents
   server constraints, available resources, and rules for the daemon.
 - **Manage config.json**: Read and update the local `config.json` to add/modify
@@ -77,10 +79,16 @@ When asked to set up a server (e.g., `/setup user@server`):
    ssh user@host "tmux new-session -d -s daemon '~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py --port 8200 --name SERVER_NAME --callback-url http://127.0.0.1:9120'"
    ```
 
-5. **Set up SSH tunnels** (inform the user, don't run in background):
+5. **Set up SSH tunnels automatically on the local machine**:
    ```bash
    ssh -N -L LOCAL_PORT:localhost:8200 -R 9120:localhost:9120 -o ServerAliveInterval=30 user@host
    ```
+   - Prefer persistent background tunnel management:
+     - First choice: `tmux` session (e.g., `dcc-tunnel-HOST`)
+     - Fallback: `nohup ... &` with PID/log files under `~/.distributed-cc/`
+   - Never leave a blocking foreground tunnel command running.
+   - If an existing tunnel for the same host/port already exists, reuse or
+     replace it cleanly.
 
 6. **Update config.json** locally:
    - Read current config, add the new server entry
@@ -145,6 +153,21 @@ When asked to check health (`/setup` with no args):
 - For each server, try `curl http://127.0.0.1:BROKER_PORT/health`
 - Report which daemons are up/down
 
+=== PROJECT SETUP MODE ===
+
+When asked to set up a project (`/setup-project ...`):
+- Router will provide a fixed template prompt and include the user instruction verbatim.
+- Treat that user instruction as the source of truth (work_dir or free-form request).
+- Prefer reusing an existing machine entry (host + broker_port) from config.json.
+- Add/update exactly one project entry in config.json and show a diff before writing.
+- Avoid redeploying daemon or starting a new tunnel unless truly needed.
+- End with a concise structured summary containing:
+  - project_id
+  - work_dir
+  - host
+  - broker_port
+  - `/connect <project_id>` command
+
 === RULES ===
 
 - Use the user's existing SSH config (don't ask for passwords)
@@ -152,6 +175,12 @@ When asked to check health (`/setup` with no args):
 - Be concise — report what you did, not what you're about to do
 - If something fails, diagnose and suggest fixes
 - The daemon script is at `tools/orchestrator_daemon.py` relative to the project root
+- Default to full automation for `/setup user@host`: deploy daemon, update
+  config, start/refresh local tunnel, and verify health.
+- If user explicitly passes manual mode, skip tunnel auto-start and print the
+  exact tunnel command they should run.
+- For `/setup-project`, keep router-level parsing minimal: use the injected
+  template and the user's raw instruction to decide the config change.
 """
 
 

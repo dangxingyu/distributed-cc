@@ -1184,7 +1184,7 @@ body {
       </div>
       <div class="onboard-step">
         <div class="onboard-num">2</div>
-        <div class="onboard-step-text">Deploy a daemon with <code>/setup user@host</code> or connect with <code>/connect project-id</code></div>
+        <div class="onboard-step-text">Run <code>/setup user@host</code> to deploy + auto-tunnel, or connect with <code>/connect project-id</code></div>
       </div>
       <div class="onboard-step">
         <div class="onboard-num">3</div>
@@ -1963,7 +1963,8 @@ const COMMANDS = [
   { name: '/connect', args: '<project-id>', desc: 'Connect channel to a project' },
   { name: '/stop', args: '', desc: 'Stop the current running task' },
   { name: '/status', args: '', desc: 'Show current project status' },
-  { name: '/setup', args: '[user@host]', desc: 'Deploy & configure a daemon' },
+  { name: '/setup', args: '[user@host] [--manual-tunnel]', desc: 'Deploy daemon (auto-tunnel by default)' },
+  { name: '/setup-project', args: '<workdir or instruction>', desc: 'Add/update one project on an existing machine' },
 ];
 
 const MENTIONS = [

@@ -437,6 +437,74 @@ async def test_setup_command_routes_to_router():
         mock_setup.assert_called_once_with(1, "/setup user@server", send_reply, send_log, None)
 
 
+async def test_setup_project_command_routes_to_router():
+    """/setup-project routes to _handle_router_message."""
+    router = _make_router([])
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_setup:
+        await router.route_message(1, "/setup-project /home/ubuntu/proj-a", send_reply, send_log)
+        mock_setup.assert_called_once_with(
+            1,
+            "/setup-project /home/ubuntu/proj-a",
+            send_reply,
+            send_log,
+            None,
+        )
+
+
+def test_parse_setup_command_health_default():
+    router = Router()
+    parsed = router._parse_setup_command("/setup")
+    assert parsed["mode"] == "health"
+
+
+def test_parse_setup_command_auto_tunnel_default():
+    router = Router()
+    parsed = router._parse_setup_command("/setup user@server")
+    assert parsed["mode"] == "setup"
+    assert parsed["host"] == "user@server"
+    assert parsed["auto_tunnel"] is True
+
+
+def test_parse_setup_command_manual_tunnel():
+    router = Router()
+    parsed = router._parse_setup_command("/setup user@server --manual-tunnel")
+    assert parsed["mode"] == "setup"
+    assert parsed["host"] == "user@server"
+    assert parsed["auto_tunnel"] is False
+
+
+def test_parse_setup_command_invalid_flag():
+    router = Router()
+    parsed = router._parse_setup_command("/setup user@server --oops")
+    assert parsed["mode"] == "error"
+    assert "unknown /setup flag" in str(parsed["error"]).lower()
+
+
+def test_parse_setup_command_health_conflict():
+    router = Router()
+    parsed = router._parse_setup_command("/setup user@server --health")
+    assert parsed["mode"] == "error"
+    assert "cannot be combined" in str(parsed["error"]).lower()
+
+
+def test_parse_setup_project_command_basic():
+    router = Router()
+    parsed = router._parse_setup_project_command("/setup-project /home/ubuntu/proj-a")
+    assert parsed["mode"] == "setup_project"
+    assert parsed["instruction"] == "/home/ubuntu/proj-a"
+
+
+def test_parse_setup_project_command_missing_instruction():
+    router = Router()
+    parsed = router._parse_setup_project_command("/setup-project")
+    assert parsed["mode"] == "error"
+    assert "missing instruction" in str(parsed["error"]).lower()
+
+
 async def test_connect_works_from_any_state():
     """/connect works regardless of prior channel state."""
     router = _make_router([
