@@ -717,10 +717,11 @@ class Router:
                 "- Do NOT redeploy daemon or create new tunnel unless required by the instruction or current state.\n\n"
                 "REQUIRED ACTIONS:\n"
                 "1) Read current config.json.\n"
-                "2) Decide target host and broker_port from existing machine setup when possible.\n"
-                "3) Add/update one project entry in config.json (show diff before write).\n"
-                "4) Validate daemon reachability (curl /health on the selected broker_port).\n"
-                "5) Return a concise result with:\n"
+                "2) If `config.md` exists, read it as user notes on setup/environment preferences.\n"
+                "3) Decide target host and broker_port from existing machine setup when possible.\n"
+                "4) Add/update one project entry in config.json (show diff before write).\n"
+                "5) Validate daemon reachability (curl /health on the selected broker_port).\n"
+                "6) Return a concise result with:\n"
                 "   - project_id\n"
                 "   - work_dir\n"
                 "   - host\n"
@@ -739,6 +740,8 @@ class Router:
                 if auto_tunnel:
                     prompt = (
                         f"Set up a new server with FULL automation: {host}\n\n"
+                        "Before acting, if `config.md` exists in the project root, read it as user notes "
+                        "for setup/environment preferences and honor them unless this request overrides them.\n\n"
                         "Goal: after this run, the router can immediately talk to the daemon "
                         "without any manual tunnel step.\n\n"
                         "Do all of the following:\n"
@@ -758,6 +761,8 @@ class Router:
                 else:
                     prompt = (
                         f"Set up a new server: {host}\n\n"
+                        "Before acting, if `config.md` exists in the project root, read it as user notes "
+                        "for setup/environment preferences and honor them unless this request overrides them.\n\n"
                         "Probe the environment via SSH, deploy the daemon, and update config.json. "
                         "Do not auto-start local tunnel. Instead, print the exact tunnel command the "
                         "user should run and then verify health after they confirm tunnel is up."
@@ -765,6 +770,7 @@ class Router:
             else:
                 prompt = (
                     "Run a health check on all configured servers. "
+                    "If `config.md` exists, read it first for user-defined setup/environment notes. "
                     "Read config.json and curl each daemon's /health endpoint."
                 )
         else:

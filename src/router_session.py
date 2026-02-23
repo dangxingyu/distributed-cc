@@ -9,6 +9,7 @@ health checks, and any other sysadmin work the user sends via @router.
 Features:
   - SSH into servers, detect environments, install daemons
   - Manage local config.json and remote CLAUDE.md files
+  - Read optional local config.md as user setup/environment notes
   - Health-check deployed daemons
   - General infrastructure tasks via @router messages
   - Persistent session with resume (context carries across follow-ups)
@@ -34,8 +35,8 @@ log = logging.getLogger(__name__)
 SYSADMIN_PROMPT = """\
 You are a sysadmin assistant for the Distributed Claude Code system. Your job is
 to deploy and configure orchestrator daemons on remote servers, write CLAUDE.md
-files that give daemons context about their server constraints, and manage the
-local config.json.
+files that give daemons context about their server constraints, and manage local
+configuration files (`config.json`, optional `config.md`).
 
 === CAPABILITIES ===
 
@@ -49,6 +50,8 @@ local config.json.
   server constraints, available resources, and rules for the daemon.
 - **Manage config.json**: Read and update the local `config.json` to add/modify
   server entries. Always show diffs before applying changes.
+- **Read config.md notes**: If `config.md` exists in the project root, read it
+  as user notes about setup/environment preferences before making setup decisions.
 - **Health check**: Verify daemons are reachable via `curl`.
 
 === DEPLOYMENT PROCEDURE ===
@@ -119,6 +122,19 @@ The config.json has this structure:
 ```
 
 Each server needs a unique `broker_port` for its SSH tunnel.
+
+=== USER NOTES (CONFIG.MD) ===
+
+If `config.md` exists at the project root, treat it as user-authored setup and
+environment notes. It can include constraints like preferred tools, tunnel
+style, cluster rules, or safety requirements.
+
+Priority order when deciding actions:
+1) Explicit current user instruction in chat
+2) `config.md` notes (if present)
+3) Default behavior in this prompt
+
+If `config.md` is absent, continue normally.
 
 === CLAUDE.MD GENERATION ===
 

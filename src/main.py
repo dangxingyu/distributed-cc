@@ -1,17 +1,17 @@
-"""Entry point: wire Router + WebChat + callback server.
+"""Entry point: wire Router + user frontend + callback server.
 
 The router is a thin relay between the web UI and remote orchestrator daemons.
 It reads config.json for project/daemon configuration.
 
 Usage:
-  python -m src.main [--web-port 8080] [--http-port 9120] [--data-dir ./data]
+  python -m src.main [--frontend web|telegram] [--web-port 8080] [--http-port 9120] [--data-dir ./data]
 """
 
 import argparse
 import asyncio
 import logging
+import os
 import signal
-import sys
 
 from aiohttp import web
 
@@ -55,9 +55,20 @@ async def start_callback_server(app: web.Application, port: int):
 
 async def main():
     parser = argparse.ArgumentParser(description="Distributed Claude Code — Router")
+    parser.add_argument(
+        "--frontend",
+        choices=["web", "telegram"],
+        default="web",
+        help="User-facing frontend",
+    )
     parser.add_argument("--http-port", type=int, default=9120, help="Callback HTTP server port")
     parser.add_argument("--web-port", type=int, default=8080, help="Web chat frontend port")
     parser.add_argument("--web-host", default="127.0.0.1", help="Web chat frontend bind address")
+    parser.add_argument(
+        "--telegram-token",
+        default=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        help="Telegram bot token (or set TELEGRAM_BOT_TOKEN)",
+    )
     parser.add_argument("--data-dir", default="./data", help="Data directory for persistence")
     args = parser.parse_args()
 
@@ -75,16 +86,28 @@ async def main():
     http_app.router.add_post("/progress", handle_progress)
     http_runner = await start_callback_server(http_app, args.http_port)
 
-    # Web frontend
-    from .web import WebChat
-    frontend = WebChat(
-        router=router,
-        store=store,
-        host=args.web_host,
-        port=args.web_port,
-    )
-    await frontend.start()
-    log.info("Running with Web frontend. Ctrl+C to stop.")
+    # User frontend
+    if args.frontend == "web":
+        from .web import WebChat
+
+        frontend = WebChat(
+            router=router,
+            store=store,
+            host=args.web_host,
+            port=args.web_port,
+        )
+        await frontend.start()
+        log.info("Running with Web frontend on http://%s:%s. Ctrl+C to stop.", args.web_host, args.web_port)
+    else:
+        from .telegram_chat import TelegramChat
+
+        frontend = TelegramChat(
+            router=router,
+            store=store,
+            token=args.telegram_token,
+        )
+        await frontend.start()
+        log.info("Running with Telegram frontend. Ctrl+C to stop.")
 
     # Wait for signal
     stop_event = asyncio.Event()
