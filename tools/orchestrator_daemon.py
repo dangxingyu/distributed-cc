@@ -17,6 +17,7 @@ HTTP API:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -58,6 +59,9 @@ CONTINUOUS_MODE_DEFAULT = os.environ.get("CONTINUOUS_MODE", "1").strip().lower()
     "no",
     "off",
 )
+ROLE_CONFIG_DIR = ".claude/roles"
+ORCHESTRATOR_ROLE_FILE = f"{ROLE_CONFIG_DIR}/orchestrator.md"
+WORKER_ROLE_FILE = f"{ROLE_CONFIG_DIR}/worker.md"
 
 
 # -- split-role prompts ------------------------------------------------
@@ -79,7 +83,7 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 - **pull_user_messages()** — fetch queued user guidance/urgent interruptions when useful.
 - **update_task_list(content)** — update your research plan (task_list.md).
 - **append_log(entry)** — append an entry to your research log (LOG.md).
-- **update_worker_config(content)** — update standing worker instructions (.claude/CLAUDE.md).
+- **update_worker_config(content)** — update standing worker instructions (.claude/roles/worker.md).
 
 ## Workflow
 
@@ -122,7 +126,7 @@ your reasoning, see what you tried, and understand why you made each decision.
   doing it yourself immediately.
 - Pull queued user messages periodically so urgent direction is integrated quickly.
 - Keep task_list at PhD-level granularity (experiments, milestones), not micro-steps.
-- Only update worker config (.claude/CLAUDE.md) when conventions genuinely change.
+- Only update worker config (.claude/roles/worker.md) when conventions genuinely change.
 - Use ask_user only for genuine blocking decisions, not routine status updates.
 """
 
@@ -206,6 +210,8 @@ sse_subscribers: dict[str, list[asyncio.Queue]] = {}
 
 orchestrator_sessions: dict[str, str] = {}  # project_id -> orchestrator session
 worker_sessions: dict[str, str] = {}  # project_id -> worker session
+orchestrator_prompt_hashes: dict[str, str] = {}  # project_id -> orchestrator prompt hash
+worker_prompt_hashes: dict[str, str] = {}  # project_id -> worker prompt hash
 
 
 def _ensure_interrupt_queue(project_id: str) -> asyncio.Queue:
@@ -242,6 +248,39 @@ def _parse_bool(value, default: bool) -> bool:
     if text in ("0", "false", "no", "off"):
         return False
     return default
+
+
+def _hash_text(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _compose_role_prompt(project_dir: str, role: str) -> tuple[str, str]:
+    """Compose base prompt + optional role-specific memory file."""
+    if role == "orchestrator":
+        base_prompt = ORCHESTRATOR_PROMPT
+        role_path = Path(project_dir) / ORCHESTRATOR_ROLE_FILE
+    elif role == "worker":
+        base_prompt = WORKER_PROMPT
+        role_path = Path(project_dir) / WORKER_ROLE_FILE
+    else:
+        raise ValueError(f"Unknown role: {role}")
+
+    prompt = base_prompt
+    if role_path.exists():
+        try:
+            role_notes = role_path.read_text().strip()
+        except Exception as e:
+            log.warning("Failed reading role memory %s: %s", role_path, e)
+            role_notes = ""
+        if role_notes:
+            relative_path = role_path.relative_to(project_dir)
+            prompt = (
+                f"{base_prompt.rstrip()}\n\n"
+                f"## Role Memory ({relative_path.as_posix()})\n\n"
+                f"{role_notes}\n"
+            )
+
+    return prompt, _hash_text(prompt)
 
 
 def _interrupt_payload_meta(payload) -> dict:
@@ -395,6 +434,18 @@ async def _run_worker_turn(
     # Capture report content via closure
     captured_report: list[str] = []
     worker_mcp = _create_worker_tools(project_id, iteration, captured_report)
+    worker_prompt, worker_prompt_hash = _compose_role_prompt(project.project_dir, "worker")
+    previous_hash = worker_prompt_hashes.get(project_id)
+
+    # Role memory changed; start a fresh worker session so new instructions load.
+    if previous_hash and previous_hash != worker_prompt_hash and worker_session_id:
+        log.info(
+            "Worker role memory changed for %s; resetting worker session",
+            project_id,
+        )
+        worker_session_id = ""
+        worker_sessions.pop(project_id, None)
+    worker_prompt_hashes[project_id] = worker_prompt_hash
 
     options = ClaudeAgentOptions(
         permission_mode="bypassPermissions",
@@ -408,7 +459,7 @@ async def _run_worker_turn(
     if worker_session_id:
         options.resume = worker_session_id
     else:
-        options.system_prompt = WORKER_PROMPT
+        options.system_prompt = worker_prompt
 
     result_text = ""
     done_event = asyncio.Event()
@@ -693,8 +744,8 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
     @tool(
         "update_worker_config",
-        "Update standing instructions for your worker (.claude/CLAUDE.md). "
-        "The worker loads this natively at the start of every assignment. "
+        "Update standing instructions for your worker (.claude/roles/worker.md). "
+        "The worker loads this role memory at the start of every assignment. "
         "This is separate from the project's root CLAUDE.md (which you should not overwrite). "
         "Use for: learned conventions, file locations, environment quirks, "
         "tool preferences. Only update when something genuinely changes.",
@@ -708,12 +759,22 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
                 "is_error": True,
             }
 
-        claude_dir = Path(project.project_dir) / ".claude"
-        claude_dir.mkdir(exist_ok=True)
-        (claude_dir / "CLAUDE.md").write_text(args["content"])
+        role_path = Path(project.project_dir) / WORKER_ROLE_FILE
+        role_path.parent.mkdir(parents=True, exist_ok=True)
+        role_path.write_text(args["content"])
+
+        # Force fresh worker session so new role memory is loaded immediately.
+        worker_prompt_hashes.pop(project_id, None)
+        if worker_sessions.pop(project_id, None):
+            state.worker_session_id = ""
+            _save_state(
+                state,
+                orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
+                worker_session_id="",
+            )
 
         return {"content": [{"type": "text", "text":
-            "Worker instructions (.claude/CLAUDE.md) updated."}]}
+            "Worker instructions (.claude/roles/worker.md) updated."}]}
 
     return create_sdk_mcp_server(
         "daemon",
@@ -737,6 +798,7 @@ def _build_orchestrator_options(
     mcp_server,
     max_iterations: int,
     session_id: str,
+    system_prompt: str,
 ) -> ClaudeAgentOptions:
     if max_iterations > 0:
         max_turns = max(8, max_iterations * 8)
@@ -748,13 +810,14 @@ def _build_orchestrator_options(
         permission_mode="bypassPermissions",
         model="claude-opus-4-6",
         cwd=project_dir,
+        setting_sources=["project"],  # load shared CLAUDE.md natively
         mcp_servers={"daemon": mcp_server},
         max_turns=max_turns,
     )
     if session_id:
         options.resume = session_id
     else:
-        options.system_prompt = ORCHESTRATOR_PROMPT
+        options.system_prompt = system_prompt
     return options
 
 
@@ -802,12 +865,29 @@ async def run_task(
     try:
         next_prompt = prompt
         while True:
+            orchestrator_prompt, orchestrator_prompt_hash = _compose_role_prompt(
+                project.project_dir,
+                "orchestrator",
+            )
+            previous_hash = orchestrator_prompt_hashes.get(project_id)
+            if previous_hash and previous_hash != orchestrator_prompt_hash and orchestrator_session_id:
+                log.info(
+                    "Orchestrator role memory changed for %s; resetting orchestrator session",
+                    project_id,
+                )
+                orchestrator_session_id = ""
+                orchestrator_sessions.pop(project_id, None)
+                state.orchestrator_session_id = ""
+                state.sdk_session_id = ""
+            orchestrator_prompt_hashes[project_id] = orchestrator_prompt_hash
+
             done_event = asyncio.Event()
             options = _build_orchestrator_options(
                 project_dir=project.project_dir,
                 mcp_server=mcp_server,
                 max_iterations=max_iterations,
                 session_id=orchestrator_session_id,
+                system_prompt=orchestrator_prompt,
             )
             saw_result = False
 
@@ -1012,6 +1092,8 @@ def _save_state(
         "sdk_session_id": orchestrator_session_id,
         "orchestrator_session_id": orchestrator_session_id,
         "worker_session_id": worker_session_id,
+        "orchestrator_prompt_hash": orchestrator_prompt_hashes.get(state.project_id, ""),
+        "worker_prompt_hash": worker_prompt_hashes.get(state.project_id, ""),
         "started_at": state.started_at,
         "finished_at": state.finished_at,
         "summary": state.summary,
@@ -1033,7 +1115,7 @@ def _load_state(project_id: str) -> dict | None:
 
 
 def _hydrate_sessions_from_state(project_id: str) -> bool:
-    """Restore orchestrator/worker session IDs from persisted state."""
+    """Restore orchestrator/worker session IDs and prompt hashes from persisted state."""
     data = _load_state(project_id)
     if not data:
         return False
@@ -1049,6 +1131,12 @@ def _hydrate_sessions_from_state(project_id: str) -> bool:
         orchestrator_sessions[project_id] = orch_sid
     if worker_sid:
         worker_sessions[project_id] = worker_sid
+    orch_prompt_hash = str(data.get("orchestrator_prompt_hash") or "").strip()
+    worker_prompt_hash = str(data.get("worker_prompt_hash") or "").strip()
+    if orch_prompt_hash:
+        orchestrator_prompt_hashes[project_id] = orch_prompt_hash
+    if worker_prompt_hash:
+        worker_prompt_hashes[project_id] = worker_prompt_hash
     return bool(orch_sid or worker_sid)
 
 

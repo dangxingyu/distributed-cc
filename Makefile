@@ -1,4 +1,5 @@
 .PHONY: run test test-e2e deploy tunnels install-dev
+E2E_JOBS ?= 1
 
 # Run router + web UI (default)
 run:
@@ -10,7 +11,12 @@ test:
 
 # Run end-to-end tests (calls real Claude, costs money)
 test-e2e:
+ifeq ($(E2E_JOBS),1)
 	uv run pytest tests/test_e2e.py -v
+else
+	@uv run python -c "import xdist" >/dev/null 2>&1 || (echo "pytest-xdist is required for E2E_JOBS>1. Run: uv sync --extra dev" && exit 1)
+	uv run pytest tests/test_e2e.py -v -n $(E2E_JOBS)
+endif
 
 # Deploy broker to a remote server: make deploy HOST=user@server NAME=my-server
 deploy:

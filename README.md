@@ -1,9 +1,11 @@
 # Distributed Claude Code
 
-Run Claude Code across multiple machines from one local web chat.
+Run Claude Code across multiple machines from one local control chat (Web UI or Telegram bot).
 
 It gives you:
-- One chat UI on your laptop (`http://localhost:8080`)
+- One local frontend:
+  - Web UI on your laptop (`http://localhost:8080`), or
+  - Telegram bot in a group/private chat
 - One daemon per server (`:8200`)
 - Two agent roles per task on each daemon:
   - **Orchestrator** — PhD-student-level researcher: plans, investigates, reviews, decides
@@ -23,9 +25,11 @@ You (web UI) -> Router (local) -> Daemon (remote)
                                -> Continue autonomously (continuous_mode=true) until /stop or task_complete
 ```
 
-The UI shows:
+The Web UI shows:
 - Chat panel: orchestrator/worker exchanges and status updates
 - Monitor panel: tool calls, logs, iteration progress, and task list
+
+Telegram mode sends orchestrator/worker messages directly into the chat and keeps logs in local persistence.
 
 ## Quick Start (10 Minutes)
 
@@ -37,13 +41,21 @@ cd distributed-cc
 uv sync --extra dev
 ```
 
-### 2. Start router + web UI
+### 2. Start router + web UI (default)
 
 ```bash
 make run
 ```
 
 Open `http://localhost:8080`.
+
+### 2b. Start router + Telegram bot
+
+```bash
+TELEGRAM_BOT_TOKEN=<your-token> uv run python -m src --frontend telegram
+```
+
+Then add the bot to a Telegram group (or DM it directly).
 
 ### 3. Set up a server from the UI
 
@@ -98,6 +110,7 @@ Investigate why training loss plateaus; maybe reward hacking.
 | `/setup <user@host> [--full\|--manual-tunnel]` | Interactive server setup via router (default auto-tunnel) |
 | `/setup` | Health check configured servers |
 | `/setup-project <workdir or instruction>` | Add/update one project entry (reuses existing machine when possible) |
+| `/setup_project <workdir or instruction>` | Telegram-friendly alias of `/setup-project` |
 
 ### Mentions (always work)
 
@@ -198,6 +211,9 @@ Prerequisite on each remote machine:
 - Check reverse tunnel (`-R 9120:localhost:9120`) is present
 - Verify local callback server is up (router running)
 
+### Telegram bot receives no group messages
+- Disable bot privacy mode in BotFather, or mention the bot in commands (e.g. `/connect@your_bot proj-a`)
+
 ### `/connect <id>` says unknown project
 - Confirm `config.json` has matching `servers[].name`
 - Restart router after config changes
@@ -207,16 +223,18 @@ Prerequisite on each remote machine:
 ```bash
 make test      # unit/integration tests (no paid API calls)
 make test-e2e  # real Claude API calls (costs money)
+make test-e2e E2E_JOBS=4  # parallel E2E workers via pytest-xdist
 ```
 
 ## Project Layout
 
 ```text
 src/
-  main.py            entrypoint (router + web + callback server)
+  main.py            entrypoint (router + frontend + callback server)
   router.py          command routing, daemon IO, status, queueing
   router_session.py  local sysadmin Claude session (@router, /setup)
   web.py             HTTP/WebSocket chat backend
+  telegram_chat.py   Telegram bot chat backend (long polling)
   store.py           JSON persistence
   static/
     index.html       frontend

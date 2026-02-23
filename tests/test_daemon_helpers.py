@@ -139,6 +139,22 @@ def test_append_log_unknown_project():
     assert _append_log("nonexistent", "test") == ""
 
 
+def test_compose_role_prompt_appends_role_memory(tmp_path):
+    from orchestrator_daemon import _compose_role_prompt, WORKER_PROMPT, WORKER_ROLE_FILE
+
+    baseline_prompt, baseline_hash = _compose_role_prompt(str(tmp_path), "worker")
+    assert baseline_prompt == WORKER_PROMPT
+
+    role_path = tmp_path / WORKER_ROLE_FILE
+    role_path.parent.mkdir(parents=True, exist_ok=True)
+    role_path.write_text("Always append ROLE_WORKER_SENTINEL: meow~ in reports.")
+
+    prompt, prompt_hash = _compose_role_prompt(str(tmp_path), "worker")
+    assert "Role Memory (.claude/roles/worker.md)" in prompt
+    assert "ROLE_WORKER_SENTINEL: meow~" in prompt
+    assert prompt_hash != baseline_hash
+
+
 def test_interrupt_queue_is_bounded_and_typed():
     """Interrupt queue should be typed and bounded, dropping oldest when full."""
     from orchestrator_daemon import (
@@ -231,7 +247,9 @@ def test_hydrate_sessions_from_state(tmp_path):
     from orchestrator_daemon import (
         _hydrate_sessions_from_state,
         orchestrator_sessions,
+        orchestrator_prompt_hashes,
         worker_sessions,
+        worker_prompt_hashes,
     )
     import orchestrator_daemon as daemon_mod
 
@@ -243,6 +261,8 @@ def test_hydrate_sessions_from_state(tmp_path):
                 "orchestrator_session_id": "orch-sid",
                 "worker_session_id": "worker-sid",
                 "sdk_session_id": "orch-sid",
+                "orchestrator_prompt_hash": "orch-hash",
+                "worker_prompt_hash": "worker-hash",
             }
         )
     )
@@ -251,14 +271,20 @@ def test_hydrate_sessions_from_state(tmp_path):
     daemon_mod.STATE_DIR = tmp_path
     orchestrator_sessions.pop(project_id, None)
     worker_sessions.pop(project_id, None)
+    orchestrator_prompt_hashes.pop(project_id, None)
+    worker_prompt_hashes.pop(project_id, None)
     try:
         assert _hydrate_sessions_from_state(project_id) is True
         assert orchestrator_sessions[project_id] == "orch-sid"
         assert worker_sessions[project_id] == "worker-sid"
+        assert orchestrator_prompt_hashes[project_id] == "orch-hash"
+        assert worker_prompt_hashes[project_id] == "worker-hash"
     finally:
         daemon_mod.STATE_DIR = old_state_dir
         orchestrator_sessions.pop(project_id, None)
         worker_sessions.pop(project_id, None)
+        orchestrator_prompt_hashes.pop(project_id, None)
+        worker_prompt_hashes.pop(project_id, None)
 
 
 @pytest.mark.asyncio
