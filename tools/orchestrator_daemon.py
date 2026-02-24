@@ -79,10 +79,16 @@ def _install_sdk_event_compat() -> None:
 
 _install_sdk_event_compat()
 
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 DAEMON_NAME = os.environ.get("DAEMON_NAME", "unknown")
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
 DEFAULT_ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "claude-opus-4-6")
 DEFAULT_SESSION_MODEL = os.environ.get("ORCHESTRATOR_SESSION_MODEL", DEFAULT_ORCHESTRATOR_MODEL)
+DEBUG_FLOW = _env_flag("DCC_DEBUG_FLOW")
 MAX_ITERATIONS = 0
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 INTERRUPT_QUEUE_MAX = 100
@@ -387,10 +393,27 @@ async def _get_callback_http_session() -> ClientSession:
 
 async def emit_progress(project_id: str, event: ProgressEvent):
     """Send progress event to SSE subscribers and HTTP callback."""
+    if DEBUG_FLOW:
+        log.info(
+            "[flow/daemon] emit project=%s event_id=%s type=%s iter=%s data_len=%s",
+            project_id,
+            event.event_id,
+            event.type,
+            event.iteration,
+            len(event.data or ""),
+        )
+
     for q in sse_subscribers.get(project_id, []):
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
+            if DEBUG_FLOW:
+                log.warning(
+                    "[flow/daemon] sse queue full project=%s event_id=%s type=%s",
+                    project_id,
+                    event.event_id,
+                    event.type,
+                )
             pass
 
     try:
@@ -418,6 +441,13 @@ async def emit_progress(project_id: str, event: ProgressEvent):
                     event.type,
                 )
     except Exception:
+        if DEBUG_FLOW:
+            log.exception(
+                "[flow/daemon] callback post failed project=%s event_id=%s type=%s",
+                project_id,
+                event.event_id,
+                event.type,
+            )
         pass
 
 

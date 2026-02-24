@@ -1317,10 +1317,15 @@ let _indicatorActive = false;
 
 function showTypingIndicator(label) {
   if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
-  if (_indicatorActive) return;
-  _indicatorActive = true;
 
   const displayLabel = label || 'working';
+  const currentLabel = typingIndicator.getAttribute('data-label');
+  if (_indicatorActive && typingIndicator.classList.contains('active') && currentLabel === displayLabel) {
+    return;
+  }
+
+  _indicatorActive = true;
+  typingIndicator.setAttribute('data-label', displayLabel);
   typingIndicator.innerHTML =
     '<span class="dot-pulse"><span></span><span></span><span></span></span>' +
     `<span class="status-label">${displayLabel} is working</span>`;
@@ -1331,9 +1336,28 @@ function hideTypingIndicator() {
   if (_hideTimer) clearTimeout(_hideTimer);
   _hideTimer = setTimeout(() => {
     _indicatorActive = false;
+    typingIndicator.removeAttribute('data-label');
     typingIndicator.classList.remove('active');
     _hideTimer = null;
   }, 800);
+}
+
+function resetTypingIndicator() {
+  if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
+  _indicatorActive = false;
+  typingIndicator.removeAttribute('data-label');
+  typingIndicator.classList.remove('active');
+}
+
+function inferWorkingSenderFromLog(text) {
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+  if (!raw) return null;
+  if (raw.startsWith('router ->') || raw.includes('[router]')) return 'router';
+  if (raw.includes('[worker]') || raw.startsWith('@worker') || raw.includes('@worker')) return 'worker';
+  if (raw.includes('[orchestrator]') || raw.startsWith('@orchestrator') || raw.includes('@orchestrator')) {
+    return 'orchestrator';
+  }
+  return null;
 }
 
 // ── Message rendering ────────────────────────────────────────────────
@@ -1588,6 +1612,7 @@ function onChannelSwitched(data) {
   currentProjectId = data.project_id || null;
   currentProjectStatus = data.project_status || 'unknown';
   localStorage.setItem('dcc_active_channel', String(activeChannel));
+  resetTypingIndicator();
 
   const ch = channels.find(c => c.id === activeChannel);
   channelTitle.textContent = ch ? '# ' + ch.name : 'distributed-cc';
@@ -2229,13 +2254,20 @@ function connect() {
 
     } else if (data.type === 'log_update') {
       addLogEntry('[LOG] ' + data.data, data.ts);
+      const sender = inferWorkingSenderFromLog(data.data);
+      if (sender) showTypingIndicator(sender);
 
     } else if (data.type === 'log') {
       addLogEntry(data.text, data.ts);
+      const sender = inferWorkingSenderFromLog(data.text);
+      if (sender) showTypingIndicator(sender);
 
     } else if (data.type === 'reply') {
       const sender = data.sender || classifyMessageLegacy(data.text);
       addMessage(data.text, sender, data.ts);
+      if (sender === 'orchestrator' || sender === 'worker' || sender === 'router') {
+        showTypingIndicator(sender);
+      }
       if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
 
     } else if (data.type === 'message_ack') {

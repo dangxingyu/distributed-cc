@@ -23,6 +23,17 @@ from .router_session import RouterSession
 log = logging.getLogger(__name__)
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _preview(text: str, limit: int = 120) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
+
+
 @dataclass
 class RemoteOrchestrator:
     """A remote orchestrator daemon configuration."""
@@ -71,6 +82,7 @@ class Router:
         # Router sessions — per-channel sysadmin Claude sessions
         self._router_sessions: dict[int, RouterSession] = {}
         self._router_tasks: dict[int, asyncio.Task] = {}
+        self._debug_flow = _env_flag("DCC_DEBUG_FLOW")
 
     async def init(self):
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -242,11 +254,36 @@ class Router:
         Returns True when processed, False when deduped.
         """
         if self._is_duplicate_event(project_id, event):
+            if self._debug_flow:
+                log.info(
+                    "[flow] dedupe project=%s source=%s event_id=%s type=%s iter=%s",
+                    project_id,
+                    source,
+                    event.get("event_id", ""),
+                    event.get("type", ""),
+                    event.get("iteration", 0),
+                )
             return False
 
         event_type = event.get("type", "")
-        data = event.get("data", "")
-        iteration = event.get("iteration", 0)
+        data = str(event.get("data", ""))
+        iteration_raw = event.get("iteration", 0)
+        try:
+            iteration = int(iteration_raw)
+        except (TypeError, ValueError):
+            iteration = 0
+
+        if self._debug_flow:
+            log.info(
+                "[flow] ingest project=%s source=%s event_id=%s type=%s iter=%s data_len=%s preview=%s",
+                project_id,
+                source,
+                event.get("event_id", ""),
+                event_type,
+                iteration,
+                len(data),
+                _preview(data),
+            )
 
         orch = self._orchestrators.get(project_id)
         if orch:
@@ -315,6 +352,13 @@ class Router:
 
     async def route_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None, send_typing: callable = None):
         stripped = text.strip()
+        if self._debug_flow:
+            log.info(
+                "[flow] route chat=%s project=%s text=%s",
+                chat_id,
+                self._channel_project.get(chat_id),
+                _preview(stripped),
+            )
 
         # ── Direct messages (@router, @orchestrator) — always work ──
 

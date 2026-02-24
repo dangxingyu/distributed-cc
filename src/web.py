@@ -8,6 +8,7 @@ all mapped channels and streamed to currently viewing clients.
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +22,10 @@ from .store import Store
 log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class WebChat:
@@ -41,6 +46,7 @@ class WebChat:
         # Multi-client websocket state
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._client_active_channel: dict[str, int | None] = {}
+        self._debug_flow = _env_flag("DCC_DEBUG_FLOW")
 
         # Wire callbacks
         self._router.set_progress_callback(self._handle_progress)
@@ -335,12 +341,30 @@ class WebChat:
     async def _handle_progress(self, project_id: str, event: dict):
         chat_ids = self._router.get_channels_for_project(project_id)
         if not chat_ids:
+            if self._debug_flow:
+                log.info(
+                    "[flow/web] drop progress (no channel mapping) project=%s event_id=%s type=%s",
+                    project_id,
+                    event.get("event_id", ""),
+                    event.get("type", ""),
+                )
             return
 
         event_type = event.get("type", "")
         data_text = event.get("data", "")
         iteration = event.get("iteration", 0)
         ts = event.get("ts")
+
+        if self._debug_flow:
+            log.info(
+                "[flow/web] progress project=%s mapped_channels=%s event_id=%s type=%s iter=%s data_len=%s",
+                project_id,
+                chat_ids,
+                event.get("event_id", ""),
+                event_type,
+                iteration,
+                len(str(data_text)),
+            )
 
         for chat_id in chat_ids:
             await self._persist_and_emit_progress(chat_id, project_id, event_type, data_text, iteration, ts)
@@ -354,6 +378,15 @@ class WebChat:
         iteration: int,
         ts: float | None,
     ):
+        if self._debug_flow:
+            log.info(
+                "[flow/web] emit channel=%s project=%s type=%s iter=%s",
+                chat_id,
+                project_id,
+                event_type,
+                iteration,
+            )
+
         for line in log_entries_from_event(event_type, data_text, tool_use_prefix="→"):
             await self._store.add_log(chat_id, line)
             if event_type != "log_update":
