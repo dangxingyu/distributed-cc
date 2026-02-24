@@ -927,6 +927,37 @@ class Router:
         orch = self._orchestrators.get(project_id)
         return orch.status if orch else "unknown"
 
+    async def refresh_project_status(self, project_id: str) -> str:
+        """Best-effort daemon status refresh for UI reconnect/switch scenarios."""
+        orch = self._orchestrators.get(project_id)
+        if not orch:
+            return "unknown"
+        if not self._http:
+            return orch.status
+
+        try:
+            if not await self._ensure_registered(orch):
+                orch.status = "disconnected"
+                return orch.status
+
+            url = f"{self._daemon_url(orch)}/status?project_id={project_id}"
+            async with self._http.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                status_code = self._resp_status(resp)
+                if status_code != 200:
+                    if status_code >= 500:
+                        orch.status = "disconnected"
+                    return orch.status
+
+                data = await self._resp_json(resp)
+                status = str(data.get("status", "unknown")).strip() or "unknown"
+                orch.status = status
+                return status
+        except aiohttp.ClientError:
+            orch.status = "disconnected"
+            return orch.status
+        except Exception:
+            return orch.status
+
     def list_orchestrators(self) -> list[RemoteOrchestrator]:
         return list(self._orchestrators.values())
 

@@ -1242,12 +1242,19 @@ let channelMembers = [];
 let currentProjectId = null;
 let currentProjectStatus = 'unknown';
 let currentIteration = 0;
+let lastWsMessageAt = 0;
+let wsWatchdogTimer = null;
 const pendingUserMessages = new Map();
 const requestScopes = {
   history: { token: 0, controller: null },
   members: { token: 0, controller: null },
   logs: { token: 0, controller: null },
 };
+const STALE_WS_MS = 45000;
+const WATCHDOG_POLL_MS = 15000;
+const SWITCH_ACK_TIMEOUT_MS = 8000;
+const TASK_LIST_CACHE_KEY = 'dcc_task_list_cache_v1';
+let taskListCache = loadTaskListCache();
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -1274,6 +1281,47 @@ function fetchJson(url, options) {
     }
     return payload;
   });
+}
+
+function normalizeIteration(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function loadTaskListCache() {
+  try {
+    const raw = localStorage.getItem(TASK_LIST_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveTaskListCache() {
+  try {
+    localStorage.setItem(TASK_LIST_CACHE_KEY, JSON.stringify(taskListCache));
+  } catch (_) {
+    // Ignore storage failures (private mode/quota).
+  }
+}
+
+function setCachedTaskList(projectId, markdown) {
+  if (!projectId) return;
+  const text = typeof markdown === 'string' ? markdown : '';
+  if (text.trim()) {
+    taskListCache[projectId] = text;
+  } else {
+    delete taskListCache[projectId];
+  }
+  saveTaskListCache();
+}
+
+function getCachedTaskList(projectId) {
+  if (!projectId) return '';
+  const value = taskListCache[projectId];
+  return typeof value === 'string' ? value : '';
 }
 
 // ── Status display ──────────────────────────────────────────────────
@@ -1601,9 +1649,18 @@ function deleteChannel(channelId, name) {
     });
 }
 
-function switchChannel(channelId) {
+function switchChannel(channelId, timeoutMs = SWITCH_ACK_TIMEOUT_MS) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const sentAt = Date.now();
   ws.send(JSON.stringify({ type: 'switch_channel', channel_id: channelId }));
+
+  setTimeout(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // If no WS traffic arrived after this switch request, force reconnect.
+    if (lastWsMessageAt < sentAt) {
+      ws.close();
+    }
+  }, timeoutMs);
 }
 
 function onChannelSwitched(data) {
@@ -1611,6 +1668,7 @@ function onChannelSwitched(data) {
   activeChannel = data.channel_id;
   currentProjectId = data.project_id || null;
   currentProjectStatus = data.project_status || 'unknown';
+  currentIteration = 0;
   localStorage.setItem('dcc_active_channel', String(activeChannel));
   resetTypingIndicator();
 
@@ -1621,11 +1679,15 @@ function onChannelSwitched(data) {
   monitorLog.innerHTML = '';
 
   // Reset per-channel UI state
-  taskListPanel.classList.remove('has-content');
-  taskListContent.innerHTML = '';
+  const cachedTaskList = getCachedTaskList(currentProjectId);
+  if (cachedTaskList) {
+    updateTaskList(cachedTaskList, { autoOpenMonitor: false });
+  } else {
+    clearTaskListPanel();
+  }
   clearAwaitingInput();
 
-  updateProjectBadge(currentProjectStatus, 0);
+  updateProjectBadge(currentProjectStatus, currentIteration);
   refreshActiveChannelData(activeChannel);
   renderChannelList();
 }
@@ -1929,9 +1991,15 @@ function toggleTaskList() {
   }
 }
 
-function updateTaskList(markdown) {
+function clearTaskListPanel() {
+  taskListPanel.classList.remove('has-content');
+  taskListContent.innerHTML = '';
+}
+
+function updateTaskList(markdown, options) {
+  const opts = options || {};
   if (!markdown || !markdown.trim()) {
-    taskListPanel.classList.remove('has-content');
+    clearTaskListPanel();
     return;
   }
   taskListPanel.classList.add('has-content');
@@ -1957,7 +2025,7 @@ function updateTaskList(markdown) {
   taskListContent.innerHTML = html;
 
   // Auto-open monitor if task list arrives and monitor is closed
-  if (monitorEl.classList.contains('monitor-closed')) {
+  if (opts.autoOpenMonitor !== false && monitorEl.classList.contains('monitor-closed')) {
     toggleMonitor();
   }
 }
@@ -2163,6 +2231,49 @@ document.addEventListener('keydown', function(e) {
   }
 });
 
+function stopWsWatchdog() {
+  if (!wsWatchdogTimer) return;
+  clearInterval(wsWatchdogTimer);
+  wsWatchdogTimer = null;
+}
+
+function startWsWatchdog() {
+  stopWsWatchdog();
+  wsWatchdogTimer = setInterval(() => {
+    if (document.hidden) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (activeChannel === null) return;
+    if (Date.now() - lastWsMessageAt < STALE_WS_MS) return;
+    switchChannel(activeChannel);
+  }, WATCHDOG_POLL_MS);
+}
+
+function resyncWhenForegrounded() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    if (activeChannel !== null) {
+      switchChannel(activeChannel);
+      return;
+    }
+    loadChannels().then(list => {
+      if (list.length === 0) return;
+      const saved = parseInt(localStorage.getItem('dcc_active_channel'), 10);
+      const target = list.find(c => c.id === saved) ? saved : list[0].id;
+      switchChannel(target);
+    });
+    return;
+  }
+  connect();
+}
+
+document.addEventListener('visibilitychange', function() {
+  if (!document.hidden) {
+    resyncWhenForegrounded();
+  }
+});
+
+window.addEventListener('focus', resyncWhenForegrounded);
+window.addEventListener('online', resyncWhenForegrounded);
+
 // ── WebSocket ───────────────────────────────────────────────────────
 
 function connect() {
@@ -2177,6 +2288,8 @@ function connect() {
   ws.onopen = function() {
     statusDot.className = 'connected';
     statusText.textContent = 'connected';
+    lastWsMessageAt = Date.now();
+    startWsWatchdog();
 
     loadChannels().then(list => {
       if (list.length === 0) return;
@@ -2189,6 +2302,8 @@ function connect() {
   ws.onclose = function() {
     statusDot.className = 'disconnected';
     statusText.textContent = 'disconnected';
+    stopWsWatchdog();
+    resetTypingIndicator();
     const pendingIds = Array.from(pendingUserMessages.keys());
     for (const id of pendingIds) {
       markPendingUserMessageFailed(id, 'offline');
@@ -2201,6 +2316,7 @@ function connect() {
   };
 
   ws.onmessage = function(event) {
+    lastWsMessageAt = Date.now();
     let data = null;
     try {
       data = JSON.parse(event.data);
@@ -2214,7 +2330,7 @@ function connect() {
 
     } else if (data.type === 'progress') {
       const pStatus = data.status || data.type;
-      currentIteration = data.iteration || currentIteration;
+      currentIteration = normalizeIteration(data.iteration, currentIteration);
       if (pStatus === 'done' || pStatus === 'stuck' || pStatus === 'error' || pStatus === 'stopped') {
         currentProjectStatus = pStatus;
       } else {
@@ -2245,11 +2361,14 @@ function connect() {
       }
       if (activeChannel === data.channel_id) {
         currentProjectStatus = data.project_status || currentProjectStatus;
-        currentIteration = data.iteration || currentIteration;
+        currentIteration = normalizeIteration(data.iteration, currentIteration);
         updateProjectBadge(currentProjectStatus, currentIteration, data.data);
       }
 
     } else if (data.type === 'task_list') {
+      if (currentProjectId) {
+        setCachedTaskList(currentProjectId, data.data);
+      }
       updateTaskList(data.data);
 
     } else if (data.type === 'log_update') {

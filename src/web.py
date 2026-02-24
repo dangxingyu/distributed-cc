@@ -261,7 +261,10 @@ class WebChat:
 
             self._client_active_channel[client_id] = channel_id
             project_id = self._router.get_channel_project(channel_id)
-            status = self._router.get_project_status(project_id) if project_id else "unconnected"
+            if project_id:
+                status = await self._router.refresh_project_status(project_id)
+            else:
+                status = "unconnected"
             await self._ws_send_to_client(
                 client_id,
                 {
