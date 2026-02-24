@@ -1244,6 +1244,7 @@ let currentProjectStatus = 'unknown';
 let currentIteration = 0;
 let lastWsMessageAt = 0;
 let wsWatchdogTimer = null;
+let pendingSwitchAck = null;
 const pendingUserMessages = new Map();
 const requestScopes = {
   history: { token: 0, controller: null },
@@ -1649,21 +1650,36 @@ function deleteChannel(channelId, name) {
     });
 }
 
+function clearPendingSwitchAck(channelId) {
+  if (!pendingSwitchAck) return;
+  if (typeof channelId === 'number' && pendingSwitchAck.channelId !== channelId) return;
+  if (pendingSwitchAck.timerId) {
+    clearTimeout(pendingSwitchAck.timerId);
+  }
+  pendingSwitchAck = null;
+}
+
 function switchChannel(channelId, timeoutMs = SWITCH_ACK_TIMEOUT_MS) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const sentAt = Date.now();
-  ws.send(JSON.stringify({ type: 'switch_channel', channel_id: channelId }));
+  const numericChannelId = Number(channelId);
+  if (!Number.isFinite(numericChannelId)) return;
 
-  setTimeout(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // If no WS traffic arrived after this switch request, force reconnect.
-    if (lastWsMessageAt < sentAt) {
+  clearPendingSwitchAck();
+  ws.send(JSON.stringify({ type: 'switch_channel', channel_id: numericChannelId }));
+
+  const timerId = setTimeout(() => {
+    if (!pendingSwitchAck || pendingSwitchAck.channelId !== numericChannelId) return;
+    pendingSwitchAck = null;
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.close();
     }
   }, timeoutMs);
+
+  pendingSwitchAck = { channelId: numericChannelId, timerId: timerId };
 }
 
 function onChannelSwitched(data) {
+  clearPendingSwitchAck(Number(data.channel_id));
   clearPendingUserMessages();
   activeChannel = data.channel_id;
   currentProjectId = data.project_id || null;
@@ -2277,15 +2293,21 @@ window.addEventListener('online', resyncWhenForegrounded);
 // ── WebSocket ───────────────────────────────────────────────────────
 
 function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  const socket = new WebSocket(proto + '//' + location.host + '/ws');
+  ws = socket;
 
-  ws.onopen = function() {
+  socket.onopen = function() {
+    if (ws !== socket) return;
     statusDot.className = 'connected';
     statusText.textContent = 'connected';
     lastWsMessageAt = Date.now();
@@ -2299,10 +2321,13 @@ function connect() {
     });
   };
 
-  ws.onclose = function() {
+  socket.onclose = function() {
+    if (ws !== socket) return;
+    ws = null;
     statusDot.className = 'disconnected';
     statusText.textContent = 'disconnected';
     stopWsWatchdog();
+    clearPendingSwitchAck();
     resetTypingIndicator();
     const pendingIds = Array.from(pendingUserMessages.keys());
     for (const id of pendingIds) {
@@ -2311,11 +2336,13 @@ function connect() {
     reconnectTimer = setTimeout(connect, 2000);
   };
 
-  ws.onerror = function() {
-    ws.close();
+  socket.onerror = function() {
+    if (ws !== socket) return;
+    socket.close();
   };
 
-  ws.onmessage = function(event) {
+  socket.onmessage = function(event) {
+    if (ws !== socket) return;
     lastWsMessageAt = Date.now();
     let data = null;
     try {
