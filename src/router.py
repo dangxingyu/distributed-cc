@@ -781,14 +781,18 @@ class Router:
                 "1) Read current config.json.\n"
                 "2) If `config.md` exists, read it as user notes on setup/environment preferences.\n"
                 "3) Decide target host and broker_port from existing machine setup when possible.\n"
-                "4) Add/update one project entry in config.json (show diff before write).\n"
-                "5) Validate daemon reachability (curl /health on the selected broker_port).\n"
-                "6) Return a concise result with:\n"
+                "4) Ensure work_dir exists on the target machine (create it if missing).\n"
+                "5) Verify work_dir is writable (touch + remove a temp file in work_dir).\n"
+                "6) Add/update one project entry in config.json (show diff before write).\n"
+                "7) Validate daemon reachability (curl /health on the selected broker_port).\n"
+                "8) Only if all checks pass, return a concise result with:\n"
                 "   - project_id\n"
                 "   - work_dir\n"
                 "   - host\n"
                 "   - broker_port\n"
                 "   - exact `/connect <project_id>` command\n"
+                "   - verification evidence for: work_dir exists, work_dir writable, daemon healthy\n\n"
+                "If any check fails, do not claim success. Return: `NOT READY` + failing check + exact command/output.\n"
             )
         elif stripped.startswith("/setup"):
             setup_req = self._parse_setup_command(stripped)

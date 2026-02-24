@@ -487,6 +487,48 @@ async def test_setup_project_command_routes_to_router():
         )
 
 
+async def test_setup_project_prompt_enforces_workdir_and_health_gates(tmp_path):
+    """Injected /setup-project template requires work_dir + writability + health checks."""
+    (tmp_path / "config.json").write_text('{"servers": []}')
+    router = Router(cwd=str(tmp_path))
+
+    captured_prompt = {"text": ""}
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            captured_prompt["text"] = prompt
+            return "ok"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return True
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(
+            1,
+            "/setup-project /blue/yanjun.li/xd7812.princeton/anti-finetuning",
+            send_reply,
+            send_log,
+            None,
+        )
+        task = router._router_tasks[1]
+        await task
+
+    prompt = captured_prompt["text"]
+    assert "Ensure work_dir exists on the target machine" in prompt
+    assert "Verify work_dir is writable" in prompt
+    assert "Validate daemon reachability" in prompt
+    assert "If any check fails, do not claim success" in prompt
+
+
 def test_parse_setup_command_health_default():
     router = Router()
     parsed = router._parse_setup_command("/setup")

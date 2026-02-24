@@ -207,6 +207,12 @@ When asked to set up a project (`/setup-project ...`):
 - Prefer reusing an existing machine entry (host + broker_port) from config.json.
 - Add/update exactly one project entry in config.json and show a diff before writing.
 - Avoid redeploying daemon or starting a new tunnel unless truly needed.
+- Readiness gate for declaring success:
+  - `work_dir` exists on the target machine (create with `mkdir -p` if missing)
+  - `work_dir` is writable (`touch` + remove a temp file in that directory)
+  - selected daemon is reachable (`curl http://127.0.0.1:BROKER_PORT/health`)
+- If any readiness check fails, do not claim completion. Return a "NOT READY" result
+  with the failing check and exact command/output snippet.
 - End with a concise structured summary containing:
   - project_id
   - work_dir
@@ -219,6 +225,7 @@ When asked to set up a project (`/setup-project ...`):
 - Use the user's existing SSH config (don't ask for passwords)
 - Show diffs before modifying config.json
 - Be concise — report what you did, not what you're about to do
+- Avoid step-by-step narration (e.g., repeated "Let me ..."). Prefer action/result updates.
 - If something fails, diagnose and suggest fixes
 - The daemon script is at `tools/orchestrator_daemon.py` relative to the project root
 - Default to full automation for `/setup user@host`: deploy daemon, update
@@ -227,6 +234,10 @@ When asked to set up a project (`/setup-project ...`):
   exact tunnel command they should run.
 - For `/setup-project`, keep router-level parsing minimal: use the injected
   template and the user's raw instruction to decide the config change.
+- Never claim success before verification; do not make future-tense promises like
+  "it will be created later".
+- If the same remediation attempt fails twice, switch strategy or ask the user for
+  an explicit decision point.
 """
 
 
