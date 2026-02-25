@@ -408,6 +408,53 @@ async def test_connect_command_unknown_project_via_route():
     assert "proj-a" in send_reply.call_args[0][0]
 
 
+async def test_connect_command_reloads_config_before_lookup(tmp_path):
+    """/connect should pick up projects newly written to config.json."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "name": "proj-new",
+                        "host": "user@host",
+                        "work_dir": "/tmp/proj-new",
+                        "broker_port": 8201,
+                    }
+                ]
+            }
+        )
+    )
+    router = Router(cwd=str(tmp_path))
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "/connect proj-new", send_reply)
+
+    assert router.get_channel_project(1) == "proj-new"
+    send_reply.assert_called_once()
+    assert "connected" in send_reply.call_args[0][0].lower()
+
+
+async def test_connect_unknown_project_while_router_task_running(tmp_path):
+    """/connect unknown while setup is running should explain likely sync timing."""
+    (tmp_path / "config.json").write_text(json.dumps({"servers": []}))
+    router = Router(cwd=str(tmp_path))
+    send_reply = AsyncMock()
+
+    pending = asyncio.create_task(asyncio.sleep(10))
+    router._router_tasks[1] = pending
+    try:
+        await router.route_message(1, "/connect not-yet", send_reply)
+    finally:
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0].lower()
+    assert "still running" in reply
+    assert "retry" in reply
+
+
 async def test_at_orchestrator_connect_command():
     """@orchestrator /connect proj-a normalizes to /connect."""
     router = _make_router([RemoteOrchestrator(project_id="proj-a", name="server-a")])

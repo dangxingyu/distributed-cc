@@ -268,6 +268,11 @@ class Router:
             return await resp.json()
 
     async def _register_project(self, orch: RemoteOrchestrator):
+        if not self._http:
+            # Can happen in tests or before Router.init(); retry lazily later.
+            orch.status = "unknown"
+            return
+
         url = f"{self._daemon_url(orch)}/register"
         try:
             async with self._http.post(
@@ -1094,7 +1099,8 @@ class Router:
         new_ids = set(self._orchestrators.keys())
 
         for pid in new_ids - old_ids:
-            asyncio.create_task(self._register_project(self._orchestrators[pid]))
+            if self._http:
+                asyncio.create_task(self._register_project(self._orchestrators[pid]))
 
         for pid in old_ids - new_ids:
             task = self._sse_tasks.pop(pid, None)
@@ -1124,8 +1130,23 @@ class Router:
 
     async def _connect_channel(self, chat_id: int, project_id: str, send_reply: callable):
         if project_id not in self._orchestrators:
+            should_reload = not self._orchestrators
+            router_task = self._router_tasks.get(chat_id)
+            if router_task and not router_task.done():
+                should_reload = True
+            if should_reload:
+                self.reload_config()
+        if project_id not in self._orchestrators:
             available = ", ".join(self._orchestrators.keys()) or "(none)"
-            await send_reply(f"Unknown project: `{project_id}`. Available: {available}")
+            router_task = self._router_tasks.get(chat_id)
+            if router_task and not router_task.done():
+                await send_reply(
+                    f"Project `{project_id}` is not visible yet (router setup still running). "
+                    f"Wait for setup READY, then retry `/connect {project_id}`. "
+                    f"Available now: {available}"
+                )
+            else:
+                await send_reply(f"Unknown project: `{project_id}`. Available: {available}")
             return
 
         await self.connect_channel(chat_id, project_id)

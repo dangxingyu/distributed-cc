@@ -1791,7 +1791,7 @@ const DEFAULT_INPUT_PLACEHOLDER = 'Type a message... (Enter to send, Shift+Enter
 let taskListCache = loadTaskListCache();
 let setupStageCache = loadSetupStageCache();
 const setupProjectPromptedChannels = new Set();
-const autoConnectAttempts = new Set();
+const suggestedConnectDrafts = new Set();
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -2552,7 +2552,7 @@ function maybePrefillSetupProjectFromRouterReply(text) {
   inputEl.focus();
 }
 
-function maybeAutoConnectFromRouterReply(text) {
+function maybePrefillConnectFromRouterReply(text) {
   if (activeChannel === null || currentProjectId) return;
   const raw = typeof text === 'string' ? text : String(text ?? '');
   const match = raw.match(/\/connect\s+([^\s`]+)/);
@@ -2563,11 +2563,20 @@ function maybeAutoConnectFromRouterReply(text) {
   if (projectId === 'project-id' || projectId === 'project_id') return;
 
   const key = String(activeChannel) + ':' + projectId;
-  if (autoConnectAttempts.has(key)) return;
-  autoConnectAttempts.add(key);
-  patchSetupStage(activeChannel, { project: 'done', connect: 'running' });
+  if (suggestedConnectDrafts.has(key)) return;
+  suggestedConnectDrafts.add(key);
+  patchSetupStage(activeChannel, { project: 'done', connect: 'todo' });
   renderSetupProgress();
-  sendChannelMessage('/connect ' + projectId);
+  if (!inputEl.value.trim()) {
+    inputEl.value = '/connect ' + projectId;
+    inputEl.dispatchEvent(new Event('input'));
+  }
+  addMessage(
+    `Project setup is ready. Please send \`/connect ${projectId}\` manually.`,
+    'system',
+    Date.now() / 1000,
+  );
+  inputEl.focus();
 }
 
 function createChannelFromModal() {
@@ -3399,7 +3408,7 @@ function connect() {
       if (sender === 'router') {
         updateSetupStageFromRouterReply(data.text);
         maybePrefillSetupProjectFromRouterReply(data.text);
-        maybeAutoConnectFromRouterReply(data.text);
+        maybePrefillConnectFromRouterReply(data.text);
       }
       if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
 
