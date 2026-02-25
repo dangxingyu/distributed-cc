@@ -332,6 +332,11 @@ body::after {
   color: var(--red);
 }
 
+#project-badge.router-mode {
+  border-color: rgba(11, 124, 117, 0.3);
+  color: var(--accent);
+}
+
 #members-btn {
   background: rgba(255, 251, 242, 0.85);
   border: 1px solid #cdb894;
@@ -431,6 +436,79 @@ body::after {
 
 #status-dot.connected { background: var(--green); }
 #status-dot.disconnected { background: var(--red); }
+
+#setup-progress {
+  display: none;
+  padding: 10px 22px 8px;
+  border-bottom: 1px solid rgba(158, 127, 76, 0.18);
+  background: linear-gradient(180deg, rgba(255, 252, 244, 0.75), rgba(255, 249, 237, 0.55));
+  z-index: 10;
+}
+
+#setup-progress.visible {
+  display: block;
+}
+
+.setup-progress-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #536660;
+  text-transform: uppercase;
+  letter-spacing: 0.55px;
+  font-family: var(--font-display);
+}
+
+.setup-progress-steps {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.setup-step {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #d4c3a2;
+  border-radius: 10px;
+  padding: 7px 8px;
+  font-size: 11.5px;
+  color: #6d7268;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 252, 245, 0.82);
+}
+
+.setup-step-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid #c5b694;
+  background: #f2e8d5;
+  flex-shrink: 0;
+}
+
+.setup-step.running {
+  border-color: rgba(31, 111, 139, 0.38);
+  color: var(--blue);
+  background: rgba(31, 111, 139, 0.1);
+}
+
+.setup-step.running .setup-step-dot {
+  border-color: rgba(31, 111, 139, 0.6);
+  background: rgba(31, 111, 139, 0.52);
+}
+
+.setup-step.done {
+  border-color: rgba(28, 138, 94, 0.38);
+  color: var(--green);
+  background: rgba(28, 138, 94, 0.11);
+}
+
+.setup-step.done .setup-step-dot {
+  border-color: rgba(28, 138, 94, 0.62);
+  background: rgba(28, 138, 94, 0.62);
+}
 
 #messages {
   flex: 1;
@@ -542,6 +620,138 @@ body::after {
   white-space: pre-wrap;
   line-height: 1.5;
   color: #344b46;
+}
+
+/* ── New channel modal ─────────────────────────── */
+
+#new-channel-modal {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 16, 10, 0.48);
+  z-index: 140;
+  padding: 18px;
+}
+
+#new-channel-modal.open {
+  display: flex;
+}
+
+.new-channel-dialog {
+  width: min(560px, 100%);
+  background: linear-gradient(180deg, #fffdf7 0%, #f7efe1 100%);
+  border: 1px solid #cbb28a;
+  border-radius: 14px;
+  box-shadow: 0 24px 42px rgba(34, 22, 9, 0.28);
+  padding: 18px 18px 16px;
+}
+
+.new-channel-title {
+  margin: 0 0 4px;
+  color: #184b44;
+  font-family: var(--font-display);
+  font-size: 18px;
+}
+
+.new-channel-subtitle {
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.new-channel-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.new-channel-field-label {
+  font-size: 12px;
+  color: #3b524d;
+  font-weight: 600;
+}
+
+.new-channel-field input {
+  border: 1px solid #c7b08a;
+  border-radius: 10px;
+  background: #fffdf8;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 9px 11px;
+  line-height: 1.4;
+}
+
+.new-channel-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(11, 124, 117, 0.2);
+}
+
+.new-channel-hint {
+  margin: -2px 0 0;
+  font-size: 11px;
+  color: #6f7f76;
+  line-height: 1.4;
+}
+
+.new-channel-error {
+  display: none;
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: #9f2f3f;
+}
+
+.new-channel-error.visible {
+  display: block;
+}
+
+.new-channel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.new-channel-actions button {
+  border-radius: 10px;
+  border: 1px solid #c9b28c;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+#new-channel-cancel-btn {
+  background: #f8f2e5;
+  color: var(--text-secondary);
+}
+
+#new-channel-cancel-btn:hover {
+  background: #f1e8d7;
+}
+
+#new-channel-create-setup-btn {
+  background: linear-gradient(140deg, #0b7c75 0%, #176f88 100%);
+  color: #f7f4eb;
+  border-color: rgba(19, 88, 94, 0.5);
+}
+
+#new-channel-create-setup-btn:hover {
+  filter: brightness(1.05);
+}
+
+.new-channel-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  filter: none;
 }
 
 /* ── Message bubbles ────────────────────────────── */
@@ -1280,6 +1490,15 @@ body::after {
     padding: 14px;
   }
 
+  #setup-progress {
+    padding: 8px 14px 7px;
+  }
+
+  .setup-progress-steps {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
   .msg {
     max-width: 100%;
   }
@@ -1308,6 +1527,19 @@ body::after {
   #monitor.monitor-closed {
     width: 100%;
   }
+
+  .new-channel-dialog {
+    padding: 14px 14px 12px;
+  }
+
+  .new-channel-actions {
+    flex-direction: column-reverse;
+    align-items: stretch;
+  }
+
+  .new-channel-actions button {
+    width: 100%;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1323,7 +1555,7 @@ body::after {
 <div id="sidebar">
   <div id="sidebar-header">Channels</div>
   <div id="channel-list"></div>
-  <button id="new-channel-btn">+ New Channel</button>
+  <button id="new-channel-btn">+ New Setup Channel</button>
 </div>
 
 <div id="main">
@@ -1342,6 +1574,14 @@ body::after {
       </div>
     </div>
   </div>
+  <div id="setup-progress">
+    <div class="setup-progress-title">Setup Progress</div>
+    <div class="setup-progress-steps">
+      <div class="setup-step" id="setup-step-machine"><span class="setup-step-dot"></span>Machine setup</div>
+      <div class="setup-step" id="setup-step-project"><span class="setup-step-dot"></span>Project setup</div>
+      <div class="setup-step" id="setup-step-connect"><span class="setup-step-dot"></span>Connect</div>
+    </div>
+  </div>
 
   <div id="no-channel-msg">
     <div class="onboard-logo">dcc</div>
@@ -1349,11 +1589,11 @@ body::after {
     <div class="onboard-steps">
       <div class="onboard-step">
         <div class="onboard-num">1</div>
-        <div class="onboard-step-text" id="onboard-step-1">Create a channel with <strong>+ New Channel</strong> in the sidebar</div>
+        <div class="onboard-step-text" id="onboard-step-1">Create a channel with <strong>+ New Setup Channel</strong> in the sidebar</div>
       </div>
       <div class="onboard-step">
         <div class="onboard-num">2</div>
-        <div class="onboard-step-text" id="onboard-step-2">Run <code>/setup user@host</code> to set up machine access, then <code>/setup-project &lt;workdir&gt;</code>, or connect with <code>/connect project-id</code></div>
+        <div class="onboard-step-text" id="onboard-step-2">Create channel with server info to auto-run <code>/setup user@host</code>, then <code>/setup-project &lt;workdir or instruction&gt;</code>, or connect with <code>/connect project-id</code></div>
       </div>
       <div class="onboard-step">
         <div class="onboard-num">3</div>
@@ -1392,6 +1632,29 @@ body::after {
   <div id="monitor-log"></div>
 </div>
 
+<div id="new-channel-modal" aria-hidden="true">
+  <div class="new-channel-dialog" role="dialog" aria-modal="true" aria-labelledby="new-channel-title">
+    <h2 class="new-channel-title" id="new-channel-title">Create a channel</h2>
+    <p class="new-channel-subtitle">
+      Server is required. Router will run machine setup automatically.
+    </p>
+    <label class="new-channel-field">
+      <span class="new-channel-field-label">Channel name</span>
+      <input id="new-channel-name-input" type="text" autocomplete="off" placeholder="Channel name">
+    </label>
+    <label class="new-channel-field">
+      <span class="new-channel-field-label">Server (for <code>/setup</code>)</span>
+      <input id="new-channel-server-input" type="text" autocomplete="off" placeholder="user@login-node">
+      <p class="new-channel-hint">The UI will send <code>/setup user@host</code> in the new channel.</p>
+      <p class="new-channel-error" id="new-channel-error"></p>
+    </label>
+    <div class="new-channel-actions">
+      <button id="new-channel-cancel-btn" type="button">Cancel</button>
+      <button id="new-channel-create-setup-btn" type="button">Create + setup</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const messagesEl = document.getElementById('messages');
 const noChannelEl = document.getElementById('no-channel-msg');
@@ -1408,6 +1671,12 @@ const statusText = document.getElementById('status-text');
 const channelListEl = document.getElementById('channel-list');
 const channelTitle = document.getElementById('channel-title');
 const newChannelBtn = document.getElementById('new-channel-btn');
+const newChannelModal = document.getElementById('new-channel-modal');
+const newChannelNameInput = document.getElementById('new-channel-name-input');
+const newChannelServerInput = document.getElementById('new-channel-server-input');
+const newChannelErrorEl = document.getElementById('new-channel-error');
+const newChannelCancelBtn = document.getElementById('new-channel-cancel-btn');
+const newChannelCreateSetupBtn = document.getElementById('new-channel-create-setup-btn');
 const membersBtn = document.getElementById('members-btn');
 const membersPopover = document.getElementById('members-popover');
 const monitorEl = document.getElementById('monitor');
@@ -1415,6 +1684,10 @@ const monitorLog = document.getElementById('monitor-log');
 const monitorBtn = document.getElementById('monitor-btn');
 const typingIndicator = document.getElementById('typing-indicator');
 const projectBadge = document.getElementById('project-badge');
+const setupProgressEl = document.getElementById('setup-progress');
+const setupStepMachineEl = document.getElementById('setup-step-machine');
+const setupStepProjectEl = document.getElementById('setup-step-project');
+const setupStepConnectEl = document.getElementById('setup-step-connect');
 
 let ws = null;
 let reconnectTimer = null;
@@ -1426,6 +1699,8 @@ let currentProjectStatus = 'unknown';
 let currentIteration = 0;
 let setupNotes = '';
 let routerTypingActive = false;
+let pendingAutoSetup = null;
+let newChannelModalBusy = false;
 let lastWsMessageAt = 0;
 let wsWatchdogTimer = null;
 let pendingSwitchAck = null;
@@ -1439,7 +1714,14 @@ const STALE_WS_MS = 45000;
 const WATCHDOG_POLL_MS = 15000;
 const SWITCH_ACK_TIMEOUT_MS = 8000;
 const TASK_LIST_CACHE_KEY = 'dcc_task_list_cache_v1';
+const LAST_SETUP_SERVER_KEY = 'dcc_last_setup_server';
+const LAST_PROJECT_WORKDIR_KEY = 'dcc_last_project_workdir';
+const SETUP_STAGE_CACHE_KEY = 'dcc_setup_stage_cache_v1';
+const DEFAULT_INPUT_PLACEHOLDER = 'Type a message... (Enter to send, Shift+Enter for newline)';
 let taskListCache = loadTaskListCache();
+let setupStageCache = loadSetupStageCache();
+const setupProjectPromptedChannels = new Set();
+const autoConnectAttempts = new Set();
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -1509,18 +1791,103 @@ function getCachedTaskList(projectId) {
   return typeof value === 'string' ? value : '';
 }
 
+function loadSetupStageCache() {
+  try {
+    const raw = localStorage.getItem(SETUP_STAGE_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveSetupStageCache() {
+  try {
+    localStorage.setItem(SETUP_STAGE_CACHE_KEY, JSON.stringify(setupStageCache));
+  } catch (_) {
+    // Ignore storage failures.
+  }
+}
+
+function getSetupStage(channelId) {
+  const key = String(channelId);
+  let stage = setupStageCache[key];
+  if (!stage || typeof stage !== 'object') {
+    stage = { machine: 'todo', project: 'todo', connect: 'todo' };
+    setupStageCache[key] = stage;
+  }
+  return stage;
+}
+
+function patchSetupStage(channelId, patch) {
+  if (channelId === null || channelId === undefined) return;
+  const stage = getSetupStage(channelId);
+  setupStageCache[String(channelId)] = {
+    machine: patch.machine || stage.machine || 'todo',
+    project: patch.project || stage.project || 'todo',
+    connect: patch.connect || stage.connect || 'todo',
+  };
+  saveSetupStageCache();
+}
+
+function statusClassForStage(value) {
+  if (value === 'done') return 'done';
+  if (value === 'running') return 'running';
+  return '';
+}
+
+function renderSetupProgress() {
+  if (activeChannel === null) {
+    setupProgressEl.classList.remove('visible');
+    return;
+  }
+
+  const stage = getSetupStage(activeChannel);
+  if (currentProjectId) {
+    stage.machine = 'done';
+    stage.project = 'done';
+    stage.connect = 'done';
+    saveSetupStageCache();
+  }
+
+  const allDone = stage.machine === 'done' && stage.project === 'done' && stage.connect === 'done';
+  if (allDone) {
+    setupProgressEl.classList.remove('visible');
+    return;
+  }
+  setupProgressEl.classList.add('visible');
+
+  setupStepMachineEl.className = 'setup-step ' + statusClassForStage(stage.machine);
+  setupStepProjectEl.className = 'setup-step ' + statusClassForStage(stage.project);
+  setupStepConnectEl.className = 'setup-step ' + statusClassForStage(stage.connect);
+}
+
+function updateInputPlaceholder() {
+  if (_pendingQuestion) return;
+  if (activeChannel === null) {
+    inputEl.placeholder = DEFAULT_INPUT_PLACEHOLDER;
+    return;
+  }
+  if (!currentProjectId) {
+    inputEl.placeholder = 'Router mode: no project connected. Try /setup-project <workdir> or /connect <project-id>';
+    return;
+  }
+  inputEl.placeholder = DEFAULT_INPUT_PLACEHOLDER;
+}
+
 function updateOnboardingContent() {
   const hasActiveChannel = activeChannel !== null;
   if (hasActiveChannel) {
     const ch = channels.find(c => c.id === activeChannel);
     const title = ch ? ('# ' + ch.name) : 'New channel';
     onboardTitleEl.textContent = title + ' is ready';
-    onboardStep1El.innerHTML = 'This channel is empty. Start by sending a message or command.';
+    onboardStep1El.innerHTML = 'This channel is empty. If machine/project is not ready, let Router finish setup first.';
   } else {
     onboardTitleEl.textContent = 'Get started with distributed Claude Code';
-    onboardStep1El.innerHTML = 'Create a channel with <strong>+ New Channel</strong> in the sidebar';
+    onboardStep1El.innerHTML = 'Create a channel with <strong>+ New Setup Channel</strong> in the sidebar';
   }
-  onboardStep2El.innerHTML = 'Run <code>/setup user@host</code> for machine setup, then <code>/setup-project &lt;workdir or instruction&gt;</code>, or connect with <code>/connect project-id</code>';
+  onboardStep2El.innerHTML = 'Create channel with server info to auto-run <code>/setup user@host</code>, then run <code>/setup-project &lt;workdir or instruction&gt;</code>, or connect with <code>/connect project-id</code>';
   onboardStep3El.innerHTML = 'Send a task — the orchestrator will plan, decompose, and assign workers autonomously';
 
   if (setupNotes && setupNotes.trim()) {
@@ -1537,16 +1904,22 @@ function refreshConversationVisibility(hasMessages) {
     updateOnboardingContent();
     noChannelEl.style.display = 'flex';
     messagesEl.style.display = 'none';
+    renderSetupProgress();
+    updateInputPlaceholder();
     return;
   }
   if (hasMessages) {
     noChannelEl.style.display = 'none';
     messagesEl.style.display = 'flex';
+    renderSetupProgress();
+    updateInputPlaceholder();
     return;
   }
   updateOnboardingContent();
   noChannelEl.style.display = 'flex';
   messagesEl.style.display = 'none';
+  renderSetupProgress();
+  updateInputPlaceholder();
 }
 
 function loadSetupNotes() {
@@ -1564,9 +1937,20 @@ function loadSetupNotes() {
 // ── Status display ──────────────────────────────────────────────────
 
 function updateProjectBadge(status, iteration, data) {
-  if (!currentProjectId) {
+  if (activeChannel === null) {
     projectBadge.style.display = 'none';
-    if (!routerTypingActive) hideTypingIndicator();
+    hideTypingIndicator();
+    return;
+  }
+  if (!currentProjectId) {
+    projectBadge.style.display = '';
+    projectBadge.className = 'router-mode';
+    projectBadge.textContent = 'Router mode';
+    if (routerTypingActive) {
+      showTypingIndicator('router');
+    } else {
+      hideTypingIndicator();
+    }
     return;
   }
   projectBadge.style.display = '';
@@ -1869,6 +2253,9 @@ function deleteChannel(channelId, name) {
   fetchJson('/api/channels/' + channelId, { method: 'DELETE' })
     .then(() => {
       channels = channels.filter(c => c.id !== channelId);
+      delete setupStageCache[String(channelId)];
+      saveSetupStageCache();
+      setupProjectPromptedChannels.delete(channelId);
       if (activeChannel === channelId) {
         activeChannel = null;
         currentProjectId = null;
@@ -1946,6 +2333,14 @@ function onChannelSwitched(data) {
   updateProjectBadge(currentProjectStatus, currentIteration);
   refreshActiveChannelData(activeChannel);
   renderChannelList();
+  if (currentProjectId) {
+    patchSetupStage(activeChannel, { machine: 'done', project: 'done', connect: 'done' });
+  } else {
+    patchSetupStage(activeChannel, { connect: 'todo' });
+  }
+  renderSetupProgress();
+  updateInputPlaceholder();
+  maybeDispatchPendingAutoSetup();
 }
 
 function loadChannels() {
@@ -1961,41 +2356,227 @@ function loadChannels() {
     });
 }
 
-function createChannel() {
-  const name = prompt('Channel name:');
-  if (!name || !name.trim()) return;
+function suggestNextChannelName() {
+  let max = 0;
+  for (const ch of channels) {
+    const match = String(ch.name || '').match(/^Channel-(\d+)$/i);
+    if (!match) continue;
+    const n = Number(match[1]);
+    if (Number.isFinite(n)) {
+      max = Math.max(max, n);
+    }
+  }
+  return 'Channel-' + String(max + 1);
+}
 
-  // Ask which project to connect
-  fetchJson('/api/projects')
-    .then(projects => {
-      let projectId = '';
-      if (projects.length > 0) {
-        const choices = projects.map(p => p.project_id).join(', ');
-        projectId = prompt('Connect to project? (' + choices + ')\nLeave empty to connect later:') || '';
+function setNewChannelError(message) {
+  const text = typeof message === 'string' ? message.trim() : '';
+  if (!text) {
+    newChannelErrorEl.textContent = '';
+    newChannelErrorEl.classList.remove('visible');
+    return;
+  }
+  newChannelErrorEl.textContent = text;
+  newChannelErrorEl.classList.add('visible');
+}
+
+function validateServerSpec(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) {
+    return { ok: false, error: 'Server is required. Use format user@host.' };
+  }
+  if (/\s/.test(value)) {
+    return { ok: false, error: 'Server cannot contain spaces.' };
+  }
+  if (!/^[^@\s]+@[^@\s]+$/.test(value)) {
+    return { ok: false, error: 'Use server format user@host (example: alice@login01).' };
+  }
+  return { ok: true, value: value };
+}
+
+function setNewChannelModalBusy(busy) {
+  newChannelModalBusy = !!busy;
+  newChannelNameInput.disabled = newChannelModalBusy;
+  newChannelServerInput.disabled = newChannelModalBusy;
+  newChannelCancelBtn.disabled = newChannelModalBusy;
+  newChannelCreateSetupBtn.disabled = newChannelModalBusy;
+}
+
+function openNewChannelModal() {
+  if (newChannelModalBusy) return;
+  setNewChannelError('');
+  newChannelNameInput.value = suggestNextChannelName();
+  newChannelServerInput.value = localStorage.getItem(LAST_SETUP_SERVER_KEY) || '';
+  newChannelModal.classList.add('open');
+  newChannelModal.setAttribute('aria-hidden', 'false');
+  setTimeout(() => {
+    if (newChannelServerInput.value.trim()) {
+      newChannelNameInput.focus();
+    } else {
+      newChannelServerInput.focus();
+    }
+  }, 0);
+}
+
+function closeNewChannelModal() {
+  if (newChannelModalBusy) return;
+  setNewChannelError('');
+  newChannelModal.classList.remove('open');
+  newChannelModal.setAttribute('aria-hidden', 'true');
+}
+
+function maybeDispatchPendingAutoSetup() {
+  if (!pendingAutoSetup) return;
+  if (activeChannel !== pendingAutoSetup.channelId) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const pending = pendingAutoSetup;
+  pendingAutoSetup = null;
+  const sent = sendChannelMessage('/setup ' + pending.serverSpec);
+  if (!sent) {
+    pendingAutoSetup = pending;
+  }
+}
+
+function updateSetupStageFromRouterReply(text) {
+  if (activeChannel === null) return;
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+
+  const machineReady =
+    /next:\s*run\s*\/setup-project/i.test(raw)
+    || (/\bREADY\b/i.test(raw) && /(daemon status|tunnel status|broker_port|machine setup)/i.test(raw));
+  if (machineReady) {
+    patchSetupStage(activeChannel, { machine: 'done' });
+  }
+
+  const hasConnectHint = /\/connect\s+([^\s`]+)/.test(raw);
+  if (hasConnectHint) {
+    patchSetupStage(activeChannel, { project: 'done' });
+  }
+
+  renderSetupProgress();
+}
+
+function maybePromptSetupProjectFromRouterReply(text) {
+  if (activeChannel === null || currentProjectId) return;
+  if (setupProjectPromptedChannels.has(activeChannel)) return;
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+  if (!/next:\s*run\s*\/setup-project/i.test(raw)) return;
+
+  patchSetupStage(activeChannel, { machine: 'done', project: 'running' });
+  renderSetupProgress();
+  setupProjectPromptedChannels.add(activeChannel);
+  const suggested = localStorage.getItem(LAST_PROJECT_WORKDIR_KEY) || '';
+  const answer = window.prompt(
+    'Machine setup finished. Enter project workdir to continue with /setup-project now:',
+    suggested,
+  );
+  if (!answer || !answer.trim()) return;
+
+  const workdir = answer.trim();
+  localStorage.setItem(LAST_PROJECT_WORKDIR_KEY, workdir);
+  sendChannelMessage('/setup-project ' + workdir);
+}
+
+function maybeAutoConnectFromRouterReply(text) {
+  if (activeChannel === null || currentProjectId) return;
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+  const match = raw.match(/\/connect\s+([^\s`]+)/);
+  if (!match) return;
+  const projectId = match[1].trim();
+  if (!projectId) return;
+  if (projectId.includes('<') || projectId.includes('>')) return;
+  if (projectId === 'project-id' || projectId === 'project_id') return;
+
+  const key = String(activeChannel) + ':' + projectId;
+  if (autoConnectAttempts.has(key)) return;
+  autoConnectAttempts.add(key);
+  patchSetupStage(activeChannel, { project: 'done', connect: 'running' });
+  renderSetupProgress();
+  sendChannelMessage('/connect ' + projectId);
+}
+
+function createChannelFromModal() {
+  if (newChannelModalBusy) return;
+  const name = newChannelNameInput.value.trim();
+  const serverCheck = validateServerSpec(newChannelServerInput.value);
+
+  if (!name) {
+    setNewChannelError('Channel name is required.');
+    newChannelNameInput.focus();
+    return;
+  }
+  if (!serverCheck.ok) {
+    setNewChannelError(serverCheck.error);
+    newChannelServerInput.focus();
+    return;
+  }
+  setNewChannelError('');
+  const serverSpec = serverCheck.value;
+
+  setNewChannelModalBusy(true);
+  fetchJson('/api/channels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name }),
+  })
+    .then(ch => {
+      channels.push(ch);
+      renderChannelList();
+      localStorage.setItem(LAST_SETUP_SERVER_KEY, serverSpec);
+      patchSetupStage(ch.id, { machine: 'running', project: 'todo', connect: 'todo' });
+      pendingAutoSetup = {
+        channelId: ch.id,
+        serverSpec: serverSpec,
+      };
+
+      localStorage.setItem('dcc_active_channel', String(ch.id));
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        switchChannel(ch.id);
       }
-
-      fetchJson('/api/channels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim(), project_id: projectId.trim() }),
-      })
-        .then(ch => {
-          channels.push(ch);
-          renderChannelList();
-          switchChannel(ch.id);
-        })
-        .catch((err) => {
-          console.error('Failed to create channel:', err);
-          alert('Failed to create channel: ' + err.message);
-        });
+    })
+    .then(() => {
+      setNewChannelModalBusy(false);
+      closeNewChannelModal();
     })
     .catch((err) => {
-      console.error('Failed to load projects:', err);
-      alert('Failed to load projects: ' + err.message);
+      setNewChannelModalBusy(false);
+      console.error('Failed to create channel:', err);
+      alert('Failed to create channel: ' + err.message);
     });
 }
 
-newChannelBtn.addEventListener('click', createChannel);
+newChannelBtn.addEventListener('click', openNewChannelModal);
+newChannelCancelBtn.addEventListener('click', closeNewChannelModal);
+newChannelCreateSetupBtn.addEventListener('click', function() {
+  createChannelFromModal();
+});
+newChannelModal.addEventListener('click', function(e) {
+  if (e.target === newChannelModal) {
+    closeNewChannelModal();
+  }
+});
+newChannelNameInput.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    createChannelFromModal();
+  }
+});
+newChannelServerInput.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    createChannelFromModal();
+  }
+});
+newChannelNameInput.addEventListener('input', function() {
+  if (newChannelErrorEl.classList.contains('visible')) {
+    setNewChannelError('');
+  }
+});
+newChannelServerInput.addEventListener('input', function() {
+  if (newChannelErrorEl.classList.contains('visible')) {
+    setNewChannelError('');
+  }
+});
 
 // ── Members ─────────────────────────────────────────────────────────
 
@@ -2065,18 +2646,37 @@ document.addEventListener('click', function() {
 
 // ── Messages ────────────────────────────────────────────────────────
 
-function sendMessage() {
-  const text = inputEl.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN || activeChannel === null) return;
+function sendChannelMessage(text) {
+  const body = typeof text === 'string' ? text.trim() : '';
+  if (!body || !ws || ws.readyState !== WebSocket.OPEN || activeChannel === null) {
+    return false;
+  }
 
   const clientMsgId = makeClientMessageId();
-  const node = addMessage(text, 'user', Date.now() / 1000, { pending: true, clientMsgId: clientMsgId });
+  const node = addMessage(body, 'user', Date.now() / 1000, { pending: true, clientMsgId: clientMsgId });
   const timeout = setTimeout(() => {
     markPendingUserMessageFailed(clientMsgId, 'timeout');
   }, 15000);
   pendingUserMessages.set(clientMsgId, { el: node, timeout: timeout });
 
-  ws.send(JSON.stringify({ type: 'message', text: text, client_msg_id: clientMsgId }));
+  if (/^\/setup(?:\s|$)/i.test(body)) {
+    patchSetupStage(activeChannel, { machine: 'running', project: 'todo', connect: 'todo' });
+    renderSetupProgress();
+  } else if (/^\/setup-project(?:\s|$)/i.test(body)) {
+    patchSetupStage(activeChannel, { project: 'running', connect: 'todo' });
+    renderSetupProgress();
+  } else if (/^\/connect(?:\s|$)/i.test(body)) {
+    patchSetupStage(activeChannel, { connect: 'running' });
+    renderSetupProgress();
+  }
+
+  ws.send(JSON.stringify({ type: 'message', text: body, client_msg_id: clientMsgId }));
+  return true;
+}
+
+function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!sendChannelMessage(text)) return;
   inputEl.value = '';
   inputEl.style.height = 'auto';
   clearAwaitingInput();
@@ -2302,7 +2902,7 @@ function setAwaitingInput(question) {
 function clearAwaitingInput() {
   _pendingQuestion = null;
   inputArea.classList.remove('awaiting-input');
-  inputEl.placeholder = 'Type a message... (Enter to send, Shift+Enter for newline)';
+  updateInputPlaceholder();
 }
 
 // ── Command palette ─────────────────────────────────────────────────
@@ -2433,7 +3033,7 @@ inputEl.addEventListener('input', function() {
 
   // restore placeholder if input is empty
   if (!this.value && !_pendingQuestion) {
-    this.placeholder = 'Type a message... (Enter to send, Shift+Enter for newline)';
+    updateInputPlaceholder();
   }
 });
 
@@ -2482,6 +3082,11 @@ if (localStorage.getItem('dcc_monitor_open') === 'true') {
 
 // Ctrl+M keyboard shortcut
 document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape' && newChannelModal.classList.contains('open')) {
+    e.preventDefault();
+    closeNewChannelModal();
+    return;
+  }
   if (e.ctrlKey && e.key === 'm') {
     e.preventDefault();
     toggleMonitor();
@@ -2630,8 +3235,14 @@ function connect() {
         renderChannelList();
       }
       if (activeChannel === data.channel_id) {
+        currentProjectId = data.project_id || currentProjectId;
         currentProjectStatus = data.project_status || currentProjectStatus;
         currentIteration = normalizeIteration(data.iteration, currentIteration);
+        if (currentProjectId) {
+          patchSetupStage(activeChannel, { machine: 'done', project: 'done', connect: 'done' });
+        }
+        renderSetupProgress();
+        updateInputPlaceholder();
         updateProjectBadge(currentProjectStatus, currentIteration, data.data);
       }
 
@@ -2662,6 +3273,11 @@ function connect() {
       addMessage(data.text, sender, data.ts);
       if (sender === 'orchestrator' || sender === 'worker' || sender === 'router') {
         showTypingIndicator(sender);
+      }
+      if (sender === 'router') {
+        updateSetupStageFromRouterReply(data.text);
+        maybePromptSetupProjectFromRouterReply(data.text);
+        maybeAutoConnectFromRouterReply(data.text);
       }
       if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
 
