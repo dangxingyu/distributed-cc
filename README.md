@@ -14,7 +14,7 @@
 
 Distributed Claude Code is optimized for this workflow:
 
-1. Humans should not manually track 10+ concurrent sessions.
+1. Humans should not manually track many concurrent sessions.
 2. The orchestrator should keep progress moving autonomously, while the user gives high-level advice and course corrections.
 
 Core components:
