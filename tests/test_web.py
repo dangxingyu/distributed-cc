@@ -437,7 +437,7 @@ async def test_ws_switch_channel_shows_project_info(aiohttp_client):
 
 
 async def test_ws_switch_channel_uses_fresh_status_on_reconnect(aiohttp_client):
-    """switch_channel refreshes project status from daemon before replying."""
+    """switch_channel acks fast, then pushes refreshed status asynchronously."""
     client, _, router, store = await _make_web(aiohttp_client)
     ch_id = await store.create_channel("proj-ch")
     await router.connect_channel(ch_id, "test-proj")
@@ -447,10 +447,15 @@ async def test_ws_switch_channel_uses_fresh_status_on_reconnect(aiohttp_client):
     ws = await client.ws_connect("/ws")
     await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
 
-    msg = await ws.receive_json()
-    assert msg["type"] == "channel_switched"
-    assert msg["project_id"] == "test-proj"
-    assert msg["project_status"] == "running"
+    first = await ws.receive_json()
+    assert first["type"] == "channel_switched"
+    assert first["project_id"] == "test-proj"
+    assert first["project_status"] == "idle"
+
+    second = await ws.receive_json()
+    assert second["type"] == "channel_status"
+    assert second["channel_id"] == ch_id
+    assert second["project_status"] == "running"
     router.refresh_project_status.assert_awaited_once_with("test-proj")
 
     await ws.close()

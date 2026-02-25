@@ -46,6 +46,7 @@ class WebChat:
         # Multi-client websocket state
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._client_active_channel: dict[str, int | None] = {}
+        self._background_tasks: set[asyncio.Task] = set()
         self._debug_flow = _env_flag("DCC_DEBUG_FLOW")
 
         # Wire callbacks
@@ -78,6 +79,12 @@ class WebChat:
                 await ws.close()
         self._clients.clear()
         self._client_active_channel.clear()
+
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
 
         if self._runner:
             await self._runner.cleanup()
@@ -261,10 +268,7 @@ class WebChat:
 
             self._client_active_channel[client_id] = channel_id
             project_id = self._router.get_channel_project(channel_id)
-            if project_id:
-                status = await self._router.refresh_project_status(project_id)
-            else:
-                status = "unconnected"
+            status = self._router.get_project_status(project_id) if project_id else "unconnected"
             await self._ws_send_to_client(
                 client_id,
                 {
@@ -274,6 +278,16 @@ class WebChat:
                     "project_status": status,
                 },
             )
+
+            if project_id:
+                self._start_background_task(
+                    self._refresh_switched_channel_status(
+                        client_id=client_id,
+                        channel_id=channel_id,
+                        project_id=project_id,
+                        initial_status=status,
+                    )
+                )
             return
 
         if msg_type == "message":
@@ -334,10 +348,45 @@ class WebChat:
                         {"type": "reply", "text": f"Routing failure: {e}", "sender": "system", "ts": ts},
                     )
 
-            asyncio.create_task(_route_message())
+            self._start_background_task(_route_message())
             return
 
         await self._ws_send_to_client(client_id, {"type": "error", "text": f"Unknown message type: {msg_type}"})
+
+    async def _refresh_switched_channel_status(
+        self,
+        client_id: str,
+        channel_id: int,
+        project_id: str,
+        initial_status: str,
+    ):
+        """Refresh project status after fast switch ACK and push update if changed."""
+        try:
+            status = await self._router.refresh_project_status(project_id)
+        except Exception:
+            return
+
+        if status == initial_status:
+            return
+        if self._client_active_channel.get(client_id) != channel_id:
+            return
+
+        await self._ws_send_to_client(
+            client_id,
+            {
+                "type": "channel_status",
+                "channel_id": channel_id,
+                "project_id": project_id,
+                "project_status": status,
+                "iteration": 0,
+                "data": "",
+            },
+        )
+
+    def _start_background_task(self, coro):
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     # -- Progress callback --------------------------------------------
 

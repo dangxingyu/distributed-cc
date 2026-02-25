@@ -24,6 +24,7 @@ import os
 import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -89,6 +90,7 @@ CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
 DEFAULT_ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "claude-opus-4-6")
 DEFAULT_SESSION_MODEL = os.environ.get("ORCHESTRATOR_SESSION_MODEL", DEFAULT_ORCHESTRATOR_MODEL)
 DEBUG_FLOW = _env_flag("DCC_DEBUG_FLOW")
+EVENT_HISTORY_MAX = int(os.environ.get("EVENT_HISTORY_MAX", "2000"))
 MAX_ITERATIONS = 0
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 INTERRUPT_QUEUE_MAX = 100
@@ -248,6 +250,7 @@ running_tasks: dict[str, asyncio.Task] = {}
 interrupt_queues: dict[str, asyncio.Queue] = {}
 cancel_events: dict[str, asyncio.Event] = {}
 sse_subscribers: dict[str, list[asyncio.Queue]] = {}
+event_history: dict[str, deque] = {}
 
 orchestrator_sessions: dict[str, str] = {}  # project_id -> orchestrator session
 worker_sessions: dict[str, str] = {}  # project_id -> worker session
@@ -391,8 +394,29 @@ async def _get_callback_http_session() -> ClientSession:
         return callback_http_session
 
 
+def _event_payload(event: ProgressEvent) -> dict:
+    return {
+        "event_id": event.event_id,
+        "type": event.type,
+        "data": event.data,
+        "iteration": event.iteration,
+        "ts": event.timestamp,
+    }
+
+
+def _record_event(project_id: str, payload: dict):
+    history = event_history.get(project_id)
+    if history is None:
+        history = deque(maxlen=EVENT_HISTORY_MAX)
+        event_history[project_id] = history
+    history.append(payload)
+
+
 async def emit_progress(project_id: str, event: ProgressEvent):
     """Send progress event to SSE subscribers and HTTP callback."""
+    payload = _event_payload(event)
+    _record_event(project_id, payload)
+
     if DEBUG_FLOW:
         log.info(
             "[flow/daemon] emit project=%s event_id=%s type=%s iter=%s data_len=%s",
@@ -423,13 +447,7 @@ async def emit_progress(project_id: str, event: ProgressEvent):
             json={
                 "project_id": project_id,
                 "daemon_name": DAEMON_NAME,
-                "event": {
-                    "event_id": event.event_id,
-                    "type": event.type,
-                    "data": event.data,
-                    "iteration": event.iteration,
-                    "ts": event.timestamp,
-                },
+                "event": payload,
             },
         ) as resp:
             if resp.status >= 400:
@@ -1416,6 +1434,53 @@ async def handle_status(request: web.Request) -> web.Response:
     )
 
 
+async def handle_events(request: web.Request) -> web.Response:
+    """GET /events — replay buffered progress events for a project."""
+    project_id = request.query.get("project_id")
+    if not project_id:
+        return web.json_response({"error": "project_id required"}, status=400)
+
+    history = list(event_history.get(project_id, []))
+    if not history:
+        if project_id in projects:
+            return web.json_response({"project_id": project_id, "events": [], "truncated": False})
+        return web.json_response({"error": "Unknown project"}, status=404)
+
+    after_event_id = str(request.query.get("after_event_id", "")).strip()
+    limit_raw = request.query.get("limit")
+    try:
+        limit = int(limit_raw) if limit_raw is not None else EVENT_HISTORY_MAX
+    except (TypeError, ValueError):
+        return web.json_response({"error": "limit must be an integer"}, status=400)
+    limit = max(1, min(limit, EVENT_HISTORY_MAX))
+
+    start_idx = 0
+    truncated = False
+    if after_event_id:
+        found = False
+        for idx, event in enumerate(history):
+            if event.get("event_id") == after_event_id:
+                start_idx = idx + 1
+                found = True
+                break
+        if not found:
+            truncated = True
+            start_idx = max(0, len(history) - limit)
+
+    events = history[start_idx:]
+    if len(events) > limit:
+        truncated = True
+        events = events[-limit:]
+
+    return web.json_response(
+        {
+            "project_id": project_id,
+            "events": events,
+            "truncated": truncated,
+        }
+    )
+
+
 async def handle_stream(request: web.Request) -> web.StreamResponse:
     """GET /stream — SSE stream of progress events for a project."""
     project_id = request.query.get("project_id")
@@ -1537,6 +1602,7 @@ def main():
     app.router.add_post("/task", handle_task)
     app.router.add_post("/interrupt", handle_interrupt)
     app.router.add_get("/status", handle_status)
+    app.router.add_get("/events", handle_events)
     app.router.add_get("/stream", handle_stream)
     app.router.add_post("/stop", handle_stop)
     app.router.add_get("/health", handle_health)

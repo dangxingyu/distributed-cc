@@ -8,6 +8,7 @@ import asyncio
 import sys
 import os
 import json
+from collections import deque
 
 import pytest
 
@@ -306,3 +307,60 @@ async def test_handle_interrupt_returns_urgency():
         assert payload["queued"] is True
     finally:
         projects.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_handle_events_replays_after_cursor():
+    from orchestrator_daemon import handle_events, event_history, projects, Project
+
+    project_id = "events-replay-test"
+    projects[project_id] = Project(project_id=project_id, project_dir="/tmp", name="x")
+    event_history[project_id] = deque(
+        [
+            {"event_id": "e1", "type": "iteration", "data": "start", "iteration": 1, "ts": 1.0},
+            {"event_id": "e2", "type": "text", "data": "next", "iteration": 2, "ts": 2.0},
+        ],
+        maxlen=50,
+    )
+
+    class _Req:
+        query = {"project_id": project_id, "after_event_id": "e1"}
+
+    try:
+        resp = await handle_events(_Req())
+        assert resp.status == 200
+        payload = json.loads(resp.text)
+        assert payload["truncated"] is False
+        assert [e["event_id"] for e in payload["events"]] == ["e2"]
+    finally:
+        projects.pop(project_id, None)
+        event_history.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_handle_events_marks_truncated_when_cursor_missing():
+    from orchestrator_daemon import handle_events, event_history, projects, Project
+
+    project_id = "events-truncated-test"
+    projects[project_id] = Project(project_id=project_id, project_dir="/tmp", name="x")
+    event_history[project_id] = deque(
+        [
+            {"event_id": "e10", "type": "iteration", "data": "old", "iteration": 10, "ts": 10.0},
+            {"event_id": "e11", "type": "text", "data": "new", "iteration": 11, "ts": 11.0},
+        ],
+        maxlen=50,
+    )
+
+    class _Req:
+        query = {"project_id": project_id, "after_event_id": "missing-cursor", "limit": "1"}
+
+    try:
+        resp = await handle_events(_Req())
+        assert resp.status == 200
+        payload = json.loads(resp.text)
+        assert payload["truncated"] is True
+        assert len(payload["events"]) == 1
+        assert payload["events"][0]["event_id"] == "e11"
+    finally:
+        projects.pop(project_id, None)
+        event_history.pop(project_id, None)

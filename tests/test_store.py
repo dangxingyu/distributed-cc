@@ -1,5 +1,6 @@
 """Test JSON file store — messages, channels, notes, logs, and project mapping."""
 
+import asyncio
 import json
 import os
 import pytest
@@ -54,6 +55,17 @@ async def test_message_all_returned(store):
     assert msgs[-1]["content"] == "msg 29"
 
 
+async def test_concurrent_message_writes_do_not_drop_entries(store):
+    async def _write(i: int):
+        await store.add_message(1, "user", f"msg-{i}")
+
+    await asyncio.gather(*[_write(i) for i in range(80)])
+    msgs = await store.get_recent_messages(1)
+
+    assert len(msgs) == 80
+    assert {m["content"] for m in msgs} == {f"msg-{i}" for i in range(80)}
+
+
 async def test_get_recent_messages_empty(store):
     msgs = await store.get_recent_messages(999)
     assert msgs == []
@@ -102,6 +114,12 @@ async def test_get_all_channel_ids(store):
     id2 = await store.create_channel("two")
     ids = await store.get_all_channel_ids()
     assert set(ids) == {id1, id2}
+
+
+async def test_concurrent_channel_creation_has_unique_ids(store):
+    ids = await asyncio.gather(*[store.create_channel(f"ch-{i}") for i in range(30)])
+    assert len(ids) == 30
+    assert len(set(ids)) == 30
 
 
 async def test_set_get_channel_project_map(store):

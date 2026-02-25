@@ -69,6 +69,7 @@ class Router:
         self._recent_event_ids: dict[str, deque[str]] = {}
         self._recent_event_id_set: dict[str, set[str]] = {}
         self._recent_event_signatures: dict[str, dict[str, float]] = {}
+        self._last_event_id: dict[str, str] = {}
 
         # Deferred non-urgent tasks while running
         self._deferred_tasks: dict[str, list[dict]] = {}
@@ -171,6 +172,7 @@ class Router:
         try:
             async with self._http.post(
                 url,
+                timeout=aiohttp.ClientTimeout(total=5),
                 json={
                     "project_id": orch.project_id,
                     "project_dir": orch.project_dir,
@@ -247,6 +249,48 @@ class Router:
                     log.info("Synced status for %s: %s", orch.project_id, status)
         except Exception as e:
             log.debug("Status sync failed for %s: %s", orch.project_id, e)
+        await self._sync_missed_events(orch, http)
+
+    async def _sync_missed_events(self, orch: RemoteOrchestrator, http: aiohttp.ClientSession):
+        """Fetch events that may have been missed during temporary disconnects."""
+        last_event_id = self._last_event_id.get(orch.project_id, "")
+        if not last_event_id:
+            return
+
+        try:
+            async with http.get(
+                f"{self._daemon_url(orch)}/events",
+                params={"project_id": orch.project_id, "after_event_id": last_event_id},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                status = self._resp_status(resp)
+                if status != 200:
+                    return
+                payload = await self._resp_json(resp)
+        except Exception as e:
+            log.debug("Missed-event sync failed for %s: %s", orch.project_id, e)
+            return
+
+        events = payload.get("events", [])
+        if not isinstance(events, list):
+            return
+        if payload.get("truncated"):
+            log.warning(
+                "Replay window truncated for %s; some historical events may be unavailable",
+                orch.project_id,
+            )
+        if self._debug_flow and events:
+            log.info(
+                "[flow] replay project=%s after=%s count=%s",
+                orch.project_id,
+                last_event_id,
+                len(events),
+            )
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            await self.ingest_progress_event(orch.project_id, event, source="replay")
 
     async def ingest_progress_event(self, project_id: str, event: dict, source: str = "unknown") -> bool:
         """Single ingestion path for both SSE and callback progress events.
@@ -266,12 +310,15 @@ class Router:
             return False
 
         event_type = event.get("type", "")
+        event_id = str(event.get("event_id", "")).strip()
         data = str(event.get("data", ""))
         iteration_raw = event.get("iteration", 0)
         try:
             iteration = int(iteration_raw)
         except (TypeError, ValueError):
             iteration = 0
+        if event_id:
+            self._last_event_id[project_id] = event_id
 
         if self._debug_flow:
             log.info(
@@ -951,6 +998,7 @@ class Router:
                 data = await self._resp_json(resp)
                 status = str(data.get("status", "unknown")).strip() or "unknown"
                 orch.status = status
+                await self._sync_missed_events(orch, self._http)
                 return status
         except aiohttp.ClientError:
             orch.status = "disconnected"

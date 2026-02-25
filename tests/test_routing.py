@@ -779,6 +779,79 @@ async def test_ingest_iteration_sets_status_running():
     assert router._orchestrators["proj"].status == "running"
 
 
+async def test_sync_daemon_status_replays_missed_events():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="disconnected")])
+    orch = router._orchestrators["proj"]
+    router._last_event_id["proj"] = "e1"
+
+    status_resp = AsyncMock()
+    status_resp.status = 200
+    status_resp.json = AsyncMock(return_value={"status": "running"})
+    status_resp.__aenter__ = AsyncMock(return_value=status_resp)
+    status_resp.__aexit__ = AsyncMock(return_value=None)
+
+    events_resp = AsyncMock()
+    events_resp.status = 200
+    events_resp.json = AsyncMock(
+        return_value={
+            "events": [
+                {
+                    "event_id": "e2",
+                    "type": "text",
+                    "data": "[orchestrator] recovered progress",
+                    "iteration": 2,
+                    "ts": 100.0,
+                }
+            ],
+            "truncated": False,
+        }
+    )
+    events_resp.__aenter__ = AsyncMock(return_value=events_resp)
+    events_resp.__aexit__ = AsyncMock(return_value=None)
+
+    mock_http = MagicMock()
+    mock_http.get = MagicMock(side_effect=[status_resp, events_resp])
+
+    router.ingest_progress_event = AsyncMock(return_value=True)
+
+    await router._sync_daemon_status(orch, mock_http)
+
+    assert orch.status == "running"
+    assert mock_http.get.call_count == 2
+    router.ingest_progress_event.assert_awaited_once_with(
+        "proj",
+        {
+            "event_id": "e2",
+            "type": "text",
+            "data": "[orchestrator] recovered progress",
+            "iteration": 2,
+            "ts": 100.0,
+        },
+        source="replay",
+    )
+
+
+async def test_sync_daemon_status_skips_replay_without_cursor():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="disconnected")])
+    orch = router._orchestrators["proj"]
+
+    status_resp = AsyncMock()
+    status_resp.status = 200
+    status_resp.json = AsyncMock(return_value={"status": "idle"})
+    status_resp.__aenter__ = AsyncMock(return_value=status_resp)
+    status_resp.__aexit__ = AsyncMock(return_value=None)
+
+    mock_http = MagicMock()
+    mock_http.get = MagicMock(return_value=status_resp)
+
+    router.ingest_progress_event = AsyncMock(return_value=True)
+
+    await router._sync_daemon_status(orch, mock_http)
+
+    assert mock_http.get.call_count == 1
+    router.ingest_progress_event.assert_not_awaited()
+
+
 # ── deferred task triggers ────────────────────────────────────────────
 
 
