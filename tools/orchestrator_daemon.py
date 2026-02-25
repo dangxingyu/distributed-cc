@@ -500,19 +500,6 @@ def _enqueue_interrupt(
     return queue.qsize()
 
 
-def _pending_user_message_count(project_id: str) -> int:
-    """Count queued non-empty user messages without draining the queue."""
-    queue = interrupt_queues.get(project_id)
-    if not queue:
-        return 0
-    count = 0
-    for payload in list(getattr(queue, "_queue", [])):
-        meta = _interrupt_payload_meta(payload)
-        if meta["kind"] == "user_message" and meta["text"]:
-            count += 1
-    return count
-
-
 async def _wait_for_interrupt_text(project_id: str, timeout: float) -> str:
     """Wait for the next non-empty USER message text.
 
@@ -741,12 +728,6 @@ async def _maybe_enqueue_heartbeat_nudge(project_id: str, state: TaskState) -> b
         "Keep moving autonomously: investigate, delegate concrete execution to worker, and verify evidence.",
         "If blocked on a true decision, call ask_user with one precise question.",
     ]
-    pending_user = _pending_user_message_count(project_id)
-    if pending_user > 0:
-        lines.append(
-            f"Queue reminder: {pending_user} queued user message(s) pending. "
-            "Call pull_user_messages and integrate guidance."
-        )
     if state.iteration > 0 and idle_for >= 600:
         lines.append(
             "Task hygiene: read task_list.md, pull user messages, "
