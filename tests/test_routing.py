@@ -290,6 +290,42 @@ async def test_route_to_disconnected_daemon():
     assert "cannot reach" in send_reply.call_args[0][0].lower()
 
 
+async def test_check_health_requires_orchestrator_daemon_signature():
+    """Health check should require status=ok plus non-empty daemon field."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value={"status": "ok", "daemon": "della-gpu"})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.get = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    ok = await router.check_health("proj")
+    assert ok is True
+
+
+async def test_check_health_rejects_legacy_payload_without_daemon():
+    """Legacy/foreign payloads should not be treated as healthy daemon."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value={"status": "ok", "server": "legacy"})
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock()
+
+    mock_http = MagicMock()
+    mock_http.get = MagicMock(return_value=mock_resp)
+    router._http = mock_http
+
+    ok = await router.check_health("proj")
+    assert ok is False
+
+
 async def test_ingest_progress_event_dedupes_event_id():
     router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
 

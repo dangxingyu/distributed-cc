@@ -1007,7 +1007,14 @@ class Router:
                 "   - If CLAUDE.md already exists: NEVER overwrite whole file.\n"
                 "   - Preserve existing content and only append/update a managed section.\n"
                 "7) Update exactly one project entry in config.json (show diff first).\n"
-                "8) Verify daemon health on selected broker_port.\n\n"
+                "8) Verify daemon health on selected broker_port.\n"
+                "   - `curl http://127.0.0.1:BROKER_PORT/health` must return JSON with:\n"
+                "     `status == \"ok\"` and non-empty `daemon` field.\n"
+                "   - If response only has legacy keys (for example `server` without `daemon`),\n"
+                "     treat as NOT READY (wrong service on this port).\n"
+                "9) Verify remote process identity on the target host:\n"
+                "   - process/command line must include `orchestrator_daemon.py`.\n"
+                "   - if `remote_broker.py` or other legacy service owns port 8200, return NOT READY.\n\n"
                 "Response format:\n"
                 "- READY: project_id, work_dir, host, broker_port, `/connect <project_id>`, evidence.\n"
                 "- NOT READY: failing check + exact command/output + next action.\n"
@@ -1032,13 +1039,21 @@ class Router:
                         "Steps:\n"
                         "1) Probe remote environment via SSH and install prerequisites.\n"
                         "2) Deploy and start daemon persistently.\n"
+                        "   - Prefer user-level systemd service (Restart=always) when available.\n"
+                        "   - Fallback to tmux; last resort nohup.\n"
                         "3) Update config.json machine-level connectivity (host + unique broker_port).\n"
                         "4) Start or refresh LOCAL background SSH tunnel:\n"
                         f"   ssh -N -L BROKER_PORT:localhost:8200 -R 9120:localhost:9120 "
                         f"-o ServerAliveInterval=30 -o ServerAliveCountMax=3 "
                         f"-o ExitOnForwardFailure=yes -o BatchMode=yes {host}\n"
-                        "   Use tmux/nohup background mode only; no blocking foreground process.\n"
-                        "5) Verify local health: curl http://127.0.0.1:BROKER_PORT/health\n\n"
+                        "   - Prefer autossh or user-level systemd service for self-healing.\n"
+                        "   - Fallback to tmux/nohup; never leave blocking foreground process.\n"
+                        "5) Verify local health: curl http://127.0.0.1:BROKER_PORT/health\n"
+                        "   - Require JSON `status == \"ok\"` and non-empty `daemon` field.\n"
+                        "   - If payload only has `server` or misses `daemon`, treat as NOT READY.\n"
+                        "6) Verify remote process identity:\n"
+                        "   - command line includes `orchestrator_daemon.py`.\n"
+                        "   - ensure no stale `remote_broker.py` is owning port 8200.\n\n"
                         "Response format:\n"
                         "- READY: host, broker_port, daemon status, tunnel status.\n"
                         "- NOT READY: failing check + exact command/output + next action.\n"
@@ -1052,9 +1067,13 @@ class Router:
                         "If config.md exists, read it first.\n\n"
                         "Steps:\n"
                         "1) Probe environment and deploy daemon.\n"
+                        "   - Prefer user-level systemd service when available; else tmux/nohup.\n"
                         "2) Update config.json machine-level connectivity (host + unique broker_port).\n"
                         "3) Print exact tunnel command for user to run manually.\n"
-                        "4) After user confirms tunnel is up, verify health.\n\n"
+                        "4) After user confirms tunnel is up, verify health/signature.\n"
+                        "   - `curl .../health` must include `status == \"ok\"` and non-empty `daemon`.\n"
+                        "5) Verify remote process identity:\n"
+                        "   - command line includes `orchestrator_daemon.py` and not legacy broker.\n\n"
                         "Response format:\n"
                         "- READY: host, broker_port, tunnel command, daemon status.\n"
                         "- NOT READY: failing check + exact command/output + next action.\n"
@@ -1064,7 +1083,10 @@ class Router:
                 prompt = (
                     "Run health checks for configured daemon endpoints from config.json. "
                     "Read config.md first if present. "
-                    "Return a concise table: host, broker_port, health(up/down), error(if any)."
+                    "For each endpoint, verify `/health` JSON signature: "
+                    "`status == \"ok\"` and non-empty `daemon`. "
+                    "Flag legacy/invalid payloads (for example `server` without `daemon`) as DOWN. "
+                    "Return a concise table: host, broker_port, health(up/down), daemon_name, error(if any)."
                 )
         else:
             prompt = stripped
@@ -1238,6 +1260,15 @@ class Router:
         try:
             url = f"{self._daemon_url(orch)}/health"
             async with self._http.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                return resp.status == 200
+                if resp.status != 200:
+                    return False
+                payload = await self._resp_json(resp)
+                if not isinstance(payload, dict):
+                    return False
+                status = str(payload.get("status", "")).strip().lower()
+                daemon_name = str(payload.get("daemon", "")).strip()
+                # Signature guard: old/foreign services may return {"status":"ok"}
+                # but do not expose orchestrator_daemon identity.
+                return status == "ok" and bool(daemon_name)
         except Exception:
             return False

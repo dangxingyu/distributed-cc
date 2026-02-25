@@ -1,5 +1,6 @@
-.PHONY: run test test-e2e deploy tunnels install-dev
+.PHONY: run test test-e2e deploy tunnels doctor install-dev
 E2E_JOBS ?= 1
+DOCTOR_ARGS ?=
 
 # Run router + web UI (default)
 run:
@@ -26,6 +27,10 @@ deploy:
 # Start SSH tunnels to remote brokers
 tunnels:
 	bash tools/start_tunnels.sh
+
+# Diagnose local<->remote daemon communication and registration
+doctor:
+	uv run python tools/doctor.py $(DOCTOR_ARGS)
 
 # Install development dependencies
 install-dev:

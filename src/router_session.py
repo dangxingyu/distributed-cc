@@ -131,7 +131,9 @@ When asked to set up a server (e.g., `/setup user@server`):
    ssh user@host "cd ~/.distributed-cc && uv venv .venv && uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp"
    ```
 
-4. **Launch the daemon** (via tmux for persistence):
+4. **Launch the daemon** (persistent process management):
+   - Prefer user-level systemd service with `Restart=always` if available.
+   - Fallback to `tmux`; last resort `nohup`.
    ```bash
    ssh user@host "tmux new-session -d -s daemon '~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py --port 8200 --name SERVER_NAME --callback-url http://127.0.0.1:9120'"
    ```
@@ -140,9 +142,10 @@ When asked to set up a server (e.g., `/setup user@server`):
    ```bash
    ssh -N -L LOCAL_PORT:localhost:8200 -R 9120:localhost:9120 -o ServerAliveInterval=30 user@host
    ```
-   - Prefer persistent background tunnel management:
-     - First choice: `tmux` session (e.g., `dcc-tunnel-HOST`)
-     - Fallback: `nohup ... &` with PID/log files under `~/.distributed-cc/`
+   - Prefer self-healing tunnel management:
+     - First choice: `autossh` or user-level systemd service
+     - Fallback: `tmux` session (e.g., `dcc-tunnel-HOST`)
+     - Last resort: `nohup ... &` with PID/log files under `~/.distributed-cc/`
    - Never leave a blocking foreground tunnel command running.
    - If an existing tunnel for the same host/port already exists, reuse or
      replace it cleanly.
@@ -155,6 +158,10 @@ When asked to set up a server (e.g., `/setup user@server`):
    ```bash
    curl http://127.0.0.1:LOCAL_PORT/health
    ```
+   - Require JSON signature: `status == "ok"` and non-empty `daemon` field.
+   - If response has legacy shape (for example `server` without `daemon`), treat as failure.
+   - Verify remote process identity (`orchestrator_daemon.py`) and ensure no stale
+     `remote_broker.py` owns port 8200.
 """
 
 SYSADMIN_PROJECT_SETUP = """\
@@ -174,7 +181,11 @@ When asked to set up a project (`/setup-project ...`):
   - `work_dir` exists on the target machine (create with `mkdir -p` if missing)
   - `work_dir` is writable (`touch` + remove a temp file in that directory)
   - `work_dir/CLAUDE.md` exists and contains concrete environment notes
-  - selected daemon is reachable (`curl http://127.0.0.1:BROKER_PORT/health`)
+  - selected daemon is reachable with valid signature:
+    `curl http://127.0.0.1:BROKER_PORT/health` must return JSON with
+    `status == "ok"` and non-empty `daemon`
+  - remote process identity is correct (`orchestrator_daemon.py`) and no stale
+    `remote_broker.py` is owning port 8200
 - If any readiness check fails, do not claim completion. Return a "NOT READY" result
   with the failing check and exact command/output snippet.
 - End with a concise structured summary containing:

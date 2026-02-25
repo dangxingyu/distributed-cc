@@ -234,6 +234,9 @@ curl http://127.0.0.1:8201/health
 
 - Check tunnel health: `curl http://127.0.0.1:<broker_port>/health`
 - Check daemon process remotely (`tmux ls`)
+- Run systematic diagnostics (health signature + register/status probes):
+  `make doctor`
+  or scoped check: `make doctor DOCTOR_ARGS="--project <project-id> --timeout 3"`
 
 ### No progress in UI
 
