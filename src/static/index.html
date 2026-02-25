@@ -2528,25 +2528,28 @@ function updateSetupStageFromRouterReply(text) {
   renderSetupProgress();
 }
 
-function maybePromptSetupProjectFromRouterReply(text) {
+function maybePrefillSetupProjectFromRouterReply(text) {
   if (activeChannel === null || currentProjectId) return;
   if (setupProjectPromptedChannels.has(activeChannel)) return;
   const raw = typeof text === 'string' ? text : String(text ?? '');
   if (!/next:\s*run\s*\/setup-project/i.test(raw)) return;
 
-  patchSetupStage(activeChannel, { machine: 'done', project: 'running' });
+  patchSetupStage(activeChannel, { machine: 'done', project: 'todo', connect: 'todo' });
   renderSetupProgress();
   setupProjectPromptedChannels.add(activeChannel);
   const suggested = localStorage.getItem(LAST_PROJECT_WORKDIR_KEY) || '';
-  const answer = window.prompt(
-    'Machine setup finished. Enter project workdir to continue with /setup-project now:',
-    suggested,
+  const draft = suggested ? ('/setup-project ' + suggested) : '/setup-project ';
+  const current = inputEl.value.trim();
+  if (!current) {
+    inputEl.value = draft;
+    inputEl.dispatchEvent(new Event('input'));
+  }
+  addMessage(
+    'Machine setup finished. Please send `/setup-project <workdir or instruction>` manually.',
+    'system',
+    Date.now() / 1000,
   );
-  if (!answer || !answer.trim()) return;
-
-  const workdir = answer.trim();
-  localStorage.setItem(LAST_PROJECT_WORKDIR_KEY, workdir);
-  sendChannelMessage('/setup-project ' + workdir);
+  inputEl.focus();
 }
 
 function maybeAutoConnectFromRouterReply(text) {
@@ -2735,6 +2738,10 @@ function sendChannelMessage(text) {
     patchSetupStage(activeChannel, { machine: 'running', project: 'todo', connect: 'todo' });
     renderSetupProgress();
   } else if (/^\/setup-project(?:\s|$)/i.test(body)) {
+    const workdirMatch = body.match(/^\/setup-project\s+(.+)$/i);
+    if (workdirMatch && workdirMatch[1]) {
+      localStorage.setItem(LAST_PROJECT_WORKDIR_KEY, workdirMatch[1].trim());
+    }
     patchSetupStage(activeChannel, { project: 'running', connect: 'todo' });
     renderSetupProgress();
   } else if (/^\/connect(?:\s|$)/i.test(body)) {
@@ -3391,7 +3398,7 @@ function connect() {
       }
       if (sender === 'router') {
         updateSetupStageFromRouterReply(data.text);
-        maybePromptSetupProjectFromRouterReply(data.text);
+        maybePrefillSetupProjectFromRouterReply(data.text);
         maybeAutoConnectFromRouterReply(data.text);
       }
       if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
