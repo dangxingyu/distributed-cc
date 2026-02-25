@@ -213,6 +213,26 @@ def test_enqueue_interrupt_stores_urgency():
     interrupt_queues.pop(project_id, None)
 
 
+def test_pending_user_message_count_ignores_system_messages():
+    from orchestrator_daemon import (
+        _ensure_interrupt_queue,
+        _enqueue_interrupt,
+        _pending_user_message_count,
+        interrupt_queues,
+    )
+
+    project_id = "pending-user-count-test"
+    interrupt_queues.pop(project_id, None)
+    _ensure_interrupt_queue(project_id)
+
+    _enqueue_interrupt(project_id, "human note", kind="user_message", urgency="normal")
+    _enqueue_interrupt(project_id, "heartbeat nudge", kind="system_nudge", urgency="normal")
+    _enqueue_interrupt(project_id, "urgent user", kind="user_message", urgency="urgent")
+
+    assert _pending_user_message_count(project_id) == 2
+    interrupt_queues.pop(project_id, None)
+
+
 @pytest.mark.asyncio
 async def test_wait_for_interrupt_text_skips_empty_payloads():
     """wait_for_interrupt_text should ignore empty payloads and return first text."""
@@ -297,6 +317,58 @@ async def test_maybe_enqueue_heartbeat_nudge_queues_system_message(tmp_path, mon
         assert payload["kind"] == "system_nudge"
         assert "Heartbeat:" in payload["text"]
         assert "GPU hint sentinel" in payload["text"]
+    finally:
+        projects.pop(project_id, None)
+        interrupt_queues.pop(project_id, None)
+        project_last_progress_ts.pop(project_id, None)
+        project_last_heartbeat_nudge_ts.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_maybe_enqueue_heartbeat_nudge_mentions_pending_user_messages(tmp_path, monkeypatch):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import (
+        _ensure_interrupt_queue,
+        _maybe_enqueue_heartbeat_nudge,
+        HEARTBEAT_IDLE_SECONDS,
+        Project,
+        TaskState,
+        _enqueue_interrupt,
+        interrupt_queues,
+        project_last_heartbeat_nudge_ts,
+        project_last_progress_ts,
+        projects,
+    )
+
+    project_id = "heartbeat-queue-reminder-test"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="hbq")
+    interrupt_queues.pop(project_id, None)
+    queue = _ensure_interrupt_queue(project_id)
+    _enqueue_interrupt(project_id, "please try lr=3e-4 later", kind="user_message", urgency="normal")
+
+    project_last_progress_ts[project_id] = time.time() - HEARTBEAT_IDLE_SECONDS - 5
+    project_last_heartbeat_nudge_ts.pop(project_id, None)
+    state = TaskState(task_id="t-hbq", project_id=project_id, task_text="do work")
+
+    async def fake_gpu_hint(_project_dir: str) -> str:
+        return ""
+
+    async def fake_emit_progress(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(daemon_mod, "_gpu_idle_hint", fake_gpu_hint)
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+
+    try:
+        queued = await _maybe_enqueue_heartbeat_nudge(project_id, state)
+        assert queued is True
+
+        first = queue.get_nowait()
+        second = queue.get_nowait()
+        assert first["kind"] == "user_message"
+        assert second["kind"] == "system_nudge"
+        assert "Queue reminder:" in second["text"]
+        assert "queued user message" in second["text"]
     finally:
         projects.pop(project_id, None)
         interrupt_queues.pop(project_id, None)

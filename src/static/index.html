@@ -282,6 +282,8 @@ body::after {
   background: linear-gradient(180deg, rgba(255, 252, 244, 0.86), rgba(255, 249, 237, 0.8));
   backdrop-filter: blur(10px);
   flex-shrink: 0;
+  position: relative;
+  z-index: 20;
 }
 
 #header h1 {
@@ -341,6 +343,7 @@ body::after {
   padding: 5px 14px;
   cursor: pointer;
   position: relative;
+  z-index: 30;
   transition: all 0.16s ease;
   box-shadow: 0 4px 12px rgba(74, 56, 24, 0.08);
 }
@@ -361,7 +364,7 @@ body::after {
   border-radius: 12px;
   min-width: 320px;
   padding: 6px 0;
-  z-index: 100;
+  z-index: 1200;
   box-shadow: 0 16px 28px rgba(60, 43, 18, 0.18);
 }
 
@@ -436,6 +439,8 @@ body::after {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  position: relative;
+  z-index: 1;
 }
 
 #no-channel-msg {
@@ -518,6 +523,25 @@ body::after {
   font-family: var(--font-mono);
   font-size: 12px;
   color: #0f6862;
+}
+
+#setup-notes-step {
+  display: none;
+}
+
+#setup-notes-body {
+  margin-top: 6px;
+  max-height: 160px;
+  overflow: auto;
+  background: rgba(251, 246, 236, 0.92);
+  border: 1px solid #d8c4a1;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  color: #344b46;
 }
 
 /* ── Message bubbles ────────────────────────────── */
@@ -737,65 +761,10 @@ body::after {
   color: var(--red);
 }
 
-/* ── Message collapsing ─────────────────────────── */
+/* ── Message body wrapper ───────────────────────── */
 
 .msg-body-wrapper {
   position: relative;
-}
-
-.msg-body-wrapper.collapsed .msg-body {
-  max-height: 180px;
-  overflow: hidden;
-}
-
-.msg-body-wrapper.collapsed::after {
-  content: '';
-  position: absolute;
-  bottom: 28px;
-  left: 0;
-  right: 0;
-  height: 48px;
-  background: linear-gradient(transparent, #f7f1e4);
-  pointer-events: none;
-  border-radius: 0 0 8px 8px;
-}
-
-.msg-orchestrator .msg-body-wrapper.collapsed::after {
-  background: linear-gradient(transparent, #e6f1eb);
-}
-
-.msg-worker .msg-body-wrapper.collapsed::after {
-  background: linear-gradient(transparent, #f4e9df);
-}
-
-.msg-user .msg-body-wrapper.collapsed::after {
-  background: linear-gradient(transparent, #e2f0ef);
-}
-
-.msg-expand-btn {
-  display: none;
-  background: rgba(255, 251, 244, 0.9);
-  border: 1px solid #cdb894;
-  border-radius: 999px;
-  color: var(--text-secondary);
-  font-family: var(--font-ui);
-  font-size: 12px;
-  font-weight: 500;
-  padding: 4px 12px;
-  cursor: pointer;
-  margin-top: 4px;
-  transition: all 0.16s ease;
-}
-
-.msg-body-wrapper.collapsed .msg-expand-btn,
-.msg-body-wrapper.expanded .msg-expand-btn {
-  display: inline-block;
-}
-
-.msg-expand-btn:hover {
-  background: #fff9ef;
-  color: var(--text-primary);
-  border-color: #b89d72;
 }
 
 /* ── Typing indicator ───────────────────────────── */
@@ -1376,19 +1345,26 @@ body::after {
 
   <div id="no-channel-msg">
     <div class="onboard-logo">dcc</div>
-    <div class="onboard-title">Get started with distributed Claude Code</div>
+    <div class="onboard-title" id="onboard-title">Get started with distributed Claude Code</div>
     <div class="onboard-steps">
       <div class="onboard-step">
         <div class="onboard-num">1</div>
-        <div class="onboard-step-text">Create a channel with <strong>+ New Channel</strong> in the sidebar</div>
+        <div class="onboard-step-text" id="onboard-step-1">Create a channel with <strong>+ New Channel</strong> in the sidebar</div>
       </div>
       <div class="onboard-step">
         <div class="onboard-num">2</div>
-        <div class="onboard-step-text">Run <code>/setup user@host</code> to deploy + auto-tunnel, or connect with <code>/connect project-id</code></div>
+        <div class="onboard-step-text" id="onboard-step-2">Run <code>/setup user@host</code> to set up machine access, then <code>/setup-project &lt;workdir&gt;</code>, or connect with <code>/connect project-id</code></div>
       </div>
       <div class="onboard-step">
         <div class="onboard-num">3</div>
-        <div class="onboard-step-text">Send a task — the orchestrator will plan, decompose, and assign workers autonomously</div>
+        <div class="onboard-step-text" id="onboard-step-3">Send a task — the orchestrator will plan, decompose, and assign workers autonomously</div>
+      </div>
+      <div class="onboard-step" id="setup-notes-step">
+        <div class="onboard-num">i</div>
+        <div class="onboard-step-text">
+          Setup notes from <code>config.md</code>:
+          <div id="setup-notes-body"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -1419,6 +1395,12 @@ body::after {
 <script>
 const messagesEl = document.getElementById('messages');
 const noChannelEl = document.getElementById('no-channel-msg');
+const onboardTitleEl = document.getElementById('onboard-title');
+const onboardStep1El = document.getElementById('onboard-step-1');
+const onboardStep2El = document.getElementById('onboard-step-2');
+const onboardStep3El = document.getElementById('onboard-step-3');
+const setupNotesStepEl = document.getElementById('setup-notes-step');
+const setupNotesBodyEl = document.getElementById('setup-notes-body');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send-btn');
 const statusDot = document.getElementById('status-dot');
@@ -1442,6 +1424,8 @@ let channelMembers = [];
 let currentProjectId = null;
 let currentProjectStatus = 'unknown';
 let currentIteration = 0;
+let setupNotes = '';
+let routerTypingActive = false;
 let lastWsMessageAt = 0;
 let wsWatchdogTimer = null;
 let pendingSwitchAck = null;
@@ -1525,11 +1509,64 @@ function getCachedTaskList(projectId) {
   return typeof value === 'string' ? value : '';
 }
 
+function updateOnboardingContent() {
+  const hasActiveChannel = activeChannel !== null;
+  if (hasActiveChannel) {
+    const ch = channels.find(c => c.id === activeChannel);
+    const title = ch ? ('# ' + ch.name) : 'New channel';
+    onboardTitleEl.textContent = title + ' is ready';
+    onboardStep1El.innerHTML = 'This channel is empty. Start by sending a message or command.';
+  } else {
+    onboardTitleEl.textContent = 'Get started with distributed Claude Code';
+    onboardStep1El.innerHTML = 'Create a channel with <strong>+ New Channel</strong> in the sidebar';
+  }
+  onboardStep2El.innerHTML = 'Run <code>/setup user@host</code> for machine setup, then <code>/setup-project &lt;workdir or instruction&gt;</code>, or connect with <code>/connect project-id</code>';
+  onboardStep3El.innerHTML = 'Send a task — the orchestrator will plan, decompose, and assign workers autonomously';
+
+  if (setupNotes && setupNotes.trim()) {
+    setupNotesBodyEl.textContent = setupNotes;
+    setupNotesStepEl.style.display = 'flex';
+  } else {
+    setupNotesBodyEl.textContent = '';
+    setupNotesStepEl.style.display = 'none';
+  }
+}
+
+function refreshConversationVisibility(hasMessages) {
+  if (activeChannel === null) {
+    updateOnboardingContent();
+    noChannelEl.style.display = 'flex';
+    messagesEl.style.display = 'none';
+    return;
+  }
+  if (hasMessages) {
+    noChannelEl.style.display = 'none';
+    messagesEl.style.display = 'flex';
+    return;
+  }
+  updateOnboardingContent();
+  noChannelEl.style.display = 'flex';
+  messagesEl.style.display = 'none';
+}
+
+function loadSetupNotes() {
+  return fetchJson('/api/setup-notes')
+    .then((payload) => {
+      setupNotes = typeof payload.notes === 'string' ? payload.notes : '';
+      updateOnboardingContent();
+    })
+    .catch(() => {
+      setupNotes = '';
+      updateOnboardingContent();
+    });
+}
+
 // ── Status display ──────────────────────────────────────────────────
 
 function updateProjectBadge(status, iteration, data) {
   if (!currentProjectId) {
     projectBadge.style.display = 'none';
+    if (!routerTypingActive) hideTypingIndicator();
     return;
   }
   projectBadge.style.display = '';
@@ -1540,22 +1577,46 @@ function updateProjectBadge(status, iteration, data) {
     showTypingIndicator('orchestrator');
   } else if (status === 'stuck') {
     projectBadge.textContent = 'Needs input';
-    hideTypingIndicator();
+    if (routerTypingActive) {
+      showTypingIndicator('router');
+    } else {
+      hideTypingIndicator();
+    }
   } else if (status === 'done') {
     projectBadge.textContent = 'Done';
-    hideTypingIndicator();
+    if (routerTypingActive) {
+      showTypingIndicator('router');
+    } else {
+      hideTypingIndicator();
+    }
   } else if (status === 'stopped') {
     projectBadge.textContent = 'Stopped';
-    hideTypingIndicator();
+    if (routerTypingActive) {
+      showTypingIndicator('router');
+    } else {
+      hideTypingIndicator();
+    }
   } else if (status === 'error') {
     projectBadge.textContent = 'Error';
-    hideTypingIndicator();
+    if (routerTypingActive) {
+      showTypingIndicator('router');
+    } else {
+      hideTypingIndicator();
+    }
   } else if (status === 'idle') {
     projectBadge.textContent = currentProjectId;
-    hideTypingIndicator();
+    if (routerTypingActive) {
+      showTypingIndicator('router');
+    } else {
+      hideTypingIndicator();
+    }
   } else {
     projectBadge.textContent = currentProjectId;
-    hideTypingIndicator();
+    if (routerTypingActive) {
+      showTypingIndicator('router');
+    } else {
+      hideTypingIndicator();
+    }
   }
 }
 
@@ -1767,37 +1828,13 @@ function addMessage(text, sender, tsSeconds, opts) {
   } else {
     bodyEl.innerHTML = renderMarkdown(body);
   }
-
-  const expandBtn = document.createElement('button');
-  expandBtn.className = 'msg-expand-btn';
-  expandBtn.textContent = 'Show more';
-
   bodyWrapper.appendChild(bodyEl);
-  bodyWrapper.appendChild(expandBtn);
 
   content.appendChild(header);
   content.appendChild(bodyWrapper);
   div.appendChild(content);
   messagesEl.appendChild(div);
-
-  // Check if message needs collapsing (after render)
-  requestAnimationFrame(() => {
-    if (bodyEl.scrollHeight > 220) {
-      bodyWrapper.classList.add('collapsed');
-      expandBtn.addEventListener('click', () => {
-        if (bodyWrapper.classList.contains('collapsed')) {
-          bodyWrapper.classList.remove('collapsed');
-          bodyWrapper.classList.add('expanded');
-          expandBtn.textContent = 'Show less';
-        } else {
-          bodyWrapper.classList.remove('expanded');
-          bodyWrapper.classList.add('collapsed');
-          expandBtn.textContent = 'Show more';
-        }
-      });
-    }
-  });
-
+  refreshConversationVisibility(true);
   scrollToBottom();
   return div;
 }
@@ -1834,9 +1871,12 @@ function deleteChannel(channelId, name) {
       channels = channels.filter(c => c.id !== channelId);
       if (activeChannel === channelId) {
         activeChannel = null;
+        currentProjectId = null;
+        currentProjectStatus = 'unknown';
+        currentIteration = 0;
+        routerTypingActive = false;
         channelTitle.textContent = 'distributed-cc';
-        messagesEl.style.display = 'none';
-        noChannelEl.style.display = 'flex';
+        refreshConversationVisibility(false);
         membersBtn.style.display = 'none';
         if (channels.length > 0) {
           switchChannel(channels[0].id);
@@ -1885,13 +1925,13 @@ function onChannelSwitched(data) {
   currentProjectId = data.project_id || null;
   currentProjectStatus = data.project_status || 'unknown';
   currentIteration = 0;
+  routerTypingActive = false;
   localStorage.setItem('dcc_active_channel', String(activeChannel));
   resetTypingIndicator();
 
   const ch = channels.find(c => c.id === activeChannel);
   channelTitle.textContent = ch ? '# ' + ch.name : 'distributed-cc';
-  noChannelEl.style.display = 'none';
-  messagesEl.style.display = 'flex';
+  refreshConversationVisibility(false);
   monitorLog.innerHTML = '';
 
   // Reset per-channel UI state
@@ -2051,6 +2091,7 @@ function loadHistory(channelId, req = beginScopedRequest('history')) {
         const sender = msg.sender || (msg.role === 'user' ? 'user' : classifyMessageLegacy(msg.content));
         addMessage(msg.content, sender, msg.ts);
       }
+      refreshConversationVisibility(messages.length > 0);
     })
     .catch((err) => {
       if (err && err.name === 'AbortError') return;
@@ -2512,6 +2553,7 @@ function connect() {
     statusText.textContent = 'connected';
     lastWsMessageAt = Date.now();
     startWsWatchdog();
+    loadSetupNotes();
 
     loadChannels().then(list => {
       if (list.length === 0) return;
@@ -2528,6 +2570,7 @@ function connect() {
     statusText.textContent = 'disconnected';
     stopWsWatchdog();
     clearPendingSwitchAck();
+    routerTypingActive = false;
     resetTypingIndicator();
     const pendingIds = Array.from(pendingUserMessages.keys());
     for (const id of pendingIds) {
@@ -2601,12 +2644,18 @@ function connect() {
     } else if (data.type === 'log_update') {
       addLogEntry('[LOG] ' + data.data, data.ts);
       const sender = inferWorkingSenderFromLog(data.data);
-      if (sender) showTypingIndicator(sender);
+      if (sender) {
+        if (sender === 'router') routerTypingActive = true;
+        showTypingIndicator(sender);
+      }
 
     } else if (data.type === 'log') {
       addLogEntry(data.text, data.ts);
       const sender = inferWorkingSenderFromLog(data.text);
-      if (sender) showTypingIndicator(sender);
+      if (sender) {
+        if (sender === 'router') routerTypingActive = true;
+        showTypingIndicator(sender);
+      }
 
     } else if (data.type === 'reply') {
       const sender = data.sender || classifyMessageLegacy(data.text);
@@ -2622,10 +2671,23 @@ function connect() {
       }
 
     } else if (data.type === 'typing') {
+      const sender = data.sender || 'orchestrator';
       if (data.active) {
-        showTypingIndicator(data.sender || 'orchestrator');
+        if (sender === 'router') {
+          routerTypingActive = true;
+        }
+        showTypingIndicator(sender);
       } else {
-        hideTypingIndicator();
+        if (sender === 'router') {
+          routerTypingActive = false;
+        }
+        if (routerTypingActive) {
+          showTypingIndicator('router');
+        } else if (currentProjectStatus === 'running' || currentProjectStatus === 'busy') {
+          showTypingIndicator('orchestrator');
+        } else {
+          hideTypingIndicator();
+        }
       }
 
     } else if (data.type === 'error') {
@@ -2636,6 +2698,9 @@ function connect() {
   };
 }
 
+updateOnboardingContent();
+refreshConversationVisibility(false);
+loadSetupNotes();
 connect();
 </script>
 </body>

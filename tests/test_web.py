@@ -32,6 +32,7 @@ async def _make_web(aiohttp_client):
     app.router.add_get("/api/channels/{id}/members", web_chat._handle_channels_members)
     app.router.add_get("/api/logs", web_chat._handle_logs)
     app.router.add_get("/api/projects", web_chat._handle_projects_list)
+    app.router.add_get("/api/setup-notes", web_chat._handle_setup_notes)
     app.router.add_get("/ws", web_chat._handle_ws)
 
     client = await aiohttp_client(app)
@@ -94,6 +95,7 @@ async def test_delete_channel_clears_mapping(aiohttp_client):
     resp = await client.delete(f"/api/channels/{ch['id']}")
     assert resp.status == 200
     assert router.get_channel_project(ch["id"]) is None
+    assert await store.get_channel_list() == []
 
     await store.close()
 
@@ -129,6 +131,35 @@ async def test_projects_list(aiohttp_client):
     assert len(data) == 1
     assert data[0]["project_id"] == "test-proj"
     assert data[0]["name"] == "test-server"
+    await store.close()
+
+
+async def test_setup_notes_empty_when_no_config_md(aiohttp_client):
+    client, _, _, store = await _make_web(aiohttp_client)
+    resp = await client.get("/api/setup-notes")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["notes"] == ""
+    await store.close()
+
+
+async def test_setup_notes_reads_config_md(aiohttp_client, tmp_path):
+    (tmp_path / "config.json").write_text('{"servers": []}')
+    (tmp_path / "config.md").write_text("cluster: tiger\nscheduler: slurm\n")
+
+    store = Store(tempfile.mkdtemp())
+    await store.init()
+    router = Router(cwd=str(tmp_path))
+    web_chat = WebChat(router=router, store=store)
+
+    app = web.Application()
+    app.router.add_get("/api/setup-notes", web_chat._handle_setup_notes)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/api/setup-notes")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "scheduler: slurm" in data["notes"]
     await store.close()
 
 

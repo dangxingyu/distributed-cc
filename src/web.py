@@ -65,6 +65,7 @@ class WebChat:
         self._app.router.add_get("/api/channels/{id}/members", self._handle_channels_members)
         self._app.router.add_get("/api/logs", self._handle_logs)
         self._app.router.add_get("/api/projects", self._handle_projects_list)
+        self._app.router.add_get("/api/setup-notes", self._handle_setup_notes)
         self._app.router.add_get("/ws", self._handle_ws)
 
         self._runner = web.AppRunner(self._app)
@@ -214,6 +215,17 @@ class WebChat:
                 }
             )
         return web.json_response(result)
+
+    async def _handle_setup_notes(self, request: web.Request) -> web.Response:
+        cwd = Path(getattr(self._router, "_cwd", os.getcwd()))
+        notes_path = cwd / "config.md"
+        notes = ""
+        if notes_path.exists():
+            try:
+                notes = notes_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                notes = ""
+        return web.json_response({"notes": notes})
 
     # -- WebSocket -----------------------------------------------------
 

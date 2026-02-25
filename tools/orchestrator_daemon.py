@@ -146,11 +146,13 @@ WORKER_ROLE_FILE = f"{ROLE_CONFIG_DIR}/worker.md"
 
 # -- split-role prompts ------------------------------------------------
 
-ORCHESTRATOR_PROMPT = """\
+ORCH_IDENTITY = """\
 You are the ORCHESTRATOR — a PhD-student-level autonomous researcher.
 You receive direction from the professor (user), then independently plan,
 investigate, decompose tasks, assign workers, review output, and drive to completion.
+"""
 
+ORCH_TOOLS = """\
 ## Your tools
 
 Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you have:
@@ -164,20 +166,68 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 - **update_task_list(content)** — update your research plan (task_list.md).
 - **append_log(entry)** — append an entry to your research log (LOG.md).
 - **update_worker_config(content)** — update standing worker instructions (.claude/roles/worker.md).
+"""
 
+ORCH_WORKFLOW = """\
 ## Workflow
 
 1. Start: Read task_list.md and LOG.md (if they exist) to resume context.
 2. Investigate: Read files, search the codebase, understand the problem.
 3. Plan: Call update_task_list with a research-level plan.
 4. Execute: Delegate concrete execution to worker by default.
-   Use direct implementation only when it is clearly faster (tiny edits, quick probes,
-   or tight unblockers).
-5. Verify: Treat worker reports as claims; verify key claims with evidence
-   (diffs/tests/artifacts) before marking progress complete.
+   Use direct implementation only for trivial unblockers (< 2 minutes, e.g., a one-line fix
+   or a quick file read to unblock yourself).
+5. Verify: NEVER accept a worker report at face value. Verify at least one key claim
+   with concrete evidence (read the diff, run the test, check the artifact) before
+   marking progress on that item.
 6. Iterate: Refine based on evidence until the goal is met.
 7. Complete: Call task_complete with a summary.
+"""
 
+ORCH_EXECUTION_POLICY = """\
+## Execution Policy
+
+VERY IMPORTANT: You are a planner and verifier. Workers are your hands.
+
+**Anti-patterns — do NOT do these:**
+- Don't "just quickly fix" something yourself when a worker should do it.
+  If you wrote code or ran a command that changes project state, you skipped delegation.
+- Don't skip verification. "Worker says tests pass" is NOT evidence. Read the test output.
+- Don't do work AND assign it. If you already made the change, don't also ask a worker to
+  make the same change.
+- Don't assign vague tasks. "Look into this" is not an assignment. Provide objective,
+  acceptance criteria, and relevant context.
+
+**Your job in each cycle:**
+1. Decide what needs to happen next (planning)
+2. Write a concrete worker assignment OR do a trivial unblock (< 2 min)
+3. Verify the result with evidence
+4. Update task_list and log
+"""
+
+ORCH_COMMUNICATION = """\
+## Communication
+
+**User messages:**
+- Pull queued user messages periodically so urgent direction is integrated quickly.
+- When the user sends guidance, integrate it into your plan — don't just acknowledge.
+
+**ask_user discipline:**
+- Use ONLY for genuine blocking decisions or information not in the codebase.
+- Anti-patterns: don't ask "should I proceed?", don't ask for status confirmation,
+  don't ask when you can figure it out yourself.
+- Format: one precise question per call. Include context for why you're blocked.
+
+**Permission denial fallback:**
+- If a worker reports permission denied or tool access errors, investigate alternative
+  approaches before escalating to the user.
+
+**Writing style:**
+- Talk in direct prose. Do not write self-addressed chat text like "@orchestrator ...".
+- Be concise — state findings and decisions, not narration of what you're about to do.
+"""
+
+ORCH_LOG_GUIDANCE = """\
 ## Research log (LOG.md)
 
 Your log is your lab notebook — the narrative record of an investigation.
@@ -197,41 +247,72 @@ Call append_log at turning points, not on every action.
 
 The log should read as a story — someone picking up where you left off can trace
 your reasoning, see what you tried, and understand why you made each decision.
+"""
 
+ORCH_RULES = """\
 ## Rules
 
 - Investigate before assigning work — don't delegate blindly.
-- Worker assignments should be concrete and actionable.
-- Prefer assign_worker for most concrete execution tasks; this is the default path.
-- Worker -> report -> orchestrator verification is the expected pipeline.
-- Use direct implementation only when delegation overhead is likely higher than
-  doing it yourself immediately.
 - For Python commands, prefer uv-managed execution (`uv run ...`) or an explicit venv.
-- Pull queued user messages periodically so urgent direction is integrated quickly.
 - Keep task_list at PhD-level granularity (experiments, milestones), not micro-steps.
 - Only update worker config (.claude/roles/worker.md) when conventions genuinely change.
-- Use ask_user only for genuine blocking decisions, not routine status updates.
-- Do not write self-addressed chat text like "@orchestrator ..."; talk in direct prose.
 """
 
+ORCHESTRATOR_PROMPT = (
+    ORCH_IDENTITY
+    + "\n"
+    + ORCH_TOOLS
+    + "\n"
+    + ORCH_WORKFLOW
+    + "\n"
+    + ORCH_EXECUTION_POLICY
+    + "\n"
+    + ORCH_COMMUNICATION
+    + "\n"
+    + ORCH_LOG_GUIDANCE
+    + "\n"
+    + ORCH_RULES
+)
 
-WORKER_PROMPT = """\
+
+WORKER_IDENTITY = """\
 You are a WORKER agent. Execute the orchestrator assignment end-to-end.
 Focus on concrete actions and evidence.
+Do not decide overall user-task completion — just execute your assignment and report results.
+"""
 
-Execution environment rules:
+WORKER_ENV = """\
+## Execution environment
+
 - Prefer uv-managed execution (`uv run ...`) or a project venv.
 - Avoid bare global `python`/`pip` when a uv/venv path is available.
-
-When finished, call the **submit_report** tool with a structured report covering:
-1. **What was done**: Specific actions, files modified, commands run
-2. **Results & Evidence**: Test output, verification results, key findings
-3. **Issues** (if any): Blockers, partial results, open questions
-
-Be concrete — include file paths, line numbers, test counts, error messages.
-If blocked, still submit a report describing the blocker and what you attempted.
-Do not decide overall user-task completion — just report your work.
 """
+
+WORKER_REPORT_CONTRACT = """\
+## Report contract
+
+When finished, call the **submit_report** tool with a structured report.
+Your report goes directly to the orchestrator for review and verification.
+
+**Required sections:**
+
+1. **Assignment restatement**: One-line summary of what you were asked to do.
+2. **What was done**: Specific actions taken, files modified, commands run.
+3. **Results & Evidence**: Test output (paste actual output), verification results,
+   key findings. Include file paths, line numbers, test counts, error messages.
+4. **Acceptance criteria status**: For each goal in your assignment, state DONE or
+   NOT DONE with evidence.
+5. **Open issues** (if any): Blockers, partial results, questions for orchestrator.
+
+**Anti-patterns — do NOT do these:**
+- Don't say "tests pass" without pasting the actual test output.
+- Don't say "file updated" without stating the file path and what changed.
+- Don't omit error details — paste the traceback, not "an error occurred".
+
+If blocked, still submit a report describing the blocker and what you attempted.
+"""
+
+WORKER_PROMPT = WORKER_IDENTITY + "\n" + WORKER_ENV + "\n" + WORKER_REPORT_CONTRACT
 
 
 # -- data models -------------------------------------------------------
@@ -417,6 +498,19 @@ def _enqueue_interrupt(
 
     queue.put_nowait(payload)
     return queue.qsize()
+
+
+def _pending_user_message_count(project_id: str) -> int:
+    """Count queued non-empty user messages without draining the queue."""
+    queue = interrupt_queues.get(project_id)
+    if not queue:
+        return 0
+    count = 0
+    for payload in list(getattr(queue, "_queue", [])):
+        meta = _interrupt_payload_meta(payload)
+        if meta["kind"] == "user_message" and meta["text"]:
+            count += 1
+    return count
 
 
 async def _wait_for_interrupt_text(project_id: str, timeout: float) -> str:
@@ -647,6 +741,17 @@ async def _maybe_enqueue_heartbeat_nudge(project_id: str, state: TaskState) -> b
         "Keep moving autonomously: investigate, delegate concrete execution to worker, and verify evidence.",
         "If blocked on a true decision, call ask_user with one precise question.",
     ]
+    pending_user = _pending_user_message_count(project_id)
+    if pending_user > 0:
+        lines.append(
+            f"Queue reminder: {pending_user} queued user message(s) pending. "
+            "Call pull_user_messages and integrate guidance."
+        )
+    if state.iteration > 0 and idle_for >= 600:
+        lines.append(
+            "Task hygiene: read task_list.md, pull user messages, "
+            "and ensure your plan is current before continuing."
+        )
     project = projects.get(project_id)
     if project:
         gpu_hint = await _gpu_idle_hint(project.project_dir)
@@ -715,12 +820,18 @@ def _create_worker_tools(project_id: str, iteration: int, captured_report: list)
     @tool(
         "submit_report",
         "Submit your work report when you've completed the assignment. "
-        "Write a structured, comprehensive report covering:\n"
-        "1. **What was done**: Specific actions taken, files modified, commands run\n"
-        "2. **Results & Evidence**: Test output, verification results, key findings\n"
-        "3. **Issues** (if any): Blockers, partial results, open questions\n\n"
-        "Be concrete — include file paths, line numbers, test counts, error messages. "
-        "This report goes directly to the orchestrator for review.",
+        "This report goes directly to the orchestrator for verification.\n\n"
+        "**Required 5-section structure:**\n"
+        "1. **Assignment restatement**: One-line summary of what you were asked to do.\n"
+        "2. **What was done**: Specific actions, files modified, commands run.\n"
+        "3. **Results & Evidence**: Paste actual test output, diffs, verification results. "
+        "Include file paths, line numbers, test counts, error messages.\n"
+        "4. **Acceptance criteria status**: For each goal, state DONE or NOT DONE with evidence.\n"
+        "5. **Open issues** (if any): Blockers, partial results, questions.\n\n"
+        "**Anti-patterns:**\n"
+        "- Don't say 'tests pass' without pasting actual test output.\n"
+        "- Don't say 'file updated' without stating the path and what changed.\n"
+        "- Don't omit error details — paste the traceback.",
         {"report": str},
     )
     async def submit_report(args):
@@ -842,7 +953,16 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         "Send a concrete task to your worker agent for execution. "
         "The worker has full tool access (Edit, Write, Bash, etc). "
         "Returns the worker's report when done. "
-        "Each call counts toward the iteration limit.",
+        "Each call counts toward the iteration limit.\n\n"
+        "**When to use:** ANY task involving file edits, running commands, multi-step "
+        "implementation, or investigation that requires tool access. This is your "
+        "default execution path.\n\n"
+        "**When NOT to use:** Don't assign work you already did yourself. Don't assign "
+        "vague tasks like 'look into this'.\n\n"
+        "**Required assignment structure:**\n"
+        "- Objective: what the worker must accomplish\n"
+        "- Acceptance criteria: how to verify success (tests to pass, output to produce)\n"
+        "- Context: relevant file paths, prior findings, constraints",
         {"task": str},
     )
     async def assign_worker(args):
@@ -947,12 +1067,22 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
                 label = urgency if kind == "user_message" else f"{kind}/{urgency}"
                 result_text += f"- ({label}) {item['text']}\n"
 
+        result_text += (
+            "\n\n[VERIFICATION REMINDER] The above is a worker CLAIM. "
+            "Verify at least one key claim before marking progress."
+        )
+
         return {"content": [{"type": "text", "text": result_text}]}
 
     @tool(
         "task_complete",
         "Mark the overall user task as complete. "
-        "Call this when all goals are achieved.",
+        "Call this when all goals are achieved.\n\n"
+        "**When NOT to use:** Don't call if the last worker report is unverified. "
+        "Don't call prematurely — ensure all acceptance criteria are met with evidence.\n\n"
+        "**Before calling:** Pull user messages first (call pull_user_messages) to check "
+        "for any last-minute guidance or course corrections. "
+        "If user messages are queued, integrate them before completion.",
         {"summary": str},
     )
     async def task_complete(args):
@@ -976,7 +1106,10 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
     @tool(
         "pull_user_messages",
         "Fetch queued user messages with urgency metadata. "
-        "Use this periodically to integrate non-urgent guidance and urgent interruptions.",
+        "Use this periodically to integrate non-urgent guidance and urgent interruptions.\n\n"
+        "**When to use:** Before planning your next step, before calling task_complete, "
+        "after receiving a worker report, and whenever you suspect the user may have "
+        "sent guidance.",
         {},
     )
     async def pull_user_messages(_args):
@@ -986,7 +1119,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
         lines = []
         for idx, item in enumerate(pending, start=1):
-            lines.append(f"{idx}. [{item['urgency']}] {item['text']}")
+            lines.append(f"{idx}. [{item['kind']}:{item['urgency']}] {item['text']}")
 
         return {
             "content": [
@@ -1002,7 +1135,16 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         "Ask the professor/user a blocking question. "
         "Use sparingly — only for genuine decisions or information "
         "that cannot be found in the codebase. "
-        "Blocks until the user responds (up to 10 minutes).",
+        "Blocks until the user responds (up to 10 minutes).\n\n"
+        "**Anti-patterns — do NOT ask these:**\n"
+        "- 'Should I proceed?' — just proceed.\n"
+        "- 'Can you confirm the status?' — check it yourself.\n"
+        "- 'Is this correct?' — verify it with evidence.\n"
+        "- Multiple questions in one call — ask ONE precise question.\n\n"
+        "**Good format:** State the decision point, the options you see, and why "
+        "you can't decide without input. Example: 'The training config supports both "
+        "fp16 and bf16. The GPU is A100 (supports both). Which precision do you prefer "
+        "for this experiment?'",
         {"question": str},
     )
     async def ask_user(args):
@@ -1047,7 +1189,9 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         "update_task_list",
         "Update your research plan (task_list.md). "
         "Use markdown checkboxes. PhD-level granularity: "
-        "experiments, investigations, milestones — not micro-implementation steps.",
+        "experiments, investigations, milestones — not micro-implementation steps.\n\n"
+        "**Anti-pattern:** Don't create a new task list every iteration. Read the existing "
+        "one, update check marks and add/remove items as needed.",
         {"content": str},
     )
     async def update_task_list(args):
@@ -1068,7 +1212,9 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         "append_log",
         "Append an entry to your research log (LOG.md). "
         "Your lab notebook — record hypotheses, findings, decisions, and pivots. "
-        "Write at turning points, not on every action.",
+        "Write at turning points, not on every action.\n\n"
+        "**Anti-pattern:** Don't log routine actions ('assigned worker', 'read file'). "
+        "Log insights, evidence, decisions, and pivots.",
         {"entry": str},
     )
     async def append_log(args):
@@ -1091,7 +1237,9 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         "The worker loads this role memory at the start of every assignment. "
         "This is separate from the project's root CLAUDE.md (which you should not overwrite). "
         "Use for: learned conventions, file locations, environment quirks, "
-        "tool preferences. Only update when something genuinely changes.",
+        "tool preferences. Only update when something genuinely changes.\n\n"
+        "**Anti-pattern:** Don't update on every iteration. Only update when you discover "
+        "a convention or constraint the worker should know for ALL future assignments.",
         {"content": str},
     )
     async def update_worker_config(args):
@@ -1320,8 +1468,11 @@ async def run_task(
 
             next_prompt = (
                 "[CONTINUE]\n"
-                "No new user instruction. Continue autonomously from task_list.md and LOG.md. "
-                "Pull queued user messages if needed, then keep driving progress."
+                "No new user instruction. Before continuing:\n"
+                "1. Read task_list.md to see current progress and next items.\n"
+                "2. Pull user messages (call pull_user_messages) for any guidance.\n"
+                "3. Continue with the next unchecked item in task_list.\n"
+                "Keep driving progress autonomously."
             )
             await asyncio.sleep(0.2)
 

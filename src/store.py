@@ -144,6 +144,10 @@ class Store:
 
     async def set_channel_project(self, chat_id: int, project_id: str | None):
         async with self._get_channel_lock(chat_id):
+            path = self._channel_path(chat_id)
+            if not os.path.exists(path):
+                # Do not recreate deleted/non-existent channels when clearing mapping.
+                return
             data = self._load(chat_id)
             data.setdefault("meta", {})
             data["meta"]["project_id"] = project_id or None

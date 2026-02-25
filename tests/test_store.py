@@ -147,6 +147,21 @@ async def test_set_channel_project_none_clears(store):
     assert ch_id not in mapping
 
 
+async def test_set_channel_project_on_missing_channel_is_noop(tmp_path):
+    data_dir = tmp_path / "data"
+    s = Store(str(data_dir))
+    await s.init()
+
+    missing_id = 42
+    channel_path = data_dir / "channels" / f"{missing_id}.json"
+    assert not channel_path.exists()
+
+    await s.set_channel_project(missing_id, None)
+    assert not channel_path.exists()
+
+    await s.close()
+
+
 # -- notes ------------------------------------------------------------
 
 

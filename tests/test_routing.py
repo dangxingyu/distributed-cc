@@ -525,11 +525,54 @@ async def test_setup_project_prompt_enforces_workdir_and_health_gates(tmp_path):
         await task
 
     prompt = captured_prompt["text"]
-    assert "Ensure work_dir exists on the target machine" in prompt
-    assert "Verify work_dir is writable" in prompt
-    assert "Create/update work_dir/CLAUDE.md" in prompt
-    assert "Validate daemon reachability" in prompt
-    assert "If any check fails, do not claim success" in prompt
+    assert "Resolve one concrete absolute work_dir" in prompt
+    assert "If no concrete work_dir is derivable" in prompt
+    assert "Ensure work_dir exists and is writable" in prompt
+    assert "Ensure work_dir/CLAUDE.md exists" in prompt
+    assert "NEVER overwrite whole file" in prompt
+    assert "Verify daemon health" in prompt
+    assert "Response format" in prompt
+    assert "READY: project_id, work_dir, host, broker_port" in prompt
+
+
+async def test_setup_server_prompt_is_machine_only(tmp_path):
+    (tmp_path / "config.json").write_text('{"servers": []}')
+    router = Router(cwd=str(tmp_path))
+
+    captured_prompt = {"text": ""}
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            captured_prompt["text"] = prompt
+            return "ok"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return True
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(
+            1,
+            "/setup user@server",
+            send_reply,
+            send_log,
+            None,
+        )
+        task = router._router_tasks[1]
+        await task
+
+    prompt = captured_prompt["text"]
+    assert "machine connectivity only" in prompt.lower()
+    assert "do not create or modify project/work_dir entries" in prompt.lower()
+    assert "do not create or edit work_dir/claude.md" in prompt.lower()
 
 
 def test_parse_setup_command_health_default():
