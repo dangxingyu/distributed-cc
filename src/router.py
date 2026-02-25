@@ -35,6 +35,10 @@ def _preview(text: str, limit: int = 120) -> str:
     return compact[:limit] + "..."
 
 
+DEFERRED_RETRY_INITIAL_SECONDS = 0.5
+DEFERRED_RETRY_MAX_SECONDS = 10.0
+
+
 @dataclass
 class RemoteOrchestrator:
     """A remote orchestrator daemon configuration."""
@@ -75,6 +79,7 @@ class Router:
 
         # Deferred non-urgent tasks while running
         self._deferred_tasks: dict[str, list[dict]] = {}
+        self._deferred_retry_tasks: dict[str, asyncio.Task] = {}
 
         # Callback to web layer
         self._progress_callback = None  # async (project_id, event)
@@ -93,6 +98,8 @@ class Router:
 
     async def close(self):
         for task in self._sse_tasks.values():
+            task.cancel()
+        for task in self._deferred_retry_tasks.values():
             task.cancel()
         if self._http:
             await self._http.close()
@@ -691,9 +698,48 @@ class Router:
         queue.append({"chat_id": chat_id, "text": text, "ts": time.time()})
         return len(queue)
 
+    def _cancel_deferred_retry(self, project_id: str):
+        task = self._deferred_retry_tasks.pop(project_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _deferred_retry_delay(self, retries: int) -> float:
+        retries = max(1, retries)
+        delay = DEFERRED_RETRY_INITIAL_SECONDS * (2 ** (retries - 1))
+        return min(delay, DEFERRED_RETRY_MAX_SECONDS)
+
+    def _is_retryable_start_error(self, error: str) -> bool:
+        lowered = str(error or "").lower()
+        return "already has a running task" in lowered or "http 409" in lowered
+
+    def _schedule_deferred_retry(self, project_id: str, retries: int):
+        existing = self._deferred_retry_tasks.get(project_id)
+        if existing and not existing.done():
+            return
+
+        delay = self._deferred_retry_delay(retries)
+
+        async def _retry():
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+
+            current = self._deferred_retry_tasks.get(project_id)
+            if current is asyncio.current_task():
+                self._deferred_retry_tasks.pop(project_id, None)
+
+            try:
+                await self._maybe_start_deferred_task(project_id)
+            except Exception:
+                log.warning("Deferred retry failed for %s", project_id, exc_info=True)
+
+        self._deferred_retry_tasks[project_id] = asyncio.create_task(_retry())
+
     async def _maybe_start_deferred_task(self, project_id: str):
         queue = self._deferred_tasks.get(project_id) or []
         if not queue:
+            self._cancel_deferred_retry(project_id)
             return
 
         orch = self._orchestrators.get(project_id)
@@ -703,6 +749,7 @@ class Router:
         next_task = queue[0]
         ok, error = await self._start_task_request(project_id, next_task["text"])
         if ok:
+            self._cancel_deferred_retry(project_id)
             queue.pop(0)
             remaining = len(queue)
             orch.status = "running"
@@ -730,6 +777,12 @@ class Router:
                 retries,
                 error,
             )
+            if self._is_retryable_start_error(error):
+                # Daemon can briefly report "already running" right after a done event.
+                # Keep queue head and retry with backoff instead of surfacing a user-facing failure.
+                self._schedule_deferred_retry(project_id, retries)
+                return
+
             if self._progress_callback:
                 snippet = next_task["text"]
                 try:
@@ -737,7 +790,7 @@ class Router:
                         "type": "text",
                         "data": (
                             "@orchestrator Failed to start queued task: "
-                            f"{snippet} (attempt {retries}, will retry)"
+                            f"{snippet} (attempt {retries})"
                         ),
                         "iteration": 0,
                         "ts": time.time(),
@@ -1047,6 +1100,7 @@ class Router:
             task = self._sse_tasks.pop(pid, None)
             if task:
                 task.cancel()
+            self._cancel_deferred_retry(pid)
 
     # -- channel/project mapping --------------------------------------
 

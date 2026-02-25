@@ -4,7 +4,16 @@
   <img src="docs/assets/distributed-cc-logo.jpeg" alt="Distributed Claude Code logo" width="720" />
 </p>
 
-*Work as an advisor!* Run Claude Code across multiple servers from one local chat interface (Web UI or Telegram), with a persistent **Orchestrator + Worker** architecture.
+*Work as an advisor!* Run Claude Code across multiple servers from one local chat interface (Web UI or Telegram), with a persistent **PhDLoop** runtime (Orchestrator + Worker).
+
+<p align="center">
+  <img src="docs/assets/illustration.jpeg" alt="System structure, binding model, and runtime flow" width="920" />
+</p>
+
+## Naming
+
+- **AdvisorLoop**: the full workflow including user + router + remote runtime.
+- **PhDLoop**: the autonomous per-project execution loop (orchestrator + worker).
 
 ## Why This Exists
 

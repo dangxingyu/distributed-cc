@@ -775,7 +775,7 @@ def _queued_user_message_count(project_id: str) -> int:
 def _build_standby_wakeup_prompt(reasons: list[str], gpu_hint: str) -> str:
     lines = [
         "[STANDBY HEARTBEAT WAKEUP]",
-        "AdvisorLoop heartbeat woke you from rest (default cadence: ~30 minutes).",
+        "PhDLoop heartbeat woke you from rest (default cadence: ~30 minutes).",
         "You were resting after a completed milestone.",
         "Purpose: prevent stagnation, NOT generate busywork.",
     ]
@@ -1281,7 +1281,15 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
         lines = []
         for idx, item in enumerate(pending, start=1):
-            lines.append(f"{idx}. [{item['kind']}:{item['urgency']}] {item['text']}")
+            kind = str(item.get("kind", "user_message"))
+            urgency = str(item.get("urgency", "normal"))
+            text = str(item.get("text", ""))
+            if kind == "user_message":
+                # Keep user-facing urgency tags compact and easy to parse in summaries.
+                tag = urgency
+            else:
+                tag = f"{kind}:{urgency}"
+            lines.append(f"{idx}. [{tag}] {text}")
 
         return {
             "content": [

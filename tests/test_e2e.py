@@ -574,6 +574,8 @@ async def _claude_eval_yes_no_score(
         "- score is an integer from 0 to 10\n"
         "- pass must be yes only if evidence clearly meets rubric\n\n"
         "- use only provided evidence; do not infer hidden actions\n\n"
+        "- if evidence contains explicit boolean checks (e.g., key=True/False), treat them as authoritative facts\n"
+        "- do not override explicit boolean checks based on truncated text snippets\n\n"
         f"RUBRIC:\n{rubric}\n\n"
         f"EVIDENCE:\n{evidence}\n"
     )
@@ -1256,6 +1258,12 @@ async def test_e2e_shared_claude_md_applies_to_orchestrator_and_worker():
                 report = report_path.read_text()
                 assert "SHARED_WORKER_SENTINEL: meow~" in report, report
                 assert (Path(sandbox) / "shared_memory_probe.txt").exists()
+                marker = "SHARED_WORKER_SENTINEL: meow~"
+                marker_idx = report.find(marker)
+                if marker_idx >= 0:
+                    marker_snippet = report[max(0, marker_idx - 120): marker_idx + len(marker) + 120]
+                else:
+                    marker_snippet = ""
 
                 eval_result = await _claude_eval_yes_no_score(
                     rubric=(
@@ -1268,6 +1276,7 @@ async def test_e2e_shared_claude_md_applies_to_orchestrator_and_worker():
                         f"status_done={status.get('status') == 'done'}\n"
                         f"summary_has_shared_orch={'SHARED_ORCH_SENTINEL: meow~' in str(status.get('summary', ''))}\n"
                         f"report_has_shared_worker={'SHARED_WORKER_SENTINEL: meow~' in report}\n"
+                        f"report_shared_worker_marker_snippet={marker_snippet}\n"
                         f"file_exists={(Path(sandbox) / 'shared_memory_probe.txt').exists()}\n"
                         f"summary={status.get('summary', '')[:400]}\n"
                         f"report={report[:800]}\n"

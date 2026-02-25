@@ -11,6 +11,7 @@ Covers:
 - channel/project mapping helpers
 """
 
+import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1008,6 +1009,36 @@ async def test_deferred_task_start_failure_keeps_queue_head():
     assert len(router._deferred_tasks["proj"]) == 1
     assert router._deferred_tasks["proj"][0]["text"] == "queued task"
     assert router._deferred_tasks["proj"][0]["retries"] == 1
+    assert "proj" not in router._deferred_retry_tasks
+
+
+async def test_deferred_task_retryable_start_failure_auto_retries():
+    """409/'already running' should retry queued start with backoff."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="done")])
+    router._deferred_tasks["proj"] = [{"chat_id": 1, "text": "queued task", "ts": 1.0}]
+
+    router._start_task_request = AsyncMock(
+        side_effect=[
+            (False, "Project proj already has a running task. Use /interrupt or /stop first."),
+            (True, ""),
+        ]
+    )
+    router._deferred_retry_delay = lambda retries: 0.01
+
+    progress_events = []
+
+    async def on_progress(project_id, event):
+        progress_events.append(event)
+
+    router.set_progress_callback(on_progress)
+
+    await router._maybe_start_deferred_task("proj")
+    await asyncio.sleep(0.05)
+
+    assert router._start_task_request.await_count >= 2
+    assert len(router._deferred_tasks["proj"]) == 0
+    assert any("Starting queued task:" in str(e.get("data", "")) for e in progress_events)
+    assert not any("Failed to start queued task:" in str(e.get("data", "")) for e in progress_events)
 
 
 # ── Mapping persistence callback ─────────────────────────────────────
