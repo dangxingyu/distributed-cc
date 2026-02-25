@@ -20,6 +20,11 @@ The daemon also runs a heartbeat watchdog:
   orchestration active.
 - If GPU cards look idle (`nvidia-smi`), the nudge includes a reminder to schedule
   GPU-bound worker tasks.
+- When a project is resting (`done`/`idle`), a slower standby heartbeat can
+  wake the orchestrator for a lightweight triage pass only when there is a
+  meaningful signal (for example, unchecked `task_list.md` items or queued
+  advisor messages).
+  Default standby cadence is ~30 minutes (`STANDBY_HEARTBEAT_SECONDS=1800`).
 
 ## What You Type vs What Happens
 

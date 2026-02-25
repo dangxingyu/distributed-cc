@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import traceback
 import uuid
@@ -133,6 +134,14 @@ HEARTBEAT_GPU_HINT = os.environ.get("HEARTBEAT_GPU_HINT", "1").strip().lower() n
 )
 HEARTBEAT_GPU_IDLE_UTIL = _env_int("HEARTBEAT_GPU_IDLE_UTIL", 10, minimum=0)
 HEARTBEAT_GPU_IDLE_MEMORY_MB = _env_int("HEARTBEAT_GPU_IDLE_MEMORY_MB", 2048, minimum=0)
+STANDBY_HEARTBEAT_ENABLED = os.environ.get("STANDBY_HEARTBEAT_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+STANDBY_HEARTBEAT_SECONDS = _env_int("STANDBY_HEARTBEAT_SECONDS", 1800, minimum=60)
+STANDBY_WAKE_MAX_ITERATIONS = _env_int("STANDBY_WAKE_MAX_ITERATIONS", 1, minimum=1)
 CONTINUOUS_MODE_DEFAULT = os.environ.get("CONTINUOUS_MODE", "1").strip().lower() not in (
     "0",
     "false",
@@ -148,8 +157,19 @@ WORKER_ROLE_FILE = f"{ROLE_CONFIG_DIR}/worker.md"
 
 ORCH_IDENTITY = """\
 You are the ORCHESTRATOR — a PhD-student-level autonomous researcher.
-You receive direction from the professor (user), then independently plan,
-investigate, decompose tasks, assign workers, review output, and drive to completion.
+The user is your advisor (professor). They give high-level direction and
+occasional course corrections — they are NOT controlling you step by step.
+You independently plan, investigate, decompose tasks, assign workers,
+review output, and drive to completion.
+
+The advisor may be juggling many projects simultaneously and cannot track your
+progress in detail. YOU are the state keeper. Your task_list.md and LOG.md are
+the source of truth for this project's status. Keep them current so that anyone
+(including yourself after a session restart) can pick up exactly where you left off.
+
+When the advisor is silent, keep working. Their silence means "carry on".
+Only stop when all goals are met (call task_complete) or you hit a genuine
+decision that requires their input (call ask_user).
 """
 
 ORCH_TOOLS = """\
@@ -208,15 +228,20 @@ VERY IMPORTANT: You are a planner and verifier. Workers are your hands.
 ORCH_COMMUNICATION = """\
 ## Communication
 
-**User messages:**
+**Advisor model:**
+- The user is an advisor, not a controller. They send occasional guidance,
+  course corrections, or new priorities — not step-by-step instructions.
+- When the user sends guidance, integrate it into your plan immediately.
+- When no guidance arrives, that means "keep going". Never stall waiting for input.
 - Pull queued user messages periodically so urgent direction is integrated quickly.
-- When the user sends guidance, integrate it into your plan — don't just acknowledge.
 
 **ask_user discipline:**
 - Use ONLY for genuine blocking decisions or information not in the codebase.
 - Anti-patterns: don't ask "should I proceed?", don't ask for status confirmation,
-  don't ask when you can figure it out yourself.
+  don't ask when you can figure it out yourself, don't ask for approval.
 - Format: one precise question per call. Include context for why you're blocked.
+- The advisor is busy — respect their attention. If you can make a reasonable
+  decision yourself, do it and note it in the log.
 
 **Permission denial fallback:**
 - If a worker reports permission denied or tool access errors, investigate alternative
@@ -391,6 +416,8 @@ callback_http_lock = asyncio.Lock()
 project_last_progress_ts: dict[str, float] = {}
 project_last_heartbeat_nudge_ts: dict[str, float] = {}
 heartbeat_tasks: dict[str, asyncio.Task] = {}
+project_last_standby_wake_ts: dict[str, float] = {}
+standby_heartbeat_tasks: dict[str, asyncio.Task] = {}
 
 
 def _ensure_interrupt_queue(project_id: str) -> asyncio.Queue:
@@ -706,6 +733,160 @@ async def _gpu_idle_hint(project_dir: str) -> str:
     )
 
 
+def _task_list_has_unchecked_items(project_id: str) -> bool:
+    """Return True when task_list.md contains unchecked checkbox items."""
+    project = projects.get(project_id)
+    if not project:
+        return False
+
+    path = Path(project.project_dir) / "task_list.md"
+    if not path.exists():
+        return False
+
+    try:
+        content = path.read_text()
+    except Exception:
+        return False
+
+    unchecked = re.compile(r"^\s*[-*]\s*\[\s\]\s+")
+    return any(unchecked.match(line) for line in content.splitlines())
+
+
+def _queued_user_message_count(project_id: str) -> int:
+    """Count queued user messages without draining the interrupt queue."""
+    queue = interrupt_queues.get(project_id)
+    if not queue or queue.empty():
+        return 0
+
+    try:
+        pending = list(queue._queue)  # type: ignore[attr-defined]
+    except Exception:
+        # Fallback: best-effort signal if queue introspection fails.
+        return queue.qsize()
+
+    count = 0
+    for payload in pending:
+        meta = _interrupt_payload_meta(payload)
+        if meta.get("kind") == "user_message" and meta.get("text"):
+            count += 1
+    return count
+
+
+def _build_standby_wakeup_prompt(reasons: list[str], gpu_hint: str) -> str:
+    lines = [
+        "[STANDBY HEARTBEAT WAKEUP]",
+        "AdvisorLoop heartbeat woke you from rest (default cadence: ~30 minutes).",
+        "You were resting after a completed milestone.",
+        "Purpose: prevent stagnation, NOT generate busywork.",
+    ]
+    if reasons:
+        lines.append("Wake reason(s): " + "; ".join(reasons))
+    lines.extend(
+        [
+            "Run a lightweight triage pass:",
+            "1. Read task_list.md and LOG.md to restore state.",
+            "2. Pull queued advisor messages and integrate any guidance.",
+            "3. Check for redundant resource usage (stale processes, duplicate jobs, avoidable re-runs).",
+            "4. Decide if there is ONE meaningful next action with clear expected value right now.",
+            "5. If yes: execute surgically (usually via assign_worker), then verify evidence.",
+            "6. If no: explicitly choose to stay resting and end this wake cycle.",
+            "Hard rule: do not invent speculative tasks just to appear active.",
+            "Hard rule: do not repeat expensive actions unless new evidence justifies rerunning.",
+        ]
+    )
+    if gpu_hint:
+        lines.append(gpu_hint)
+    return "\n".join(lines)
+
+
+async def _maybe_start_standby_wakeup(project_id: str) -> bool:
+    """Wake a resting orchestrator only when there is a meaningful signal."""
+    if not STANDBY_HEARTBEAT_ENABLED:
+        return False
+
+    project = projects.get(project_id)
+    if not project:
+        return False
+
+    running = running_tasks.get(project_id)
+    if running and not running.done():
+        return False
+
+    state = task_states.get(project_id)
+    if not state:
+        return False
+    if state.status in ("running", "stopped"):
+        return False
+
+    now = time.time()
+    last_wake = project_last_standby_wake_ts.get(project_id, 0.0)
+    if now - last_wake < STANDBY_HEARTBEAT_SECONDS:
+        return False
+
+    queued_user_messages = _queued_user_message_count(project_id)
+    has_unchecked_items = _task_list_has_unchecked_items(project_id)
+    if queued_user_messages <= 0 and not has_unchecked_items:
+        return False
+
+    reasons: list[str] = []
+    if queued_user_messages > 0:
+        reasons.append(f"{queued_user_messages} queued advisor message(s)")
+    if has_unchecked_items:
+        reasons.append("unchecked items in task_list.md")
+
+    gpu_hint = await _gpu_idle_hint(project.project_dir) if has_unchecked_items else ""
+    wake_prompt = _build_standby_wakeup_prompt(reasons, gpu_hint)
+    project_last_standby_wake_ts[project_id] = now
+
+    await emit_progress(
+        project_id,
+        ProgressEvent(
+            type="log_update",
+            data=f"[heartbeat] standby wake triggered: {'; '.join(reasons)}",
+            iteration=state.iteration,
+        ),
+    )
+
+    task = asyncio.create_task(
+        run_task(
+            project_id=project_id,
+            task_text=wake_prompt,
+            max_iterations=STANDBY_WAKE_MAX_ITERATIONS,
+            continuous_mode=False,
+            model=state.model or DEFAULT_ORCHESTRATOR_MODEL,
+            session_model=state.session_model or state.model or DEFAULT_SESSION_MODEL,
+            permission_mode=state.permission_mode or DEFAULT_PERMISSION_MODE,
+        )
+    )
+    running_tasks[project_id] = task
+    return True
+
+
+async def _standby_heartbeat_loop(project_id: str):
+    """Periodic heartbeat that wakes resting orchestrators only on useful signals."""
+    while True:
+        await asyncio.sleep(STANDBY_HEARTBEAT_SECONDS)
+        if project_id not in projects:
+            break
+        try:
+            await _maybe_start_standby_wakeup(project_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("Standby heartbeat error for %s: %s", project_id, e)
+
+
+def _ensure_standby_heartbeat_task(project_id: str):
+    if not STANDBY_HEARTBEAT_ENABLED:
+        return
+    task = standby_heartbeat_tasks.get(project_id)
+    if task and not task.done():
+        return
+    standby_heartbeat_tasks[project_id] = asyncio.create_task(
+        _standby_heartbeat_loop(project_id)
+    )
+
+
 async def _maybe_enqueue_heartbeat_nudge(project_id: str, state: TaskState) -> bool:
     """Inject a system nudge when the orchestrator has been idle too long."""
     if state.status != "running":
@@ -725,13 +906,13 @@ async def _maybe_enqueue_heartbeat_nudge(project_id: str, state: TaskState) -> b
     idle_minutes = max(1, int(idle_for // 60))
     lines = [
         f"Heartbeat: no visible progress for ~{idle_minutes} minute(s).",
-        "Keep moving autonomously: investigate, delegate concrete execution to worker, and verify evidence.",
-        "If blocked on a true decision, call ask_user with one precise question.",
+        "You own this project — advisor silence means 'carry on'.",
+        "Next action: read task_list.md, pick the next unchecked item, assign a worker or investigate.",
+        "Only call ask_user if you genuinely cannot proceed without advisor input.",
     ]
     if state.iteration > 0 and idle_for >= 600:
         lines.append(
-            "Task hygiene: read task_list.md, pull user messages, "
-            "and ensure your plan is current before continuing."
+            "Task hygiene: pull user messages and ensure task_list.md reflects current state."
         )
     project = projects.get(project_id)
     if project:
@@ -1113,14 +1294,17 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 
     @tool(
         "ask_user",
-        "Ask the professor/user a blocking question. "
-        "Use sparingly — only for genuine decisions or information "
-        "that cannot be found in the codebase. "
-        "Blocks until the user responds (up to 10 minutes).\n\n"
+        "Ask the advisor a blocking question. This PAUSES your work until they respond "
+        "(up to 10 minutes). The advisor is busy across many projects — respect their "
+        "attention. If you can make a reasonable decision yourself, do it and log it.\n\n"
+        "**When to use:** Only for genuine blocking decisions where you lack the "
+        "information or authority to choose (e.g., conflicting requirements, "
+        "resource allocation preferences, ambiguous goals).\n\n"
         "**Anti-patterns — do NOT ask these:**\n"
         "- 'Should I proceed?' — just proceed.\n"
         "- 'Can you confirm the status?' — check it yourself.\n"
         "- 'Is this correct?' — verify it with evidence.\n"
+        "- 'I've completed X, what's next?' — check your task_list.\n"
         "- Multiple questions in one call — ask ONE precise question.\n\n"
         "**Good format:** State the decision point, the options you see, and why "
         "you can't decide without input. Example: 'The training config supports both "
@@ -1449,11 +1633,11 @@ async def run_task(
 
             next_prompt = (
                 "[CONTINUE]\n"
-                "No new user instruction. Before continuing:\n"
-                "1. Read task_list.md to see current progress and next items.\n"
-                "2. Pull user messages (call pull_user_messages) for any guidance.\n"
-                "3. Continue with the next unchecked item in task_list.\n"
-                "Keep driving progress autonomously."
+                "Advisor silence means 'carry on'. You own this project's progress.\n"
+                "1. Read task_list.md — what's the next unchecked item?\n"
+                "2. Pull user messages — any new guidance to integrate?\n"
+                "3. Drive the next item to completion: assign worker, verify, update task_list.\n"
+                "If all items are done, call task_complete."
             )
             await asyncio.sleep(0.2)
 
@@ -1677,6 +1861,7 @@ async def handle_register(request: web.Request) -> web.Response:
     projects[project_id] = Project(project_id=project_id, project_dir=project_dir, name=name)
     if _hydrate_sessions_from_state(project_id):
         log.info("Restored persisted session IDs for %s", project_id)
+    _ensure_standby_heartbeat_task(project_id)
     log.info("Registered project %s: %s", project_id, project_dir)
     return web.json_response({"ok": True, "project_id": project_id})
 
@@ -1953,6 +2138,22 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def on_cleanup(_app: web.Application):
     global callback_http_session
+    all_bg_tasks = list(heartbeat_tasks.values()) + list(standby_heartbeat_tasks.values())
+    for task in all_bg_tasks:
+        if task and not task.done():
+            task.cancel()
+    for task in all_bg_tasks:
+        if not task:
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    heartbeat_tasks.clear()
+    standby_heartbeat_tasks.clear()
+
     if callback_http_session and not callback_http_session.closed:
         await callback_http_session.close()
     callback_http_session = None

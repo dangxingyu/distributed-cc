@@ -304,6 +304,146 @@ async def test_maybe_enqueue_heartbeat_nudge_queues_system_message(tmp_path, mon
         project_last_heartbeat_nudge_ts.pop(project_id, None)
 
 
+def test_task_list_has_unchecked_items(tmp_path):
+    from orchestrator_daemon import _task_list_has_unchecked_items, projects, Project
+
+    project_id = "task-list-unchecked"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="x")
+    try:
+        (tmp_path / "task_list.md").write_text("- [x] done\n- [ ] next item\n")
+        assert _task_list_has_unchecked_items(project_id) is True
+
+        (tmp_path / "task_list.md").write_text("- [x] done\n- [x] done2\n")
+        assert _task_list_has_unchecked_items(project_id) is False
+    finally:
+        projects.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_maybe_start_standby_wakeup_requires_meaningful_signal(tmp_path, monkeypatch):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import (
+        _maybe_start_standby_wakeup,
+        Project,
+        TaskState,
+        projects,
+        running_tasks,
+        task_states,
+        project_last_standby_wake_ts,
+    )
+
+    project_id = "standby-no-signal"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="x")
+    task_states[project_id] = TaskState(
+        task_id="t-standby-no-signal",
+        project_id=project_id,
+        task_text="done work",
+        status="done",
+    )
+
+    called = {"run_task": False}
+
+    async def fake_run_task(*_args, **_kwargs):
+        called["run_task"] = True
+
+    async def fake_emit_progress(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(daemon_mod, "run_task", fake_run_task)
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+    monkeypatch.setattr(daemon_mod, "STANDBY_HEARTBEAT_ENABLED", True)
+
+    try:
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is False
+        assert called["run_task"] is False
+    finally:
+        projects.pop(project_id, None)
+        task_states.pop(project_id, None)
+        running_tasks.pop(project_id, None)
+        project_last_standby_wake_ts.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_maybe_start_standby_wakeup_starts_when_unchecked_items_exist(
+    tmp_path, monkeypatch
+):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import (
+        STANDBY_WAKE_MAX_ITERATIONS,
+        _maybe_start_standby_wakeup,
+        Project,
+        TaskState,
+        projects,
+        running_tasks,
+        task_states,
+        project_last_standby_wake_ts,
+    )
+
+    project_id = "standby-starts"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="x")
+    task_states[project_id] = TaskState(
+        task_id="t-standby-starts",
+        project_id=project_id,
+        task_text="done work",
+        status="done",
+        model="model-a",
+        session_model="model-b",
+        permission_mode="default",
+    )
+    (tmp_path / "task_list.md").write_text("- [ ] resume experiment\n")
+
+    called = {}
+
+    async def fake_run_task(
+        project_id: str,
+        task_text: str,
+        max_iterations: int = 0,
+        continuous_mode: bool = True,
+        model: str = "",
+        session_model: str = "",
+        permission_mode: str = "",
+    ):
+        called["project_id"] = project_id
+        called["task_text"] = task_text
+        called["max_iterations"] = max_iterations
+        called["continuous_mode"] = continuous_mode
+        called["model"] = model
+        called["session_model"] = session_model
+        called["permission_mode"] = permission_mode
+
+    async def fake_emit_progress(*_args, **_kwargs):
+        return None
+
+    async def fake_gpu_hint(_project_dir: str) -> str:
+        return ""
+
+    monkeypatch.setattr(daemon_mod, "run_task", fake_run_task)
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+    monkeypatch.setattr(daemon_mod, "_gpu_idle_hint", fake_gpu_hint)
+    monkeypatch.setattr(daemon_mod, "STANDBY_HEARTBEAT_ENABLED", True)
+
+    try:
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is True
+        task = running_tasks.get(project_id)
+        assert task is not None
+        await task
+
+        assert called["project_id"] == project_id
+        assert called["max_iterations"] == STANDBY_WAKE_MAX_ITERATIONS
+        assert called["continuous_mode"] is False
+        assert called["model"] == "model-a"
+        assert called["session_model"] == "model-b"
+        assert called["permission_mode"] == "default"
+        assert "[STANDBY HEARTBEAT WAKEUP]" in called["task_text"]
+    finally:
+        projects.pop(project_id, None)
+        task_states.pop(project_id, None)
+        running_tasks.pop(project_id, None)
+        project_last_standby_wake_ts.pop(project_id, None)
+
+
 def test_parse_bool_helper():
     from orchestrator_daemon import _parse_bool
 
