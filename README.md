@@ -70,6 +70,20 @@ This step creates/updates one project entry and gives you `/connect <project-id>
 Investigate why training loss plateaus and propose a fix.
 ```
 
+## Core Abstractions (Read First)
+
+- **Server (machine)**: connectivity/runtime endpoint (`host` + `broker_port`) where a daemon runs.
+- **Project**: one concrete workdir on a server, identified by `project_id`.
+- **Channel**: one conversation thread in UI; a channel is connected to at most one project at a time.
+- **Orchestrator/Worker sessions**: persistent Claude sessions owned by a project (not by a channel).
+
+Binding rules:
+
+- One server can host many projects.
+- Many channels can point to the same project.
+- If channels share a project, they observe the same orchestrator/worker runtime state.
+- Router setup sessions are per-channel; execution sessions (orchestrator/worker) are per-project.
+
 ## Setup Model (Important)
 
 ### `/setup` = machine setup only
@@ -219,7 +233,7 @@ curl http://127.0.0.1:8201/health
 
 ### `/connect <id>` unknown project
 
-- Confirm `config.json` has that `servers[].name`
+- Confirm `config.json` has that `projects[].project_id` (or `servers[].name` in legacy config)
 - Restart router after config edits
 
 ## Testing
