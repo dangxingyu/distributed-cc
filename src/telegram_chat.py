@@ -202,7 +202,7 @@ class TelegramChat:
             await self._store.add_log(chat_id, msg)
             await self._send_text(chat_id, f"[log] {msg}")
 
-        async def send_typing(active: bool, sender: str = "router"):
+        async def send_typing(active: bool, sender: str = "router", token: str | None = None):
             if active:
                 await self._send_typing(chat_id)
 

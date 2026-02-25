@@ -144,6 +144,20 @@ async def test_should_emit_final_result_true_when_different_from_last_stream_tex
     assert s.should_emit_final_result("different final summary") is True
 
 
+async def test_should_emit_final_result_false_when_same_as_earlier_stream_text():
+    from claude_agent_sdk.types import TextBlock
+
+    s = RouterSession(cwd="/tmp")
+    msg1 = MagicMock()
+    msg1.content = [TextBlock(text="first summary")]
+    await s._forward_progress(msg1)
+    msg2 = MagicMock()
+    msg2.content = [TextBlock(text="second summary")]
+    await s._forward_progress(msg2)
+
+    assert s.should_emit_final_result("first summary") is False
+
+
 # ── Session resume ───────────────────────────────────────────────────────
 
 

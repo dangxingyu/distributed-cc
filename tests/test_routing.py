@@ -723,6 +723,47 @@ async def test_load_config_orchestrators_takes_precedence(tmp_path):
     assert "old-srv" not in router._orchestrators
 
 
+async def test_load_config_projects_schema_resolves_machine_and_server(tmp_path):
+    """_load_config reads split machines/projects schema and backfills servers."""
+    config = {
+        "orchestrator": {
+            "model": "claude-opus-4-6",
+            "session_model": "claude-sonnet-4-6",
+            "permission_mode": "acceptEdits",
+        },
+        "machines": [
+            {"name": "della-gpu", "host": "user@della", "broker_port": 8203},
+        ],
+        "servers": [
+            {"name": "local", "host": None, "work_dir": "/tmp/local", "broker_port": 8200},
+        ],
+        "projects": [
+            {"project_id": "ftgs", "machine": "della-gpu", "work_dir": "/scratch/ftgs"},
+            {"project_id": "local-proj", "server": "local", "work_dir": "/tmp/local-proj"},
+        ],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    router = Router(cwd=str(tmp_path))
+    router._load_config()
+
+    ftgs = router._orchestrators["ftgs"]
+    assert ftgs.host == "user@della"
+    assert ftgs.broker_port == 8203
+    assert ftgs.project_dir == "/scratch/ftgs"
+    assert ftgs.model == "claude-opus-4-6"
+    assert ftgs.session_model == "claude-sonnet-4-6"
+    assert ftgs.permission_mode == "acceptEdits"
+
+    local_proj = router._orchestrators["local-proj"]
+    assert local_proj.host is None
+    assert local_proj.broker_port == 8200
+    assert local_proj.project_dir == "/tmp/local-proj"
+
+    # Server remains directly connectable unless shadowed by a project_id.
+    assert "local" in router._orchestrators
+
+
 async def test_load_config_missing_file(tmp_path):
     """Missing config.json is handled gracefully."""
     router = Router(cwd=str(tmp_path))
@@ -1050,3 +1091,67 @@ async def test_router_sessions_are_per_channel():
         # Each call has the correct chat_id
         assert mock_setup.call_args_list[0][0][0] == 1
         assert mock_setup.call_args_list[1][0][0] == 2
+
+
+async def test_router_typing_token_emitted_for_start_and_stop(tmp_path):
+    (tmp_path / "config.json").write_text('{"servers": []}')
+    router = Router(cwd=str(tmp_path))
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            return "done"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return False
+
+    typing_events = []
+
+    async def send_typing(active: bool, sender: str = "router", token: str | None = None):
+        typing_events.append((active, sender, token))
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(1, "/setup", AsyncMock(), AsyncMock(), send_typing)
+        await router._router_tasks[1]
+
+    assert len(typing_events) == 2
+    assert typing_events[0][0] is True
+    assert typing_events[1][0] is False
+    assert typing_events[0][1] == "router"
+    assert typing_events[1][1] == "router"
+    assert typing_events[0][2] == typing_events[1][2]
+    assert isinstance(typing_events[0][2], str) and typing_events[0][2].startswith("router-")
+
+
+async def test_router_typing_compat_with_two_arg_callback(tmp_path):
+    (tmp_path / "config.json").write_text('{"servers": []}')
+    router = Router(cwd=str(tmp_path))
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            return "done"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return False
+
+    typing_events = []
+
+    async def send_typing(active: bool, sender: str = "router"):
+        typing_events.append((active, sender))
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(1, "/setup", AsyncMock(), AsyncMock(), send_typing)
+        await router._router_tasks[1]
+
+    assert typing_events == [(True, "router"), (False, "router")]

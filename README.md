@@ -1,50 +1,33 @@
 # Distributed Claude Code
 
-Run Claude Code across multiple machines from one local control chat (Web UI or Telegram bot).
+<p align="center">
+  <img src="docs/assets/distributed-cc-logo.jpeg" alt="Distributed Claude Code logo" width="720" />
+</p>
 
-It gives you:
-- One local frontend:
-  - Web UI on your laptop (`http://localhost:8080`), or
-  - Telegram bot in a group/private chat
-- One daemon per server (`:8200`)
-- Two agent roles per task on each daemon:
-  - **Orchestrator** — PhD-student-level researcher: plans, investigates, reviews, decides
-  - **Worker** — implementation agent: executes assignments with full tool access
+*Work as an advisor!* Run Claude Code across multiple servers from one local chat interface (Web UI or Telegram), with a persistent **Orchestrator + Worker** architecture.
 
-The orchestrator maintains two persistent artifacts per project:
-- `task_list.md` — research plan (overwritten on update)
-- `LOG.md` — lab notebook (append-only record of hypotheses, findings, decisions)
+## Why This Exists
 
-The daemon also runs a heartbeat watchdog:
-- If no progress events are emitted for a while, it queues a system nudge to keep
-  orchestration active.
-- If GPU cards look idle (`nvidia-smi`), the nudge includes a reminder to schedule
-  GPU-bound worker tasks.
-- When a project is resting (`done`/`idle`), a slower standby heartbeat can
-  wake the orchestrator for a lightweight triage pass only when there is a
-  meaningful signal (for example, unchecked `task_list.md` items or queued
-  advisor messages).
-  Default standby cadence is ~30 minutes (`STANDBY_HEARTBEAT_SECONDS=1800`).
+Distributed Claude Code is optimized for this workflow:
 
-## What You Type vs What Happens
+1. Humans should not manually track 10+ concurrent sessions.
+2. The orchestrator should keep progress moving autonomously, while the user gives high-level advice and course corrections.
 
-```text
-You (web UI) -> Router (local) -> Daemon (remote)
-                               -> Orchestrator (plans, uses MCP tools)
-                               -> Worker assignment via assign_worker tool
-                               -> Worker report via submit_report tool
-                               -> Continue autonomously (continuous_mode=true) until /stop or task_complete
-```
+Core model:
 
-The Web UI shows:
-- Chat panel: orchestrator/worker exchanges and status updates
-- Monitor panel: tool calls, logs, iteration progress, and task list
+- **Router** (local): message routing + setup/sysadmin helper.
+- **Daemon** (remote per machine): long-lived orchestrator runtime.
+- **Orchestrator** (remote): plans, delegates, verifies, updates project memory.
+- **Worker** (remote): executes concrete assignments.
 
-Telegram mode sends orchestrator/worker messages directly into the chat and keeps logs in local persistence.
+Persistent artifacts per project:
 
-## Quick Start (10 Minutes)
+- `task_list.md`: current research/task plan
+- `LOG.md`: lab notebook (decisions, findings, pivots)
 
-### 1. Install locally
+## Quick Start (Web, Recommended)
+
+### 1. Install
 
 ```bash
 git clone https://github.com/dangxingyu/distributed-cc.git
@@ -52,7 +35,7 @@ cd distributed-cc
 uv sync --extra dev
 ```
 
-### 2. Start router + web UI (default)
+### 2. Run locally
 
 ```bash
 make run
@@ -60,116 +43,117 @@ make run
 
 Open `http://localhost:8080`.
 
-### 2b. Start router + Telegram bot
+### 3. Create your first setup channel
 
-```bash
-TELEGRAM_BOT_TOKEN=<your-token> uv run python -m src --frontend telegram
-```
+Click **+ New Setup Channel** in the sidebar.
 
-Then add the bot to a Telegram group (or DM it directly).
+- Fill `Channel name`
+- Fill `Server` as `user@host`
+- Click `Create + setup`
 
-### 3. Set up a server from the UI
+The UI sends `/setup user@host` automatically.
 
-In chat, run:
+### 4. Complete project setup
 
-```text
-/setup user@your-server
-```
-
-The setup agent will:
-- SSH into the server
-- install daemon dependencies
-- create/update `work_dir/CLAUDE.md` with environment notes
-- update local `config.json`
-- auto-start/refresh local SSH tunnel in background (default)
-
-Use follow-up messages to provide context (conda path, project path, cluster constraints).
-
-### 4. Confirm SSH tunnel(s)
-
-By default, `/setup user@host` now attempts to start the tunnel for you.
-
-If you want manual mode, run:
+After machine setup finishes, continue with:
 
 ```text
-/setup user@your-server --manual-tunnel
+/setup-project <workdir or instruction>
 ```
 
-Manual tunnel command (one per server):
+This step creates/updates one project entry and gives you `/connect <project-id>`.
 
-```bash
-ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@your-server
-```
-
-- `-L` exposes remote daemon locally
-- `-R` allows daemon progress callbacks back to your laptop
-
-### 5. Connect a channel and run a task
+### 5. Connect and run work
 
 ```text
-/connect my-project
-Investigate why training loss plateaus; maybe reward hacking.
+/connect <project-id>
+Investigate why training loss plateaus and propose a fix.
 ```
+
+## Setup Model (Important)
+
+### `/setup` = machine setup only
+
+`/setup user@host` handles server infrastructure only:
+
+- daemon deployment/start
+- local tunnel wiring
+- machine-level entry update in `config.json`
+
+It **must not** set project workdirs or project CLAUDE memory.
+
+### `/setup-project` = project setup only
+
+`/setup-project ...` handles project configuration only:
+
+- resolve concrete workdir
+- create/update one project entry
+- prepare project memory files in the workdir
+- verify health on selected broker port
 
 ## Core Commands
 
 | Command | Purpose |
 |---|---|
-| `/connect <project-id>` | Connect current channel to a project |
+| `/connect <project-id>` | Connect current channel to one project |
 | `/connect` | Show current connection |
-| `/status` | Show daemon/task status |
-| `/stop` | Stop current running task (router or orchestrator) |
-| `/setup <user@host> [--full\|--manual-tunnel]` | Interactive server setup via router (default auto-tunnel) |
-| `/setup` | Health check configured servers |
-| `/setup-project <workdir or instruction>` | Add/update one project entry (reuses existing machine when possible) |
-| `/setup_project <workdir or instruction>` | Telegram-friendly alias of `/setup-project` |
+| `/status` | Show current project/daemon status |
+| `/stop` | Stop current running router/orchestrator task |
+| `/setup <user@host> [--manual-tunnel]` | Machine setup (daemon + tunnel) |
+| `/setup` | Health-check configured machine endpoints |
+| `/setup-project <workdir or instruction>` | Project setup on an existing machine |
+| `/setup_project <workdir or instruction>` | Telegram-friendly alias |
 
-### Mentions (always work)
+Mentions:
 
-| You send | Behavior |
-|---|---|
-| `@router <msg>` | Direct message to the router (sysadmin) |
-| `@orchestrator <msg>` | Direct message to orchestrator (urgent interrupt if running) |
+- `@router ...`: direct router/sysadmin message
+- `@orchestrator ...`: urgent message to running orchestrator
 
-### Routing without mentions
+## Routing Behavior
 
-| Channel state | Plain message goes to |
-|---|---|
-| No project connected | Router (sysadmin brain) |
-| Project connected, idle | Orchestrator (starts new task) |
-| Project connected, running | Queued as next task (non-urgent guidance) |
+Without mentions:
 
-Interruption levels while running:
-- Plain channel message: non-urgent guidance (buffered as next-task context)
-- `@orchestrator ...`: urgent interrupt (`urgency=urgent`)
+- No project connected: message goes to **Router**
+- Project connected + idle: message starts new orchestrator task
+- Project connected + running: message is queued as non-urgent next-task context
 
-## Daemon HTTP API (Quick Reference)
+Urgency while running:
 
-| Endpoint | Notes |
-|---|---|
-| `POST /task` | Supports `max_iterations` (set `0` for unlimited worker-assignment cap), `continuous_mode` (default `true`), `model`, `session_model`, and `permission_mode` |
-| `POST /interrupt` | Supports `urgency`: `normal` (default) or `urgent` |
+- Plain message: non-urgent guidance
+- `@orchestrator ...`: urgent interruption
+
+## Heartbeat Behavior
+
+There are two heartbeat modes:
+
+1. **Running heartbeat**: if progress stalls, daemon queues a nudge.
+2. **Standby heartbeat**: while `done/idle`, daemon can wake orchestrator for lightweight triage only when meaningful signals exist (for example queued advisor messages or unchecked `task_list.md` items).
+
+Defaults:
+
+- `HEARTBEAT_INTERVAL_SECONDS=45`
+- `HEARTBEAT_IDLE_SECONDS=180`
+- `STANDBY_HEARTBEAT_SECONDS=1800` (~30 minutes)
+- `STANDBY_WAKE_MAX_ITERATIONS=1`
 
 ## Configuration
 
-The router reads `config.json` at startup.
+Start from template:
 
-Current common format:
+```bash
+cp config.example.json config.json
+```
+
+Common config shape:
 
 ```json
 {
   "servers": [
     {
-      "name": "h100",
+      "name": "proj-a",
       "host": "ubuntu@host-or-ip",
-      "work_dir": "/home/ubuntu/project",
+      "work_dir": "/home/ubuntu/project-a",
       "broker_port": 8201
-    },
-    {
-      "name": "local",
-      "host": null,
-      "work_dir": "/Users/you/project",
-      "broker_port": 8200
     }
   ],
   "orchestrator": {
@@ -180,28 +164,31 @@ Current common format:
 }
 ```
 
-Field meanings:
-- `name`: project ID used by `/connect`
-- `host`: SSH destination, or `null` for local
-- `work_dir`: project directory on that machine
-- `broker_port`: local forwarded port that maps to remote `:8200`
-- `max_iterations` (optional): worker-assignment cap (`0` means no cap, default)
-- `orchestrator.model` (optional): model for new orchestrator turns
-- `orchestrator.session_model` (optional): model for resumed orchestrator sessions and worker turns
-- `orchestrator.permission_mode` (optional): Claude Code permission policy
-  (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
+Field notes:
 
-Start from:
+- `servers[].name`: project id used by `/connect`
+- `servers[].host`: SSH destination (`null` for local)
+- `servers[].work_dir`: project root on target machine
+- `servers[].broker_port`: local forwarded port to daemon `:8200`
+- `orchestrator.*`: default daemon runtime model/policy
+
+`config.json` is local-only. Never commit real hosts/tokens.
+
+## Telegram Mode
+
+Run:
 
 ```bash
-cp config.example.json config.json
+TELEGRAM_BOT_TOKEN=<token> uv run python -m src --frontend telegram
 ```
 
-`config.json` is intentionally local-only (gitignored). Keep real hosts/tokens there, never in committed files.
+Then add the bot to a group or DM it directly.
 
-## Manual Setup (If You Skip `/setup`)
+## Manual Daemon Setup (Optional)
 
-On remote server:
+Only needed if you do not use `/setup`.
+
+Remote server:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -211,42 +198,36 @@ ssh user@server "cd ~/.distributed-cc && uv venv .venv && uv pip install --pytho
 ssh user@server "tmux new-session -d -s daemon '~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py --port 8200 --name server-a --callback-url http://127.0.0.1:9120'"
 ```
 
-From laptop:
+Local laptop:
 
 ```bash
 ssh -N -L 8201:localhost:8200 -R 9120:localhost:9120 user@server
 curl http://127.0.0.1:8201/health
 ```
 
-Prerequisite on each remote machine:
-- Claude Code CLI installed and authenticated
-
 ## Troubleshooting
 
 ### Router cannot reach daemon
-- Confirm tunnel is active:
-  - `curl http://127.0.0.1:<broker_port>/health`
-- Check daemon process on server:
-  - `tmux ls`
-  - daemon running with `~/.distributed-cc/.venv/bin/python3`
 
-### No progress events in UI
-- Check reverse tunnel (`-R 9120:localhost:9120`) is present
-- Verify local callback server is up (router running)
+- Check tunnel health: `curl http://127.0.0.1:<broker_port>/health`
+- Check daemon process remotely (`tmux ls`)
 
-### Telegram bot receives no group messages
-- Disable bot privacy mode in BotFather, or mention the bot in commands (e.g. `/connect@your_bot proj-a`)
+### No progress in UI
 
-### `/connect <id>` says unknown project
-- Confirm `config.json` has matching `servers[].name`
-- Restart router after config changes
+- Verify reverse tunnel `-R 9120:localhost:9120`
+- Confirm router process is running locally
+
+### `/connect <id>` unknown project
+
+- Confirm `config.json` has that `servers[].name`
+- Restart router after config edits
 
 ## Testing
 
 ```bash
-make test      # unit/integration tests (no paid API calls)
-make test-e2e  # real Claude API calls (costs money)
-make test-e2e E2E_JOBS=4  # parallel E2E workers via pytest-xdist
+make test
+make test-e2e
+make test-e2e E2E_JOBS=4
 ```
 
 ## Project Layout
@@ -254,27 +235,27 @@ make test-e2e E2E_JOBS=4  # parallel E2E workers via pytest-xdist
 ```text
 src/
   main.py            entrypoint (router + frontend + callback server)
-  router.py          command routing, daemon IO, status, queueing
-  router_session.py  local sysadmin Claude session (@router, /setup)
-  web.py             HTTP/WebSocket chat backend
-  telegram_chat.py   Telegram bot chat backend (long polling)
+  router.py          routing, daemon IO, queueing
+  router_session.py  local setup/sysadmin Claude session
+  web.py             HTTP/WebSocket backend
+  telegram_chat.py   Telegram backend
   store.py           JSON persistence
-  static/
-    index.html       frontend
+  static/index.html  Web UI
 
 tools/
-  orchestrator_daemon.py  remote daemon (orchestrator + worker MCP tools)
-  deploy.sh               helper to copy/install daemon remotely
-  start_tunnels.sh        helper for SSH tunnels
+  orchestrator_daemon.py  remote daemon runtime
+  deploy.sh               deploy helper
+  start_tunnels.sh        tunnel helper
 
 docs/
-  message-flow.md       event routing and message classification
-  broker-guide.md       daemon deployment and operations
-  design-philosophy.md  architecture rationale
+  design-philosophy.md
+  message-flow.md
+  broker-guide.md
+  native-prompts.md
 ```
 
 ## Requirements
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on each remote server
+- Claude Code CLI on remote machines

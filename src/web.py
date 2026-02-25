@@ -335,10 +335,11 @@ class WebChat:
                 await self._store.add_log(channel_id, msg)
                 await self._ws_send_to_channel(channel_id, {"type": "log", "text": msg, "ts": ts})
 
-            async def send_typing(active: bool, sender: str = "router"):
-                await self._ws_send_to_channel(channel_id, {
-                    "type": "typing", "active": active, "sender": sender,
-                })
+            async def send_typing(active: bool, sender: str = "router", token: str | None = None):
+                payload = {"type": "typing", "active": active, "sender": sender}
+                if token:
+                    payload["token"] = token
+                await self._ws_send_to_channel(channel_id, payload)
 
             async def _route_message():
                 try:

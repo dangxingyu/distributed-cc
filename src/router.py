@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 
@@ -101,6 +102,7 @@ class Router:
 
         Supports both:
           - new schema: {"orchestrators": [{project_id, name, project_dir, ...}]}
+          - split schema: {"machines": [...], "projects": [...]}
           - legacy schema: {"servers": [{name, work_dir, ...}]}
         """
         config_path = os.path.join(self._cwd, "config.json")
@@ -117,6 +119,12 @@ class Router:
         default_session_model = str(orch_cfg.get("session_model", "")).strip()
         default_permission_mode = str(orch_cfg.get("permission_mode", "")).strip()
 
+        def _as_int(value, fallback: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return fallback
+
         orchestrators = cfg.get("orchestrators")
         if orchestrators:
             for o in orchestrators:
@@ -127,9 +135,9 @@ class Router:
                     project_id=project_id,
                     name=o.get("name", project_id),
                     host=o.get("host"),
-                    broker_port=o.get("broker_port", 8200),
+                    broker_port=_as_int(o.get("broker_port", 8200), 8200),
                     project_dir=o.get("project_dir", ""),
-                    max_iterations=o.get("max_iterations", 0),
+                    max_iterations=_as_int(o.get("max_iterations", 0), 0),
                     model=str(o.get("model", default_model)).strip(),
                     session_model=str(o.get("session_model", default_session_model)).strip(),
                     permission_mode=str(o.get("permission_mode", default_permission_mode)).strip(),
@@ -137,7 +145,88 @@ class Router:
                 self._orchestrators[project_id] = orch
             return
 
-        for s in cfg.get("servers", []):
+        servers = cfg.get("servers", [])
+        machines = cfg.get("machines", [])
+        projects = cfg.get("projects", [])
+
+        # Split schema: project-level entries resolve machine/server connectivity.
+        if projects:
+            machines_by_name: dict[str, dict] = {}
+            for m in machines:
+                name = str(m.get("name", "")).strip()
+                if name:
+                    machines_by_name[name] = m
+
+            servers_by_name: dict[str, dict] = {}
+            for s in servers:
+                name = str(s.get("name", "")).strip()
+                if name:
+                    servers_by_name[name] = s
+
+            for p in projects:
+                project_id = str(p.get("project_id", "")).strip()
+                if not project_id:
+                    continue
+
+                machine_name = str(p.get("machine", "")).strip()
+                server_name = str(p.get("server", "")).strip()
+                machine_ref = machines_by_name.get(machine_name) if machine_name else None
+                server_ref = servers_by_name.get(server_name) if server_name else None
+                base = machine_ref or server_ref or {}
+
+                host = p.get("host", base.get("host"))
+                broker_port = _as_int(p.get("broker_port", base.get("broker_port", 8200)), 8200)
+                project_dir = str(
+                    p.get(
+                        "work_dir",
+                        p.get("project_dir", base.get("work_dir", base.get("project_dir", ""))),
+                    )
+                )
+                max_iterations = _as_int(p.get("max_iterations", base.get("max_iterations", 0)), 0)
+                model = str(p.get("model", base.get("model", default_model))).strip()
+                session_model = str(
+                    p.get("session_model", base.get("session_model", default_session_model))
+                ).strip()
+                permission_mode = str(
+                    p.get("permission_mode", base.get("permission_mode", default_permission_mode))
+                ).strip()
+
+                orch = RemoteOrchestrator(
+                    project_id=project_id,
+                    name=str(p.get("name", project_id)),
+                    host=host,
+                    broker_port=broker_port,
+                    project_dir=project_dir,
+                    max_iterations=max_iterations,
+                    model=model,
+                    session_model=session_model,
+                    permission_mode=permission_mode,
+                )
+                self._orchestrators[project_id] = orch
+
+            # Keep plain server entries connectable unless shadowed by project_id.
+            for s in servers:
+                name = str(s.get("name", "")).strip()
+                if not name:
+                    continue
+                project_id = str(s.get("project_id", name))
+                if project_id in self._orchestrators:
+                    continue
+                orch = RemoteOrchestrator(
+                    project_id=project_id,
+                    name=str(s.get("name", project_id)),
+                    host=s.get("host"),
+                    broker_port=_as_int(s.get("broker_port", 8200), 8200),
+                    project_dir=str(s.get("work_dir", s.get("project_dir", ""))),
+                    max_iterations=_as_int(s.get("max_iterations", 0), 0),
+                    model=str(s.get("model", default_model)).strip(),
+                    session_model=str(s.get("session_model", default_session_model)).strip(),
+                    permission_mode=str(s.get("permission_mode", default_permission_mode)).strip(),
+                )
+                self._orchestrators[project_id] = orch
+            return
+
+        for s in servers:
             name = s.get("name")
             if not name:
                 continue
@@ -146,9 +235,9 @@ class Router:
                 project_id=project_id,
                 name=s.get("name", project_id),
                 host=s.get("host"),
-                broker_port=s.get("broker_port", 8200),
+                broker_port=_as_int(s.get("broker_port", 8200), 8200),
                 project_dir=s.get("work_dir", s.get("project_dir", "")),
-                max_iterations=s.get("max_iterations", 0),
+                max_iterations=_as_int(s.get("max_iterations", 0), 0),
                 model=str(s.get("model", default_model)).strip(),
                 session_model=str(s.get("session_model", default_session_model)).strip(),
                 permission_mode=str(s.get("permission_mode", default_permission_mode)).strip(),
@@ -803,6 +892,24 @@ class Router:
 
     # -- router session ------------------------------------------------
 
+    async def _safe_send_typing(
+        self,
+        send_typing,
+        active: bool,
+        sender: str = "router",
+        token: str | None = None,
+    ):
+        if not send_typing:
+            return
+        try:
+            if token:
+                await send_typing(active, sender, token)
+            else:
+                await send_typing(active, sender)
+        except TypeError:
+            # Backward compatibility with callbacks that only accept (active, sender).
+            await send_typing(active, sender)
+
     async def _handle_router_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None, send_typing: callable = None):
         if chat_id not in self._router_sessions:
             self._router_sessions[chat_id] = RouterSession(cwd=self._cwd)
@@ -904,20 +1011,21 @@ class Router:
         else:
             prompt = stripped
 
+        typing_token = f"router-{uuid.uuid4().hex}"
+
         async def _run():
-            if send_typing:
-                await send_typing(True, "router")
+            await self._safe_send_typing(send_typing, True, "router", typing_token)
             try:
                 result = await session.run(prompt)
+                # Reload config before announcing completion so immediate /connect sees new projects.
+                self.reload_config()
                 if session.should_emit_final_result(result):
                     await setup_reply(result)
-                self.reload_config()
             except Exception as e:
                 log.exception("Router session error: %s", e)
                 await send_reply(f"Router error: {e}", sender="system")
             finally:
-                if send_typing:
-                    await send_typing(False, "router")
+                await self._safe_send_typing(send_typing, False, "router", typing_token)
 
         # Cancel any in-flight setup task for this channel before starting a new one
         old_task = self._router_tasks.get(chat_id)

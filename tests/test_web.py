@@ -346,6 +346,43 @@ async def test_ws_message_broadcasts_reply_to_same_channel_viewers(aiohttp_clien
     await store.close()
 
 
+async def test_ws_typing_event_includes_token(aiohttp_client):
+    client, _, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("typing-token")
+    await router.connect_channel(ch_id, "test-proj")
+
+    async def mock_route(chat_id, text, send_reply, send_log=None, send_typing=None):
+        await send_typing(True, "router", "router-token-1")
+        await send_typing(False, "router", "router-token-1")
+
+    router.route_message = mock_route
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await ws.send_json({"type": "message", "text": "trigger typing"})
+
+    typing_events = []
+    for _ in range(4):
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        if msg.get("type") == "typing":
+            typing_events.append(msg)
+        if len(typing_events) == 2:
+            break
+
+    assert len(typing_events) == 2
+    assert typing_events[0]["active"] is True
+    assert typing_events[1]["active"] is False
+    assert typing_events[0]["sender"] == "router"
+    assert typing_events[1]["sender"] == "router"
+    assert typing_events[0]["token"] == "router-token-1"
+    assert typing_events[1]["token"] == "router-token-1"
+
+    await ws.close()
+    await store.close()
+
+
 async def test_progress_persists_for_inactive_channel(aiohttp_client):
     client, web_chat, router, store = await _make_web(aiohttp_client)
 

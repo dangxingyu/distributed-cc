@@ -1199,6 +1199,43 @@ body::after {
   font-family: var(--font-display);
 }
 
+#monitor-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#monitor-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.monitor-tool-btn {
+  border: 1px solid #cbb289;
+  background: rgba(255, 252, 244, 0.9);
+  color: #4f6059;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.monitor-tool-btn:hover {
+  background: #fff8eb;
+  color: var(--text-primary);
+  border-color: #b89967;
+}
+
+.monitor-tool-btn.active {
+  background: rgba(31, 111, 139, 0.14);
+  color: var(--blue);
+  border-color: rgba(31, 111, 139, 0.38);
+}
+
 #monitor-close {
   background: none;
   border: none;
@@ -1297,28 +1334,27 @@ body::after {
 #monitor-log {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 0;
+  padding: 8px 8px 10px;
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
 }
 
 .log-entry {
-  padding: 4px 14px;
+  padding: 6px 8px;
   word-break: break-word;
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  border-left: 2px solid transparent;
-  transition: background 0.08s ease;
+  border-left: 3px solid transparent;
+  border-radius: 8px;
+  background: rgba(255, 252, 246, 0.74);
+  transition: background 0.08s ease, border-color 0.12s ease;
+  margin-bottom: 5px;
 }
 
 .log-entry:hover {
-  background: rgba(255, 249, 238, 0.68);
-}
-
-.log-entry + .log-entry {
-  border-top: 1px solid rgba(171, 144, 104, 0.25);
+  background: rgba(255, 247, 233, 0.88);
 }
 
 .log-entry-tool {
@@ -1345,11 +1381,12 @@ body::after {
 
 .log-time {
   color: var(--text-muted);
-  opacity: 0.5;
+  opacity: 0.7;
   font-size: 10px;
   flex-shrink: 0;
   padding-top: 1px;
-  min-width: 58px;
+  min-width: 62px;
+  font-family: var(--font-mono);
 }
 
 .log-source {
@@ -1386,8 +1423,9 @@ body::after {
 .log-content {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
 }
 
 #monitor-btn {
@@ -1430,6 +1468,11 @@ body::after {
     width: min(90vw, 420px);
     border-left: 1px solid rgba(158, 127, 76, 0.25);
     transform: translateX(101%);
+  }
+
+  .monitor-tool-btn {
+    padding: 4px 7px;
+    font-size: 10px;
   }
 }
 
@@ -1540,6 +1583,23 @@ body::after {
   .new-channel-actions button {
     width: 100%;
   }
+
+  #monitor-header {
+    padding: 11px 12px;
+  }
+
+  #monitor-header-right {
+    gap: 6px;
+  }
+
+  #monitor-tools {
+    gap: 4px;
+  }
+
+  .monitor-tool-btn {
+    padding: 4px 6px;
+    font-size: 9.5px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1621,7 +1681,13 @@ body::after {
 <div id="monitor" class="monitor-closed">
   <div id="monitor-header">
     <h2>Monitor</h2>
-    <button id="monitor-close" onclick="toggleMonitor()">&times;</button>
+    <div id="monitor-header-right">
+      <div id="monitor-tools">
+        <button id="monitor-autoscroll-btn" class="monitor-tool-btn active" type="button">Auto-scroll</button>
+        <button id="monitor-clear-btn" class="monitor-tool-btn" type="button">Clear</button>
+      </div>
+      <button id="monitor-close" onclick="toggleMonitor()">&times;</button>
+    </div>
   </div>
   <div id="task-list-panel">
     <div id="task-list-toggle" onclick="toggleTaskList()">
@@ -1682,6 +1748,8 @@ const membersPopover = document.getElementById('members-popover');
 const monitorEl = document.getElementById('monitor');
 const monitorLog = document.getElementById('monitor-log');
 const monitorBtn = document.getElementById('monitor-btn');
+const monitorAutoscrollBtn = document.getElementById('monitor-autoscroll-btn');
+const monitorClearBtn = document.getElementById('monitor-clear-btn');
 const typingIndicator = document.getElementById('typing-indicator');
 const projectBadge = document.getElementById('project-badge');
 const setupProgressEl = document.getElementById('setup-progress');
@@ -1699,11 +1767,13 @@ let currentProjectStatus = 'unknown';
 let currentIteration = 0;
 let setupNotes = '';
 let routerTypingActive = false;
+const routerTypingTokens = new Set();
 let pendingAutoSetup = null;
 let newChannelModalBusy = false;
 let lastWsMessageAt = 0;
 let wsWatchdogTimer = null;
 let pendingSwitchAck = null;
+let monitorAutoScroll = true;
 const pendingUserMessages = new Map();
 const requestScopes = {
   history: { token: 0, controller: null },
@@ -2262,6 +2332,7 @@ function deleteChannel(channelId, name) {
         currentProjectStatus = 'unknown';
         currentIteration = 0;
         routerTypingActive = false;
+        routerTypingTokens.clear();
         channelTitle.textContent = 'distributed-cc';
         refreshConversationVisibility(false);
         membersBtn.style.display = 'none';
@@ -2313,6 +2384,7 @@ function onChannelSwitched(data) {
   currentProjectStatus = data.project_status || 'unknown';
   currentIteration = 0;
   routerTypingActive = false;
+  routerTypingTokens.clear();
   localStorage.setItem('dcc_active_channel', String(activeChannel));
   resetTypingIndicator();
 
@@ -2708,6 +2780,9 @@ function loadLogs(channelId, req = beginScopedRequest('logs')) {
       for (const entry of logs) {
         addLogEntry(entry.text, entry.ts);
       }
+      if (monitorAutoScroll) {
+        scrollMonitorToBottom();
+      }
     })
     .catch((err) => {
       if (err && err.name === 'AbortError') return;
@@ -2734,6 +2809,22 @@ function toggleMonitor() {
 }
 
 let _monitorScrollPending = false;
+
+function isMonitorNearBottom() {
+  const threshold = 24;
+  const remaining = monitorLog.scrollHeight - monitorLog.scrollTop - monitorLog.clientHeight;
+  return remaining <= threshold;
+}
+
+function setMonitorAutoScroll(enabled) {
+  monitorAutoScroll = !!enabled;
+  monitorAutoscrollBtn.classList.toggle('active', monitorAutoScroll);
+  monitorAutoscrollBtn.textContent = monitorAutoScroll ? 'Auto-scroll' : 'Auto-scroll off';
+}
+
+function scrollMonitorToBottom() {
+  monitorLog.scrollTop = monitorLog.scrollHeight;
+}
 
 function addLogEntry(text, ts) {
   const entry = document.createElement('div');
@@ -2820,14 +2911,37 @@ function addLogEntry(text, ts) {
 
   monitorLog.appendChild(entry);
 
-  if (!_monitorScrollPending) {
+  if (monitorAutoScroll && !_monitorScrollPending) {
     _monitorScrollPending = true;
     requestAnimationFrame(() => {
-      monitorLog.scrollTop = monitorLog.scrollHeight;
+      scrollMonitorToBottom();
       _monitorScrollPending = false;
     });
   }
 }
+
+monitorAutoscrollBtn.addEventListener('click', function() {
+  setMonitorAutoScroll(!monitorAutoScroll);
+  if (monitorAutoScroll) {
+    scrollMonitorToBottom();
+  }
+});
+
+monitorClearBtn.addEventListener('click', function() {
+  monitorLog.innerHTML = '';
+});
+
+monitorLog.addEventListener('scroll', function() {
+  if (isMonitorNearBottom()) {
+    if (!monitorAutoScroll) {
+      setMonitorAutoScroll(true);
+    }
+  } else if (monitorAutoScroll) {
+    setMonitorAutoScroll(false);
+  }
+});
+
+setMonitorAutoScroll(true);
 
 // ── Task list panel ─────────────────────────────────────────────────
 
@@ -3176,6 +3290,7 @@ function connect() {
     stopWsWatchdog();
     clearPendingSwitchAck();
     routerTypingActive = false;
+    routerTypingTokens.clear();
     resetTypingIndicator();
     const pendingIds = Array.from(pendingUserMessages.keys());
     for (const id of pendingIds) {
@@ -3288,13 +3403,21 @@ function connect() {
 
     } else if (data.type === 'typing') {
       const sender = data.sender || 'orchestrator';
+      const token = typeof data.token === 'string' ? data.token : '';
       if (data.active) {
-        if (sender === 'router') {
+        if (sender === 'router' && token) {
+          routerTypingTokens.add(token);
+          routerTypingActive = routerTypingTokens.size > 0;
+        } else if (sender === 'router') {
           routerTypingActive = true;
         }
         showTypingIndicator(sender);
       } else {
-        if (sender === 'router') {
+        if (sender === 'router' && token) {
+          routerTypingTokens.delete(token);
+          routerTypingActive = routerTypingTokens.size > 0;
+        } else if (sender === 'router') {
+          routerTypingTokens.clear();
           routerTypingActive = false;
         }
         if (routerTypingActive) {

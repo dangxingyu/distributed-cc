@@ -39,6 +39,11 @@ def _resolve_permission_mode(value: str | None, default: str = "bypassPermission
     return default
 
 
+def _normalize_assistant_text(text: str) -> str:
+    """Normalize assistant text for duplicate suppression."""
+    return "\n".join(line.rstrip() for line in (text or "").strip().splitlines()).strip()
+
+
 def _install_sdk_event_compat() -> None:
     """Treat unknown CLI *_event payloads as SystemMessage to avoid stream aborts."""
     try:
@@ -344,6 +349,7 @@ class RouterSession:
         self._log_callback: callable | None = None
         self._last_stream_text: str = ""
         self._saw_stream_text: bool = False
+        self._stream_text_fingerprints: set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -375,6 +381,7 @@ class RouterSession:
     async def _run_inner(self, user_message: str) -> str:
         self._last_stream_text = ""
         self._saw_stream_text = False
+        self._stream_text_fingerprints = set()
 
         options = ClaudeAgentOptions(
             permission_mode=self._permission_mode,
@@ -417,6 +424,7 @@ class RouterSession:
                 if text:
                     self._saw_stream_text = True
                     self._last_stream_text = text
+                    self._stream_text_fingerprints.add(_normalize_assistant_text(text))
                 if text and self._progress_callback:
                     try:
                         await self._progress_callback(text)
@@ -442,10 +450,12 @@ class RouterSession:
 
     def should_emit_final_result(self, result_text: str) -> bool:
         """Whether the final ResultMessage text should be surfaced to the UI."""
-        final_text = (result_text or "").strip()
+        final_text = _normalize_assistant_text(result_text or "")
         if not final_text:
             return False
-        if self._saw_stream_text and final_text == self._last_stream_text.strip():
+        if self._saw_stream_text and final_text == _normalize_assistant_text(self._last_stream_text):
+            return False
+        if final_text in self._stream_text_fingerprints:
             return False
         return True
 
