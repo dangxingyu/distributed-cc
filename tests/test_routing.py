@@ -609,6 +609,18 @@ async def test_setup_project_command_routes_to_router():
         )
 
 
+async def test_doctor_command_routes_to_router():
+    """/doctor routes to _handle_router_message."""
+    router = _make_router([])
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_router:
+        await router.route_message(1, "/doctor ftgs", send_reply, send_log)
+        mock_router.assert_called_once_with(1, "/doctor ftgs", send_reply, send_log, None)
+
+
 async def test_setup_project_prompt_enforces_workdir_and_health_gates(tmp_path):
     """Injected /setup-project template requires work_dir + writability + health checks."""
     (tmp_path / "config.json").write_text('{"servers": []}')
@@ -653,6 +665,60 @@ async def test_setup_project_prompt_enforces_workdir_and_health_gates(tmp_path):
     assert "Verify daemon health" in prompt
     assert "Response format" in prompt
     assert "READY: project_id, work_dir, host, broker_port" in prompt
+
+
+async def test_doctor_prompt_includes_channel_context(tmp_path):
+    (tmp_path / "config.json").write_text('{"servers": []}')
+    router = Router(cwd=str(tmp_path))
+    router._orchestrators["ftgs"] = RemoteOrchestrator(
+        project_id="ftgs",
+        name="della-gpu",
+        host="user@host",
+        broker_port=8203,
+        project_dir="/scratch/ftgs",
+        status="disconnected",
+    )
+    router._channel_project[1] = "ftgs"
+    router._record_channel_context(1, "daemon connect failed on ftgs")
+    router._record_channel_context(1, "please inspect tunnel and remote process")
+
+    captured_prompt = {"text": ""}
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            captured_prompt["text"] = prompt
+            return "ok"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return True
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(
+            1,
+            "/doctor verify communication path",
+            send_reply,
+            send_log,
+            None,
+        )
+        task = router._router_tasks[1]
+        await task
+
+    prompt = captured_prompt["text"]
+    assert "DOCTOR MODE (/doctor)" in prompt
+    assert "connected_project: ftgs" in prompt
+    assert "user_hint: verify communication path" in prompt
+    assert "daemon connect failed on ftgs" in prompt
+    assert "tools/doctor.py --project <project_id>" in prompt
+    assert "ROOT CAUSE" in prompt
 
 
 async def test_setup_server_prompt_is_machine_only(tmp_path):

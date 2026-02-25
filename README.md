@@ -125,6 +125,7 @@ It **must not** set project workdirs or project CLAUDE memory.
 | `/setup <user@host> [--manual-tunnel]` | Machine setup (daemon + tunnel) |
 | `/setup` | Health-check configured machine endpoints |
 | `/setup-project <workdir or instruction>` | Project setup on an existing machine |
+| `/doctor [hint]` | Diagnose daemon/tunnel/register status using channel context + config |
 | `/setup_project <workdir or instruction>` | Telegram-friendly alias |
 
 Mentions:
@@ -234,6 +235,7 @@ curl http://127.0.0.1:8201/health
 
 - Check tunnel health: `curl http://127.0.0.1:<broker_port>/health`
 - Check daemon process remotely (`tmux ls`)
+- In a channel, run `/doctor [hint]` to let Router diagnose current project/server context
 - Run systematic diagnostics (health signature + register/status probes):
   `make doctor`
   or scoped check: `make doctor DOCTOR_ARGS="--project <project-id> --timeout 3"`

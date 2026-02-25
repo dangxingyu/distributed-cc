@@ -242,6 +242,7 @@ class TelegramChat:
             "/stop\n"
             "/setup <user@host>\n"
             "/setup-project <workdir or instruction>\n"
+            "/doctor [hint]\n"
             "/setup_project <workdir or instruction> (Telegram-friendly alias)\n"
             "@router <message>\n"
             "@orchestrator <message>"

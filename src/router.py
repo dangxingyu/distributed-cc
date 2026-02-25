@@ -37,6 +37,8 @@ def _preview(text: str, limit: int = 120) -> str:
 
 DEFERRED_RETRY_INITIAL_SECONDS = 0.5
 DEFERRED_RETRY_MAX_SECONDS = 10.0
+CHANNEL_CONTEXT_HISTORY_MAX = 24
+DOCTOR_CONTEXT_MESSAGES = 10
 
 
 @dataclass
@@ -90,6 +92,7 @@ class Router:
         # Router sessions — per-channel sysadmin Claude sessions
         self._router_sessions: dict[int, RouterSession] = {}
         self._router_tasks: dict[int, asyncio.Task] = {}
+        self._channel_context_history: dict[int, deque[str]] = {}
         self._debug_flow = _env_flag("DCC_DEBUG_FLOW")
 
     async def init(self):
@@ -504,6 +507,8 @@ class Router:
 
     async def route_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None, send_typing: callable = None):
         stripped = text.strip()
+        if stripped:
+            self._record_channel_context(chat_id, stripped)
         if self._debug_flow:
             log.info(
                 "[flow] route chat=%s project=%s text=%s",
@@ -541,7 +546,7 @@ class Router:
             return
 
         # /setup* is a shorthand for @router
-        if stripped.startswith("/setup-project") or stripped.startswith("/setup"):
+        if stripped.startswith("/setup-project") or stripped.startswith("/setup") or stripped.startswith("/doctor"):
             await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
             return
 
@@ -697,6 +702,79 @@ class Router:
                 ),
             }
         return {"mode": "setup_project", "instruction": body}
+
+    def _record_channel_context(self, chat_id: int, text: str):
+        compact = " ".join((text or "").split())
+        if not compact:
+            return
+        if len(compact) > 500:
+            compact = compact[:500] + "..."
+        history = self._channel_context_history.get(chat_id)
+        if history is None:
+            history = deque(maxlen=CHANNEL_CONTEXT_HISTORY_MAX)
+            self._channel_context_history[chat_id] = history
+        history.append(compact)
+
+    def _build_doctor_prompt(self, chat_id: int, hint: str) -> str:
+        project_id = self._channel_project.get(chat_id)
+        orch = self._orchestrators.get(project_id) if project_id else None
+
+        if orch:
+            connected = (
+                f"{project_id} (name={orch.name}, host={orch.host}, broker_port={orch.broker_port}, "
+                f"project_dir={orch.project_dir}, status={orch.status})"
+            )
+        elif project_id:
+            connected = f"{project_id} (missing from current config)"
+        else:
+            connected = "(none)"
+
+        known_projects = ", ".join(sorted(self._orchestrators.keys())) or "(none)"
+        raw_history = list(self._channel_context_history.get(chat_id) or [])
+        recent = [
+            line
+            for line in raw_history
+            if not line.lower().startswith("/doctor")
+        ]
+        recent = recent[-DOCTOR_CONTEXT_MESSAGES:]
+        recent_lines = "\n".join(f"- {line}" for line in recent) if recent else "- (none)"
+
+        hint_text = hint or "(none)"
+        recommended_cmd = "uv run python tools/doctor.py --timeout 5"
+        if project_id:
+            recommended_cmd = (
+                f"uv run python tools/doctor.py --project {project_id} --timeout 5"
+            )
+
+        return (
+            "DOCTOR MODE (/doctor)\n\n"
+            "Goal: diagnose communication and remote-setup issues for this channel.\n\n"
+            "Context snapshot:\n"
+            f"- channel_id: {chat_id}\n"
+            f"- connected_project: {connected}\n"
+            f"- known_projects: {known_projects}\n"
+            f"- user_hint: {hint_text}\n"
+            "- recent_channel_messages:\n"
+            f"{recent_lines}\n\n"
+            f"Recommended first command: `{recommended_cmd}`\n\n"
+            "Workflow:\n"
+            "1) Determine target using priority: explicit user_hint > connected_project > recent messages.\n"
+            "2) Run systematic checks first with local tool:\n"
+            "   - if a project_id is known: `uv run python tools/doctor.py --project <project_id> --timeout 5`\n"
+            "   - else: `uv run python tools/doctor.py --timeout 5`\n"
+            "3) For each failing check, run focused follow-ups and classify root cause:\n"
+            "   - tunnel down / wrong broker_port mapping\n"
+            "   - wrong service on port (legacy broker or non-orchestrator daemon)\n"
+            "   - daemon process absent/crashed or remote port conflict\n"
+            "   - register/status failure from project_dir mismatch/permissions\n"
+            "4) If safe, apply minimal fixes and re-run doctor once to verify.\n"
+            "5) Return concise structured output:\n"
+            "   - TARGET\n"
+            "   - CHECK RESULTS\n"
+            "   - ROOT CAUSE\n"
+            "   - FIX APPLIED (or exact next commands)\n"
+            "   - FINAL STATUS\n"
+        )
 
     def _enqueue_deferred_task(self, project_id: str, chat_id: int, text: str) -> int:
         queue = self._deferred_tasks.setdefault(project_id, [])
@@ -1088,6 +1166,9 @@ class Router:
                     "Flag legacy/invalid payloads (for example `server` without `daemon`) as DOWN. "
                     "Return a concise table: host, broker_port, health(up/down), daemon_name, error(if any)."
                 )
+        elif stripped.startswith("/doctor"):
+            doctor_hint = stripped[len("/doctor"):].strip()
+            prompt = self._build_doctor_prompt(chat_id, doctor_hint)
         else:
             prompt = stripped
 
