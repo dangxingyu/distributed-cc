@@ -455,6 +455,42 @@ async def test_connect_unknown_project_while_router_task_running(tmp_path):
     assert "retry" in reply
 
 
+async def test_connect_command_fails_fast_when_daemon_unreachable():
+    """/connect should fail immediately if daemon health check fails."""
+    router = _make_router([RemoteOrchestrator(project_id="proj-a", name="server-a")])
+    router._http = object()
+    router.check_health = AsyncMock(return_value=False)
+    router._ensure_registered = AsyncMock(return_value=True)
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "/connect proj-a", send_reply)
+
+    assert router.get_channel_project(1) is None
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0].lower()
+    assert "cannot connect" in reply
+    assert "unreachable" in reply
+    router._ensure_registered.assert_not_called()
+
+
+async def test_connect_command_fails_when_registration_fails():
+    """/connect should fail if daemon is reachable but register fails."""
+    router = _make_router([RemoteOrchestrator(project_id="proj-a", name="server-a")])
+    router._http = object()
+    router.check_health = AsyncMock(return_value=True)
+    router._ensure_registered = AsyncMock(return_value=False)
+
+    send_reply = AsyncMock()
+    await router.route_message(1, "/connect proj-a", send_reply)
+
+    assert router.get_channel_project(1) is None
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0].lower()
+    assert "cannot connect" in reply
+    assert "registration failed" in reply
+    router._ensure_registered.assert_awaited_once()
+
+
 async def test_at_orchestrator_connect_command():
     """@orchestrator /connect proj-a normalizes to /connect."""
     router = _make_router([RemoteOrchestrator(project_id="proj-a", name="server-a")])

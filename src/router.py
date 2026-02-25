@@ -1149,8 +1149,25 @@ class Router:
                 await send_reply(f"Unknown project: `{project_id}`. Available: {available}")
             return
 
-        await self.connect_channel(chat_id, project_id)
         orch = self._orchestrators[project_id]
+        if self._http:
+            health_ok = await self.check_health(project_id)
+            if not health_ok:
+                orch.status = "disconnected"
+                await send_reply(
+                    f"Cannot connect `{project_id}`: daemon is unreachable at "
+                    f"http://127.0.0.1:{orch.broker_port}. Check tunnel/daemon, then retry."
+                )
+                return
+
+            if not await self._ensure_registered(orch):
+                await send_reply(
+                    f"Cannot connect `{project_id}`: daemon is up but project registration failed. "
+                    f"Check project_dir `{orch.project_dir}` and daemon logs, then retry."
+                )
+                return
+
+        await self.connect_channel(chat_id, project_id)
         await send_reply(f"Connected to **{orch.name}** (`{project_id}`)")
 
     def hydrate_channel_mapping(self, chat_id: int, project_id: str) -> bool:
