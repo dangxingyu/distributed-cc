@@ -85,15 +85,54 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+VALID_PERMISSION_MODES = {"default", "acceptEdits", "plan", "bypassPermissions"}
+
+
+def _normalize_permission_mode(value: str | None, default: str = "bypassPermissions") -> str:
+    candidate = str(value or "").strip()
+    if candidate in VALID_PERMISSION_MODES:
+        return candidate
+    return default
+
+
 DAEMON_NAME = os.environ.get("DAEMON_NAME", "unknown")
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
 DEFAULT_ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "claude-opus-4-6")
 DEFAULT_SESSION_MODEL = os.environ.get("ORCHESTRATOR_SESSION_MODEL", DEFAULT_ORCHESTRATOR_MODEL)
+DEFAULT_PERMISSION_MODE = _normalize_permission_mode(
+    os.environ.get("DCC_PERMISSION_MODE", "bypassPermissions"),
+    default="bypassPermissions",
+)
 DEBUG_FLOW = _env_flag("DCC_DEBUG_FLOW")
-EVENT_HISTORY_MAX = int(os.environ.get("EVENT_HISTORY_MAX", "2000"))
+EVENT_HISTORY_MAX = _env_int("EVENT_HISTORY_MAX", 2000, minimum=1)
 MAX_ITERATIONS = 0
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 INTERRUPT_QUEUE_MAX = 100
+HEARTBEAT_ENABLED = os.environ.get("HEARTBEAT_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+HEARTBEAT_INTERVAL_SECONDS = _env_int("HEARTBEAT_INTERVAL_SECONDS", 45, minimum=10)
+HEARTBEAT_IDLE_SECONDS = _env_int("HEARTBEAT_IDLE_SECONDS", 180, minimum=30)
+HEARTBEAT_GPU_HINT = os.environ.get("HEARTBEAT_GPU_HINT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+HEARTBEAT_GPU_IDLE_UTIL = _env_int("HEARTBEAT_GPU_IDLE_UTIL", 10, minimum=0)
+HEARTBEAT_GPU_IDLE_MEMORY_MB = _env_int("HEARTBEAT_GPU_IDLE_MEMORY_MB", 2048, minimum=0)
 CONTINUOUS_MODE_DEFAULT = os.environ.get("CONTINUOUS_MODE", "1").strip().lower() not in (
     "0",
     "false",
@@ -131,11 +170,13 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 1. Start: Read task_list.md and LOG.md (if they exist) to resume context.
 2. Investigate: Read files, search the codebase, understand the problem.
 3. Plan: Call update_task_list with a research-level plan.
-4. Execute: Prefer worker delegation by default for substantial implementation/investigation.
-   Use direct implementation only when it is clearly faster (small edits, quick probes,
-   tight unblockers, or orchestration glue work).
-5. Iterate: Refine based on evidence until the goal is met.
-6. Complete: Call task_complete with a summary.
+4. Execute: Delegate concrete execution to worker by default.
+   Use direct implementation only when it is clearly faster (tiny edits, quick probes,
+   or tight unblockers).
+5. Verify: Treat worker reports as claims; verify key claims with evidence
+   (diffs/tests/artifacts) before marking progress complete.
+6. Iterate: Refine based on evidence until the goal is met.
+7. Complete: Call task_complete with a summary.
 
 ## Research log (LOG.md)
 
@@ -161,20 +202,26 @@ your reasoning, see what you tried, and understand why you made each decision.
 
 - Investigate before assigning work — don't delegate blindly.
 - Worker assignments should be concrete and actionable.
-- Prefer assign_worker for most concrete execution tasks. Treat your own direct
-  implementation as the exception, not the default.
+- Prefer assign_worker for most concrete execution tasks; this is the default path.
+- Worker -> report -> orchestrator verification is the expected pipeline.
 - Use direct implementation only when delegation overhead is likely higher than
   doing it yourself immediately.
+- For Python commands, prefer uv-managed execution (`uv run ...`) or an explicit venv.
 - Pull queued user messages periodically so urgent direction is integrated quickly.
 - Keep task_list at PhD-level granularity (experiments, milestones), not micro-steps.
 - Only update worker config (.claude/roles/worker.md) when conventions genuinely change.
 - Use ask_user only for genuine blocking decisions, not routine status updates.
+- Do not write self-addressed chat text like "@orchestrator ..."; talk in direct prose.
 """
 
 
 WORKER_PROMPT = """\
 You are a WORKER agent. Execute the orchestrator assignment end-to-end.
 Focus on concrete actions and evidence.
+
+Execution environment rules:
+- Prefer uv-managed execution (`uv run ...`) or a project venv.
+- Avoid bare global `python`/`pip` when a uv/venv path is available.
 
 When finished, call the **submit_report** tool with a structured report covering:
 1. **What was done**: Specific actions, files modified, commands run
@@ -232,6 +279,7 @@ class TaskState:
     max_iterations: int = MAX_ITERATIONS
     model: str = DEFAULT_ORCHESTRATOR_MODEL
     session_model: str = DEFAULT_SESSION_MODEL
+    permission_mode: str = DEFAULT_PERMISSION_MODE
     continuous_mode: bool = CONTINUOUS_MODE_DEFAULT
     sdk_session_id: str = ""  # backward-compat alias of orchestrator_session_id
     orchestrator_session_id: str = ""
@@ -259,6 +307,9 @@ worker_prompt_hashes: dict[str, str] = {}  # project_id -> worker prompt hash
 current_worker_tasks: dict[str, asyncio.Task] = {}  # project_id -> active worker task
 callback_http_session: ClientSession | None = None
 callback_http_lock = asyncio.Lock()
+project_last_progress_ts: dict[str, float] = {}
+project_last_heartbeat_nudge_ts: dict[str, float] = {}
+heartbeat_tasks: dict[str, asyncio.Task] = {}
 
 
 def _ensure_interrupt_queue(project_id: str) -> asyncio.Queue:
@@ -369,17 +420,43 @@ def _enqueue_interrupt(
 
 
 async def _wait_for_interrupt_text(project_id: str, timeout: float) -> str:
-    """Wait for the next non-empty interrupt text."""
+    """Wait for the next non-empty USER message text.
+
+    Non-user queue payloads (e.g., heartbeat nudges) are preserved and restored.
+    """
     queue = _ensure_interrupt_queue(project_id)
     deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise asyncio.TimeoutError
-        payload = await asyncio.wait_for(queue.get(), timeout=remaining)
-        text = _interrupt_payload_text(payload)
-        if text:
-            return text
+    deferred_payloads: list[dict] = []
+    restored = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            payload = await asyncio.wait_for(queue.get(), timeout=remaining)
+            meta = _interrupt_payload_meta(payload)
+            if not meta["text"]:
+                continue
+            if meta["kind"] == "user_message":
+                for deferred in deferred_payloads:
+                    if queue.full():
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    queue.put_nowait(deferred)
+                restored = True
+                return meta["text"]
+            deferred_payloads.append(meta)
+    finally:
+        if not restored:
+            for deferred in deferred_payloads:
+                if queue.full():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                queue.put_nowait(deferred)
 
 
 # -- progress streaming ------------------------------------------------
@@ -416,6 +493,7 @@ async def emit_progress(project_id: str, event: ProgressEvent):
     """Send progress event to SSE subscribers and HTTP callback."""
     payload = _event_payload(event)
     _record_event(project_id, payload)
+    project_last_progress_ts[project_id] = event.timestamp
 
     if DEBUG_FLOW:
         log.info(
@@ -467,6 +545,142 @@ async def emit_progress(project_id: str, event: ProgressEvent):
                 event.type,
             )
         pass
+
+
+def _format_queued_messages_for_prompt(payloads: list[dict]) -> str:
+    """Render queued user/system messages as prompt context."""
+    if not payloads:
+        return ""
+    lines = [
+        "[QUEUED MESSAGES]",
+        "Integrate these messages before deciding your next action:",
+    ]
+    for idx, item in enumerate(payloads, start=1):
+        kind = item.get("kind", "user_message")
+        urgency = item.get("urgency", "normal")
+        label = urgency if kind == "user_message" else f"{kind}/{urgency}"
+        lines.append(f"{idx}. [{label}] {item.get('text', '')}")
+    return "\n".join(lines)
+
+
+async def _gpu_idle_hint(project_dir: str) -> str:
+    """Best-effort GPU utilization hint for heartbeat nudges."""
+    if not HEARTBEAT_GPU_HINT:
+        return ""
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi",
+            "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+            cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+
+    try:
+        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await proc.communicate()
+        except Exception:
+            pass
+        return ""
+    except Exception:
+        return ""
+
+    if proc.returncode != 0:
+        return ""
+
+    idle_cards: list[str] = []
+    for raw_line in stdout.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            gpu_idx = parts[0]
+            util = int(parts[1])
+            mem_used = int(parts[2])
+            mem_total = int(parts[3])
+        except ValueError:
+            continue
+        if util <= HEARTBEAT_GPU_IDLE_UTIL and mem_used <= HEARTBEAT_GPU_IDLE_MEMORY_MB:
+            idle_cards.append(f"GPU{gpu_idx} (util={util}%, mem={mem_used}/{mem_total} MiB)")
+
+    if not idle_cards:
+        return ""
+
+    return (
+        "GPU heartbeat hint: detected likely-idle cards: "
+        + "; ".join(idle_cards)
+        + ". If beneficial, schedule GPU-bound worker tasks."
+    )
+
+
+async def _maybe_enqueue_heartbeat_nudge(project_id: str, state: TaskState) -> bool:
+    """Inject a system nudge when the orchestrator has been idle too long."""
+    if state.status != "running":
+        return False
+
+    now = time.time()
+    last_progress = project_last_progress_ts.get(project_id, state.started_at)
+    idle_for = now - last_progress
+    if idle_for < HEARTBEAT_IDLE_SECONDS:
+        return False
+
+    cooldown = max(HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_IDLE_SECONDS // 2)
+    last_nudge = project_last_heartbeat_nudge_ts.get(project_id, 0.0)
+    if now - last_nudge < cooldown:
+        return False
+
+    idle_minutes = max(1, int(idle_for // 60))
+    lines = [
+        f"Heartbeat: no visible progress for ~{idle_minutes} minute(s).",
+        "Keep moving autonomously: investigate, delegate concrete execution to worker, and verify evidence.",
+        "If blocked on a true decision, call ask_user with one precise question.",
+    ]
+    project = projects.get(project_id)
+    if project:
+        gpu_hint = await _gpu_idle_hint(project.project_dir)
+        if gpu_hint:
+            lines.append(gpu_hint)
+
+    nudge_text = "\n".join(lines)
+    _enqueue_interrupt(project_id, nudge_text, kind="system_nudge", urgency="normal")
+    project_last_heartbeat_nudge_ts[project_id] = now
+    await emit_progress(
+        project_id,
+        ProgressEvent(
+            type="log_update",
+            data=f"[heartbeat] queued nudge after {int(idle_for)}s idle",
+            iteration=state.iteration,
+        ),
+    )
+    return True
+
+
+async def _heartbeat_loop(project_id: str, state: TaskState):
+    """Periodic heartbeat to nudge orchestrator when progress stalls."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        if state.status != "running":
+            break
+        if cancel_events.get(project_id, asyncio.Event()).is_set():
+            break
+        try:
+            await _maybe_enqueue_heartbeat_nudge(project_id, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("Heartbeat loop error for %s: %s", project_id, e)
 
 
 # -- agent sdk helpers -------------------------------------------------
@@ -529,6 +743,7 @@ async def _run_worker_turn(
     iteration: int,
     worker_session_id: str = "",
     model: str = DEFAULT_SESSION_MODEL,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
 ) -> tuple[str, str]:
     """Execute one worker assignment in an independent worker session."""
     project = projects.get(project_id)
@@ -552,7 +767,7 @@ async def _run_worker_turn(
     worker_prompt_hashes[project_id] = worker_prompt_hash
 
     options = ClaudeAgentOptions(
-        permission_mode="bypassPermissions",
+        permission_mode=permission_mode,
         model=model,
         cwd=project.project_dir,
         max_turns=50,
@@ -690,6 +905,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
                     iteration=state.iteration,
                     worker_session_id=worker_sid,
                     model=state.session_model or state.model,
+                    permission_mode=state.permission_mode,
                 )
             )
             current_worker_tasks[project_id] = worker_task
@@ -724,9 +940,12 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         # Append any pending user interrupts to the report
         result_text = report
         if interrupts:
-            result_text += "\n\n[USER INTERRUPTIONS]\n"
+            result_text += "\n\n[QUEUED MESSAGES]\n"
             for item in interrupts:
-                result_text += f"- ({item['urgency']}) {item['text']}\n"
+                kind = item.get("kind", "user_message")
+                urgency = item.get("urgency", "normal")
+                label = urgency if kind == "user_message" else f"{kind}/{urgency}"
+                result_text += f"- ({label}) {item['text']}\n"
 
         return {"content": [{"type": "text", "text": result_text}]}
 
@@ -925,6 +1144,7 @@ def _build_orchestrator_options(
     system_prompt: str,
     model: str,
     session_model: str,
+    permission_mode: str,
 ) -> ClaudeAgentOptions:
     if max_iterations > 0:
         max_turns = max(8, max_iterations * 8)
@@ -934,7 +1154,7 @@ def _build_orchestrator_options(
 
     active_model = session_model if session_id and session_model else model
     options = ClaudeAgentOptions(
-        permission_mode="bypassPermissions",
+        permission_mode=permission_mode,
         model=active_model,
         cwd=project_dir,
         setting_sources=["project"],  # load shared CLAUDE.md natively
@@ -955,6 +1175,7 @@ async def run_task(
     continuous_mode: bool = CONTINUOUS_MODE_DEFAULT,
     model: str = DEFAULT_ORCHESTRATOR_MODEL,
     session_model: str = DEFAULT_SESSION_MODEL,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
 ):
     """Run autonomous task with MCP tool-driven orchestrator."""
     os.environ.pop("CLAUDECODE", None)
@@ -973,6 +1194,7 @@ async def run_task(
         continuous_mode=continuous_mode,
         model=model,
         session_model=session_model or model,
+        permission_mode=_normalize_permission_mode(permission_mode, default=DEFAULT_PERMISSION_MODE),
     )
     task_states[project_id] = state
 
@@ -980,6 +1202,7 @@ async def run_task(
     if project_id not in cancel_events:
         cancel_events[project_id] = asyncio.Event()
     cancel_events[project_id].clear()
+    project_last_progress_ts[project_id] = time.time()
 
     orchestrator_session_id = orchestrator_sessions.get(project_id, "")
 
@@ -992,6 +1215,9 @@ async def run_task(
     )
 
     prompt = f"[TASK]\n{task_text}"
+    if HEARTBEAT_ENABLED:
+        hb_task = asyncio.create_task(_heartbeat_loop(project_id, state))
+        heartbeat_tasks[project_id] = hb_task
 
     try:
         next_prompt = prompt
@@ -1021,11 +1247,18 @@ async def run_task(
                 system_prompt=orchestrator_prompt,
                 model=state.model,
                 session_model=state.session_model,
+                permission_mode=state.permission_mode,
             )
             saw_result = False
+            prompt_for_turn = next_prompt
+            pending_messages = _drain_interrupt_payloads(project_id)
+            if pending_messages:
+                prompt_for_turn = (
+                    f"{next_prompt}\n\n{_format_queued_messages_for_prompt(pending_messages)}"
+                )
 
             async for message in query(
-                prompt=_prompt_stream(next_prompt, done_event), options=options
+                prompt=_prompt_stream(prompt_for_turn, done_event), options=options
             ):
                 if isinstance(message, AssistantMessage):
                     await _forward_assistant_message(
@@ -1110,7 +1343,19 @@ async def run_task(
             ProgressEvent(type="error", data=str(e), iteration=state.iteration),
         )
     finally:
+        hb_task = heartbeat_tasks.pop(project_id, None)
+        if hb_task and not hb_task.done():
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         running_tasks.pop(project_id, None)
+        project_last_progress_ts.pop(project_id, None)
+        project_last_heartbeat_nudge_ts.pop(project_id, None)
         _save_state(
             state,
             orchestrator_session_id=orchestrator_session_id,
@@ -1232,6 +1477,7 @@ def _save_state(
         "max_iterations": state.max_iterations,
         "model": state.model,
         "session_model": state.session_model,
+        "permission_mode": state.permission_mode,
         "continuous_mode": state.continuous_mode,
         "sdk_session_id": orchestrator_session_id,
         "orchestrator_session_id": orchestrator_session_id,
@@ -1312,6 +1558,10 @@ async def handle_task(request: web.Request) -> web.Response:
     continuous_mode = _parse_bool(data.get("continuous_mode"), CONTINUOUS_MODE_DEFAULT)
     model = str(data.get("model") or DEFAULT_ORCHESTRATOR_MODEL).strip() or DEFAULT_ORCHESTRATOR_MODEL
     session_model = str(data.get("session_model") or model).strip() or model
+    permission_mode = _normalize_permission_mode(
+        data.get("permission_mode"),
+        default=DEFAULT_PERMISSION_MODE,
+    )
 
     if not project_id or not task_text:
         return web.json_response({"error": "project_id and task required"}, status=400)
@@ -1347,6 +1597,7 @@ async def handle_task(request: web.Request) -> web.Response:
             continuous_mode=continuous_mode,
             model=model,
             session_model=session_model,
+            permission_mode=permission_mode,
         )
     )
     running_tasks[project_id] = task
@@ -1359,6 +1610,7 @@ async def handle_task(request: web.Request) -> web.Response:
             "continuous_mode": continuous_mode,
             "model": model,
             "session_model": session_model,
+            "permission_mode": permission_mode,
         }
     )
 
@@ -1404,6 +1656,7 @@ async def handle_status(request: web.Request) -> web.Response:
                 "max_iterations": state.max_iterations if state else MAX_ITERATIONS,
                 "model": state.model if state else DEFAULT_ORCHESTRATOR_MODEL,
                 "session_model": state.session_model if state else DEFAULT_SESSION_MODEL,
+                "permission_mode": state.permission_mode if state else DEFAULT_PERMISSION_MODE,
                 "continuous_mode": state.continuous_mode if state else CONTINUOUS_MODE_DEFAULT,
                 "summary": state.summary if state else "",
             }
@@ -1424,6 +1677,7 @@ async def handle_status(request: web.Request) -> web.Response:
             "max_iterations": state.max_iterations,
             "model": state.model,
             "session_model": state.session_model,
+            "permission_mode": state.permission_mode,
             "continuous_mode": state.continuous_mode,
             "task_text": state.task_text,
             "summary": state.summary,

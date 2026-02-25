@@ -922,7 +922,10 @@ async def test_e2e_full_stack_web_to_worker():
                     # At least one reply should show orchestrator→worker assignment
                     orch_to_worker = [
                         r for r in replies
-                        if "@orchestrator" in r.get("text", "") and "@worker" in r.get("text", "")
+                        if (
+                            ("@orchestrator" in r.get("text", "") and "@worker" in r.get("text", ""))
+                            or r.get("text", "").startswith("@worker:")
+                        )
                     ]
                     assert len(orch_to_worker) > 0, (
                         f"No orchestrator→worker assignment in chat. "

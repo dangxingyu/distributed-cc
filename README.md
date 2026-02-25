@@ -15,6 +15,12 @@ The orchestrator maintains two persistent artifacts per project:
 - `task_list.md` — research plan (overwritten on update)
 - `LOG.md` — lab notebook (append-only record of hypotheses, findings, decisions)
 
+The daemon also runs a heartbeat watchdog:
+- If no progress events are emitted for a while, it queues a system nudge to keep
+  orchestration active.
+- If GPU cards look idle (`nvidia-smi`), the nudge includes a reminder to schedule
+  GPU-bound worker tasks.
+
 ## What You Type vs What Happens
 
 ```text
@@ -68,6 +74,7 @@ In chat, run:
 The setup agent will:
 - SSH into the server
 - install daemon dependencies
+- create/update `work_dir/CLAUDE.md` with environment notes
 - update local `config.json`
 - auto-start/refresh local SSH tunnel in background (default)
 
@@ -135,7 +142,7 @@ Interruption levels while running:
 
 | Endpoint | Notes |
 |---|---|
-| `POST /task` | Supports `max_iterations` (set `0` for unlimited worker-assignment cap), `continuous_mode` (default `true`), `model`, and `session_model` |
+| `POST /task` | Supports `max_iterations` (set `0` for unlimited worker-assignment cap), `continuous_mode` (default `true`), `model`, `session_model`, and `permission_mode` |
 | `POST /interrupt` | Supports `urgency`: `normal` (default) or `urgent` |
 
 ## Configuration
@@ -162,7 +169,8 @@ Current common format:
   ],
   "orchestrator": {
     "model": "claude-opus-4-6",
-    "session_model": "claude-opus-4-6"
+    "session_model": "claude-opus-4-6",
+    "permission_mode": "bypassPermissions"
   }
 }
 ```
@@ -175,6 +183,8 @@ Field meanings:
 - `max_iterations` (optional): worker-assignment cap (`0` means no cap, default)
 - `orchestrator.model` (optional): model for new orchestrator turns
 - `orchestrator.session_model` (optional): model for resumed orchestrator sessions and worker turns
+- `orchestrator.permission_mode` (optional): Claude Code permission policy
+  (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 
 Start from:
 

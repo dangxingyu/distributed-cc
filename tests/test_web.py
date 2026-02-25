@@ -369,7 +369,7 @@ async def test_orchestrator_worker_exchange_visible_in_chat_and_monitor(aiohttp_
     history = await store.get_recent_messages(ch_id)
     assert any("@orchestrator -> @worker" in entry["text"] for entry in logs)
     assert any(
-        m["role"] == "assistant" and "@orchestrator -> @worker" in m["content"]
+        m["role"] == "assistant" and "@worker: run focused tests and report" in m["content"]
         for m in history
     )
 
@@ -648,7 +648,7 @@ async def test_progress_error_sends_chat_reply(aiohttp_client):
 
     reply = next(m for m in messages if m["type"] == "reply")
     assert "SDK crashed" in reply["text"]
-    assert "@orchestrator" in reply["text"]
+    assert "Error:" in reply["text"]
 
     progress = next(m for m in messages if m["type"] == "progress")
     assert progress.get("status") == "error"

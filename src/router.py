@@ -46,6 +46,7 @@ class RemoteOrchestrator:
     max_iterations: int = 0
     model: str = ""
     session_model: str = ""
+    permission_mode: str = ""
     status: str = "unknown"  # idle/running/done/stuck/error/disconnected
 
 
@@ -114,6 +115,7 @@ class Router:
         orch_cfg = cfg.get("orchestrator", {})
         default_model = str(orch_cfg.get("model", "")).strip()
         default_session_model = str(orch_cfg.get("session_model", "")).strip()
+        default_permission_mode = str(orch_cfg.get("permission_mode", "")).strip()
 
         orchestrators = cfg.get("orchestrators")
         if orchestrators:
@@ -130,6 +132,7 @@ class Router:
                     max_iterations=o.get("max_iterations", 0),
                     model=str(o.get("model", default_model)).strip(),
                     session_model=str(o.get("session_model", default_session_model)).strip(),
+                    permission_mode=str(o.get("permission_mode", default_permission_mode)).strip(),
                 )
                 self._orchestrators[project_id] = orch
             return
@@ -148,6 +151,7 @@ class Router:
                 max_iterations=s.get("max_iterations", 0),
                 model=str(s.get("model", default_model)).strip(),
                 session_model=str(s.get("session_model", default_session_model)).strip(),
+                permission_mode=str(s.get("permission_mode", default_permission_mode)).strip(),
             )
             self._orchestrators[project_id] = orch
 
@@ -664,6 +668,8 @@ class Router:
             payload["model"] = orch.model
         if orch.session_model:
             payload["session_model"] = orch.session_model
+        if orch.permission_mode:
+            payload["permission_mode"] = orch.permission_mode
         try:
             async with self._http.post(
                 url,
@@ -830,15 +836,16 @@ class Router:
                 "3) Decide target host and broker_port from existing machine setup when possible.\n"
                 "4) Ensure work_dir exists on the target machine (create it if missing).\n"
                 "5) Verify work_dir is writable (touch + remove a temp file in work_dir).\n"
-                "6) Add/update one project entry in config.json (show diff before write).\n"
-                "7) Validate daemon reachability (curl /health on the selected broker_port).\n"
-                "8) Only if all checks pass, return a concise result with:\n"
+                "6) Create/update work_dir/CLAUDE.md with filesystem/server/environment notes for agents.\n"
+                "7) Add/update one project entry in config.json (show diff before write).\n"
+                "8) Validate daemon reachability (curl /health on the selected broker_port).\n"
+                "9) Only if all checks pass, return a concise result with:\n"
                 "   - project_id\n"
                 "   - work_dir\n"
                 "   - host\n"
                 "   - broker_port\n"
                 "   - exact `/connect <project_id>` command\n"
-                "   - verification evidence for: work_dir exists, work_dir writable, daemon healthy\n\n"
+                "   - verification evidence for: work_dir exists, work_dir writable, CLAUDE.md written, daemon healthy\n\n"
                 "If any check fails, do not claim success. Return: `NOT READY` + failing check + exact command/output.\n"
             )
         elif stripped.startswith("/setup"):
@@ -867,7 +874,8 @@ class Router:
                         f"-o ExitOnForwardFailure=yes -o BatchMode=yes {host}\n"
                         "   Prefer tmux session `dcc-tunnel-<host-slug>`; fallback to nohup + PID/log files.\n"
                         "   Do NOT leave a blocking foreground process.\n"
-                        "5) Verify health locally: curl http://127.0.0.1:BROKER_PORT/health\n\n"
+                        "5) Ensure work_dir/CLAUDE.md exists and captures filesystem/server/environment constraints.\n"
+                        "6) Verify health locally: curl http://127.0.0.1:BROKER_PORT/health\n\n"
                         "At the end report concise outputs: project_id, broker_port, daemon status, "
                         "tunnel status, and stop/restart commands."
                     )
@@ -877,6 +885,7 @@ class Router:
                         "Before acting, if `config.md` exists in the project root, read it as user notes "
                         "for setup/environment preferences and honor them unless this request overrides them.\n\n"
                         "Probe the environment via SSH, deploy the daemon, and update config.json. "
+                        "Ensure work_dir/CLAUDE.md exists with concrete filesystem/server/environment notes. "
                         "Do not auto-start local tunnel. Instead, print the exact tunnel command the "
                         "user should run and then verify health after they confirm tunnel is up."
                     )

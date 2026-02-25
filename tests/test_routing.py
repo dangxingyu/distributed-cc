@@ -69,6 +69,7 @@ async def test_route_idle_starts_task_with_model_overrides():
             status="idle",
             model="claude-opus-4-6",
             session_model="claude-sonnet-4-6",
+            permission_mode="default",
         )
     ])
     router._channel_project[1] = "myproj"
@@ -91,6 +92,7 @@ async def test_route_idle_starts_task_with_model_overrides():
     assert payload["task"] == "fix the bug"
     assert payload["model"] == "claude-opus-4-6"
     assert payload["session_model"] == "claude-sonnet-4-6"
+    assert payload["permission_mode"] == "default"
 
 
 async def test_route_running_non_mention_is_deferred():
@@ -525,6 +527,7 @@ async def test_setup_project_prompt_enforces_workdir_and_health_gates(tmp_path):
     prompt = captured_prompt["text"]
     assert "Ensure work_dir exists on the target machine" in prompt
     assert "Verify work_dir is writable" in prompt
+    assert "Create/update work_dir/CLAUDE.md" in prompt
     assert "Validate daemon reachability" in prompt
     assert "If any check fails, do not claim success" in prompt
 
@@ -617,6 +620,7 @@ async def test_load_config_servers_schema_with_orchestrator_defaults(tmp_path):
         "orchestrator": {
             "model": "claude-opus-4-6",
             "session_model": "claude-sonnet-4-6",
+            "permission_mode": "acceptEdits",
         },
         "servers": [
             {"name": "srv-a", "work_dir": "/tmp/a"},
@@ -631,10 +635,12 @@ async def test_load_config_servers_schema_with_orchestrator_defaults(tmp_path):
     orch_a = router._orchestrators["srv-a"]
     assert orch_a.model == "claude-opus-4-6"
     assert orch_a.session_model == "claude-sonnet-4-6"
+    assert orch_a.permission_mode == "acceptEdits"
 
     orch_b = router._orchestrators["srv-b"]
     assert orch_b.model == "claude-haiku-4-5"
     assert orch_b.session_model == "claude-sonnet-4-6"
+    assert orch_b.permission_mode == "acceptEdits"
 
 
 async def test_load_config_orchestrators_schema(tmp_path):

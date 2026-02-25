@@ -8,6 +8,7 @@ import asyncio
 import sys
 import os
 import json
+import time
 from collections import deque
 
 import pytest
@@ -233,6 +234,76 @@ async def test_wait_for_interrupt_text_skips_empty_payloads():
     interrupt_queues.pop(project_id, None)
 
 
+@pytest.mark.asyncio
+async def test_wait_for_interrupt_text_preserves_non_user_payloads():
+    from orchestrator_daemon import (
+        _ensure_interrupt_queue,
+        _wait_for_interrupt_text,
+        interrupt_queues,
+    )
+
+    project_id = "queue-preserve-non-user"
+    interrupt_queues.pop(project_id, None)
+    queue = _ensure_interrupt_queue(project_id)
+    queue.put_nowait({"kind": "system_nudge", "text": "heartbeat", "ts": 0})
+    queue.put_nowait({"kind": "user_message", "text": "human answer", "ts": 0})
+
+    result = await _wait_for_interrupt_text(project_id, timeout=1)
+    assert result == "human answer"
+
+    remaining = queue.get_nowait()
+    assert remaining["kind"] == "system_nudge"
+    assert remaining["text"] == "heartbeat"
+    interrupt_queues.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_maybe_enqueue_heartbeat_nudge_queues_system_message(tmp_path, monkeypatch):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import (
+        _ensure_interrupt_queue,
+        _maybe_enqueue_heartbeat_nudge,
+        HEARTBEAT_IDLE_SECONDS,
+        Project,
+        TaskState,
+        interrupt_queues,
+        project_last_heartbeat_nudge_ts,
+        project_last_progress_ts,
+        projects,
+    )
+
+    project_id = "heartbeat-test"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="hb")
+    interrupt_queues.pop(project_id, None)
+    project_last_progress_ts[project_id] = time.time() - HEARTBEAT_IDLE_SECONDS - 5
+    project_last_heartbeat_nudge_ts.pop(project_id, None)
+    state = TaskState(task_id="t-hb", project_id=project_id, task_text="do work")
+
+    async def fake_gpu_hint(_project_dir: str) -> str:
+        return "GPU hint sentinel"
+
+    async def fake_emit_progress(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(daemon_mod, "_gpu_idle_hint", fake_gpu_hint)
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+
+    try:
+        queued = await _maybe_enqueue_heartbeat_nudge(project_id, state)
+        assert queued is True
+
+        queue = _ensure_interrupt_queue(project_id)
+        payload = queue.get_nowait()
+        assert payload["kind"] == "system_nudge"
+        assert "Heartbeat:" in payload["text"]
+        assert "GPU hint sentinel" in payload["text"]
+    finally:
+        projects.pop(project_id, None)
+        interrupt_queues.pop(project_id, None)
+        project_last_progress_ts.pop(project_id, None)
+        project_last_heartbeat_nudge_ts.pop(project_id, None)
+
+
 def test_parse_bool_helper():
     from orchestrator_daemon import _parse_bool
 
@@ -242,6 +313,15 @@ def test_parse_bool_helper():
     assert _parse_bool("0", default=True) is False
     assert _parse_bool("off", default=True) is False
     assert _parse_bool("unexpected", default=True) is True
+
+
+def test_normalize_permission_mode_helper():
+    from orchestrator_daemon import _normalize_permission_mode
+
+    assert _normalize_permission_mode("default") == "default"
+    assert _normalize_permission_mode("acceptEdits") == "acceptEdits"
+    assert _normalize_permission_mode("not-a-mode") == "bypassPermissions"
+    assert _normalize_permission_mode("", default="plan") == "plan"
 
 
 def test_hydrate_sessions_from_state(tmp_path):

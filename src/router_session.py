@@ -29,6 +29,14 @@ from claude_agent_sdk.types import (
 )
 
 log = logging.getLogger(__name__)
+VALID_PERMISSION_MODES = {"default", "acceptEdits", "plan", "bypassPermissions"}
+
+
+def _resolve_permission_mode(value: str | None, default: str = "bypassPermissions") -> str:
+    mode = str(value or "").strip()
+    if mode in VALID_PERMISSION_MODES:
+        return mode
+    return default
 
 
 def _install_sdk_event_compat() -> None:
@@ -74,6 +82,8 @@ configuration files (`config.json`, optional `config.md`).
   Use `ssh user@host "command"` via the Bash tool.
 - **Deploy daemon**: Copy `tools/orchestrator_daemon.py` to the remote server,
   set up a Python venv with dependencies, and launch the daemon.
+- **Environment discipline**: Use `uv` + virtual environment by default for
+  Python installation/execution steps.
 - **Manage local tunnels**: Create/refresh local SSH tunnels in the background
   so the router can reach remote daemons without extra manual steps.
 - **Write CLAUDE.md**: Generate a CLAUDE.md on the remote server that documents
@@ -127,7 +137,13 @@ When asked to set up a server (e.g., `/setup user@server`):
    - Read current config, add the new server entry
    - Show the diff before writing
 
-7. **Verify** the daemon is reachable:
+7. **Write/update project CLAUDE.md in work_dir**:
+   - Ensure `<work_dir>/CLAUDE.md` exists
+   - Include filesystem layout, environment constraints, scheduler/runtime notes,
+     and any user-provided setup notes from `config.md`
+   - Keep it concise and operational, not generic prose
+
+8. **Verify** the daemon is reachable:
    ```bash
    curl http://127.0.0.1:LOCAL_PORT/health
    ```
@@ -210,6 +226,7 @@ When asked to set up a project (`/setup-project ...`):
 - Readiness gate for declaring success:
   - `work_dir` exists on the target machine (create with `mkdir -p` if missing)
   - `work_dir` is writable (`touch` + remove a temp file in that directory)
+  - `work_dir/CLAUDE.md` exists and contains concrete environment notes
   - selected daemon is reachable (`curl http://127.0.0.1:BROKER_PORT/health`)
 - If any readiness check fails, do not claim completion. Return a "NOT READY" result
   with the failing check and exact command/output snippet.
@@ -244,8 +261,13 @@ When asked to set up a project (`/setup-project ...`):
 class RouterSession:
     """Local sysadmin Claude session for the router — handles infra and config tasks."""
 
-    def __init__(self, cwd: str = "."):
+    def __init__(self, cwd: str = ".", permission_mode: str | None = None):
         self._cwd = os.path.abspath(cwd)
+        default_permission = os.environ.get("DCC_ROUTER_PERMISSION_MODE", "bypassPermissions")
+        self._permission_mode = _resolve_permission_mode(
+            permission_mode,
+            default=_resolve_permission_mode(default_permission),
+        )
         self._session_id: str | None = None
         self._is_running = False
         self._progress_callback: callable | None = None
@@ -285,7 +307,7 @@ class RouterSession:
         self._saw_stream_text = False
 
         options = ClaudeAgentOptions(
-            permission_mode="bypassPermissions",
+            permission_mode=self._permission_mode,
             model="sonnet",
             cwd=self._cwd,
         )

@@ -23,6 +23,12 @@ def test_router_session_init_resolves_cwd():
     assert s._cwd.startswith("/")
 
 
+def test_router_session_permission_mode_from_env(monkeypatch):
+    monkeypatch.setenv("DCC_ROUTER_PERMISSION_MODE", "default")
+    s = RouterSession(cwd="/tmp")
+    assert s._permission_mode == "default"
+
+
 # ── Running flag ─────────────────────────────────────────────────────────
 
 
