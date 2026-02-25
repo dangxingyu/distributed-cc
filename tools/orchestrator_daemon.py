@@ -118,14 +118,6 @@ EVENT_HISTORY_MAX = _env_int("EVENT_HISTORY_MAX", 2000, minimum=1)
 MAX_ITERATIONS = 0
 STATE_DIR = Path.home() / ".distributed-cc" / "state"
 INTERRUPT_QUEUE_MAX = 100
-HEARTBEAT_ENABLED = os.environ.get("HEARTBEAT_ENABLED", "1").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-    "off",
-)
-HEARTBEAT_INTERVAL_SECONDS = _env_int("HEARTBEAT_INTERVAL_SECONDS", 45, minimum=10)
-HEARTBEAT_IDLE_SECONDS = _env_int("HEARTBEAT_IDLE_SECONDS", 180, minimum=30)
 HEARTBEAT_GPU_HINT = os.environ.get("HEARTBEAT_GPU_HINT", "1").strip().lower() not in (
     "0",
     "false",
@@ -413,9 +405,6 @@ worker_prompt_hashes: dict[str, str] = {}  # project_id -> worker prompt hash
 current_worker_tasks: dict[str, asyncio.Task] = {}  # project_id -> active worker task
 callback_http_session: ClientSession | None = None
 callback_http_lock = asyncio.Lock()
-project_last_progress_ts: dict[str, float] = {}
-project_last_heartbeat_nudge_ts: dict[str, float] = {}
-heartbeat_tasks: dict[str, asyncio.Task] = {}
 project_last_standby_wake_ts: dict[str, float] = {}
 standby_heartbeat_tasks: dict[str, asyncio.Task] = {}
 
@@ -601,7 +590,6 @@ async def emit_progress(project_id: str, event: ProgressEvent):
     """Send progress event to SSE subscribers and HTTP callback."""
     payload = _event_payload(event)
     _record_event(project_id, payload)
-    project_last_progress_ts[project_id] = event.timestamp
 
     if DEBUG_FLOW:
         log.info(
@@ -885,69 +873,6 @@ def _ensure_standby_heartbeat_task(project_id: str):
     standby_heartbeat_tasks[project_id] = asyncio.create_task(
         _standby_heartbeat_loop(project_id)
     )
-
-
-async def _maybe_enqueue_heartbeat_nudge(project_id: str, state: TaskState) -> bool:
-    """Inject a system nudge when the orchestrator has been idle too long."""
-    if state.status != "running":
-        return False
-
-    now = time.time()
-    last_progress = project_last_progress_ts.get(project_id, state.started_at)
-    idle_for = now - last_progress
-    if idle_for < HEARTBEAT_IDLE_SECONDS:
-        return False
-
-    cooldown = max(HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_IDLE_SECONDS // 2)
-    last_nudge = project_last_heartbeat_nudge_ts.get(project_id, 0.0)
-    if now - last_nudge < cooldown:
-        return False
-
-    idle_minutes = max(1, int(idle_for // 60))
-    lines = [
-        f"Heartbeat: no visible progress for ~{idle_minutes} minute(s).",
-        "You own this project — advisor silence means 'carry on'.",
-        "Next action: read task_list.md, pick the next unchecked item, assign a worker or investigate.",
-        "Only call ask_user if you genuinely cannot proceed without advisor input.",
-    ]
-    if state.iteration > 0 and idle_for >= 600:
-        lines.append(
-            "Task hygiene: pull user messages and ensure task_list.md reflects current state."
-        )
-    project = projects.get(project_id)
-    if project:
-        gpu_hint = await _gpu_idle_hint(project.project_dir)
-        if gpu_hint:
-            lines.append(gpu_hint)
-
-    nudge_text = "\n".join(lines)
-    _enqueue_interrupt(project_id, nudge_text, kind="system_nudge", urgency="normal")
-    project_last_heartbeat_nudge_ts[project_id] = now
-    await emit_progress(
-        project_id,
-        ProgressEvent(
-            type="log_update",
-            data=f"[heartbeat] queued nudge after {int(idle_for)}s idle",
-            iteration=state.iteration,
-        ),
-    )
-    return True
-
-
-async def _heartbeat_loop(project_id: str, state: TaskState):
-    """Periodic heartbeat to nudge orchestrator when progress stalls."""
-    while True:
-        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-        if state.status != "running":
-            break
-        if cancel_events.get(project_id, asyncio.Event()).is_set():
-            break
-        try:
-            await _maybe_enqueue_heartbeat_nudge(project_id, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.debug("Heartbeat loop error for %s: %s", project_id, e)
 
 
 # -- agent sdk helpers -------------------------------------------------
@@ -1523,7 +1448,6 @@ async def run_task(
     if project_id not in cancel_events:
         cancel_events[project_id] = asyncio.Event()
     cancel_events[project_id].clear()
-    project_last_progress_ts[project_id] = time.time()
 
     orchestrator_session_id = orchestrator_sessions.get(project_id, "")
 
@@ -1536,9 +1460,6 @@ async def run_task(
     )
 
     prompt = f"[TASK]\n{task_text}"
-    if HEARTBEAT_ENABLED:
-        hb_task = asyncio.create_task(_heartbeat_loop(project_id, state))
-        heartbeat_tasks[project_id] = hb_task
 
     try:
         next_prompt = prompt
@@ -1667,19 +1588,7 @@ async def run_task(
             ProgressEvent(type="error", data=str(e), iteration=state.iteration),
         )
     finally:
-        hb_task = heartbeat_tasks.pop(project_id, None)
-        if hb_task and not hb_task.done():
-            hb_task.cancel()
-            try:
-                await hb_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
         running_tasks.pop(project_id, None)
-        project_last_progress_ts.pop(project_id, None)
-        project_last_heartbeat_nudge_ts.pop(project_id, None)
         _save_state(
             state,
             orchestrator_session_id=orchestrator_session_id,
@@ -2146,7 +2055,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def on_cleanup(_app: web.Application):
     global callback_http_session
-    all_bg_tasks = list(heartbeat_tasks.values()) + list(standby_heartbeat_tasks.values())
+    all_bg_tasks = list(standby_heartbeat_tasks.values())
     for task in all_bg_tasks:
         if task and not task.done():
             task.cancel()
@@ -2159,7 +2068,6 @@ async def on_cleanup(_app: web.Application):
             pass
         except Exception:
             pass
-    heartbeat_tasks.clear()
     standby_heartbeat_tasks.clear()
 
     if callback_http_session and not callback_http_session.closed:

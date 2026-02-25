@@ -1,7 +1,7 @@
 # Distributed Claude Code
 
 <p align="center">
-  <img src="docs/assets/distributed-cc-logo.jpeg" alt="Distributed Claude Code logo" width="720" />
+  <img src="docs/assets/logo.jpeg" alt="Distributed Claude Code logo" width="720" />
 </p>
 
 *Work as an advisor!* Run Claude Code across multiple servers from one local chat interface (Web UI or Telegram), with a persistent **PhDLoop** runtime (Orchestrator + Worker).
@@ -10,11 +10,6 @@
   <img src="docs/assets/illustration.jpeg" alt="System structure, binding model, and runtime flow" width="920" />
 </p>
 
-## Naming
-
-- **AdvisorLoop**: the full workflow including user + router + remote runtime.
-- **PhDLoop**: the autonomous per-project execution loop (orchestrator + worker).
-
 ## Why This Exists
 
 Distributed Claude Code is optimized for this workflow:
@@ -22,7 +17,7 @@ Distributed Claude Code is optimized for this workflow:
 1. Humans should not manually track 10+ concurrent sessions.
 2. The orchestrator should keep progress moving autonomously, while the user gives high-level advice and course corrections.
 
-Core model:
+Core components:
 
 - **Router** (local): message routing + setup/sysadmin helper.
 - **Daemon** (remote per machine): long-lived orchestrator runtime.
@@ -61,6 +56,9 @@ Click **+ New Setup Channel** in the sidebar.
 - Click `Create + setup`
 
 The UI sends `/setup user@host` automatically.
+
+First run note: no manual config files are required. Router can create/update
+`config.json` during setup flow. `config.md` is optional notes for better setup context.
 
 ### 4. Complete project setup
 
@@ -148,19 +146,24 @@ Urgency while running:
 
 ## Heartbeat Behavior
 
-There are two heartbeat modes:
-
-1. **Running heartbeat**: if progress stalls, daemon queues a nudge.
-2. **Standby heartbeat**: while `done/idle`, daemon can wake orchestrator for lightweight triage only when meaningful signals exist (for example queued advisor messages or unchecked `task_list.md` items).
+Heartbeat only runs in **standby** state (`done/idle`): daemon wakes orchestrator for lightweight triage only when meaningful signals exist (for example queued advisor messages or unchecked `task_list.md` items).
 
 Defaults:
 
-- `HEARTBEAT_INTERVAL_SECONDS=45`
-- `HEARTBEAT_IDLE_SECONDS=180`
 - `STANDBY_HEARTBEAT_SECONDS=1800` (~30 minutes)
 - `STANDBY_WAKE_MAX_ITERATIONS=1`
 
 ## Configuration
+
+`config.json` and `config.md` are both optional.
+
+- `config.json`: structured machine/project config (good for stable multi-server workflows).
+- `config.md`: free-form setup/environment notes for Router (cluster layout, SLURM habits, preferred paths, etc.).
+
+You can use either mode:
+
+1. **Config-first**: prepare `config.json` (and optionally `config.md`) before running.
+2. **Adhoc-first**: create a channel and talk to setup agent in-channel (`/setup ...` then `/setup-project ...`) without pre-writing config files.
 
 Start from template:
 
@@ -168,16 +171,22 @@ Start from template:
 cp config.example.json config.json
 ```
 
-Common config shape:
+Canonical config shape (project-centric):
 
 ```json
 {
-  "servers": [
+  "machines": [
     {
-      "name": "proj-a",
+      "name": "della-gpu",
       "host": "ubuntu@host-or-ip",
-      "work_dir": "/home/ubuntu/project-a",
       "broker_port": 8201
+    }
+  ],
+  "projects": [
+    {
+      "project_id": "proj-a",
+      "machine": "della-gpu",
+      "work_dir": "/home/ubuntu/project-a"
     }
   ],
   "orchestrator": {
@@ -190,11 +199,17 @@ Common config shape:
 
 Field notes:
 
-- `servers[].name`: project id used by `/connect`
-- `servers[].host`: SSH destination (`null` for local)
-- `servers[].work_dir`: project root on target machine
-- `servers[].broker_port`: local forwarded port to daemon `:8200`
+- `machines[].name`: machine key referenced by `projects[].machine`
+- `machines[].host`: SSH destination (`null` for local)
+- `machines[].broker_port`: local forwarded port to daemon `:8200`
+- `projects[].project_id`: id used by `/connect`
+- `projects[].work_dir`: project root on target machine
 - `orchestrator.*`: default daemon runtime model/policy
+
+Compatibility:
+
+- `servers[]` (legacy) and `orchestrators[]` schemas are still supported.
+- For new setups, prefer `machines[] + projects[]` for clearer machine/project separation.
 
 `config.json` is local-only. Never commit real hosts/tokens.
 
@@ -211,6 +226,7 @@ Then add the bot to a group or DM it directly.
 ## Manual Daemon Setup (Optional)
 
 Only needed if you do not use `/setup`.
+For long-lived reliability, prefer `systemd` services for daemon and tunnels.
 
 Remote server:
 
@@ -248,9 +264,11 @@ curl http://127.0.0.1:8201/health
 ### `/connect <id>` unknown project
 
 - Confirm `config.json` has that `projects[].project_id` (or `servers[].name` in legacy config)
-- Restart router after config edits
+- Retry `/connect <project-id>`; router reloads config automatically when needed
 
 ## Testing
+
+`make test-e2e` uses real Claude calls. Ensure credentials are available and expect usage cost.
 
 ```bash
 make test
@@ -284,6 +302,13 @@ docs/
 
 ## Requirements
 
+Local machine:
+
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)
-- Claude Code CLI on remote machines
+- SSH client
+
+Remote machine:
+
+- Claude Code CLI
+- Python 3.10+ (and ability to run long-lived daemon via `tmux` or `systemd`)

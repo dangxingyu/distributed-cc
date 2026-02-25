@@ -8,7 +8,6 @@ import asyncio
 import sys
 import os
 import json
-import time
 from collections import deque
 
 import pytest
@@ -255,53 +254,6 @@ async def test_wait_for_interrupt_text_preserves_non_user_payloads():
     assert remaining["kind"] == "system_nudge"
     assert remaining["text"] == "heartbeat"
     interrupt_queues.pop(project_id, None)
-
-
-@pytest.mark.asyncio
-async def test_maybe_enqueue_heartbeat_nudge_queues_system_message(tmp_path, monkeypatch):
-    import orchestrator_daemon as daemon_mod
-    from orchestrator_daemon import (
-        _ensure_interrupt_queue,
-        _maybe_enqueue_heartbeat_nudge,
-        HEARTBEAT_IDLE_SECONDS,
-        Project,
-        TaskState,
-        interrupt_queues,
-        project_last_heartbeat_nudge_ts,
-        project_last_progress_ts,
-        projects,
-    )
-
-    project_id = "heartbeat-test"
-    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="hb")
-    interrupt_queues.pop(project_id, None)
-    project_last_progress_ts[project_id] = time.time() - HEARTBEAT_IDLE_SECONDS - 5
-    project_last_heartbeat_nudge_ts.pop(project_id, None)
-    state = TaskState(task_id="t-hb", project_id=project_id, task_text="do work")
-
-    async def fake_gpu_hint(_project_dir: str) -> str:
-        return "GPU hint sentinel"
-
-    async def fake_emit_progress(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(daemon_mod, "_gpu_idle_hint", fake_gpu_hint)
-    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
-
-    try:
-        queued = await _maybe_enqueue_heartbeat_nudge(project_id, state)
-        assert queued is True
-
-        queue = _ensure_interrupt_queue(project_id)
-        payload = queue.get_nowait()
-        assert payload["kind"] == "system_nudge"
-        assert "Heartbeat:" in payload["text"]
-        assert "GPU hint sentinel" in payload["text"]
-    finally:
-        projects.pop(project_id, None)
-        interrupt_queues.pop(project_id, None)
-        project_last_progress_ts.pop(project_id, None)
-        project_last_heartbeat_nudge_ts.pop(project_id, None)
 
 
 def test_task_list_has_unchecked_items(tmp_path):
