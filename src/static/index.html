@@ -2377,16 +2377,22 @@ function switchChannel(channelId, timeoutMs = SWITCH_ACK_TIMEOUT_MS) {
 }
 
 function onChannelSwitched(data) {
-  clearPendingSwitchAck(Number(data.channel_id));
+  const nextChannelId = Number(data.channel_id);
+  const sameChannelResync = activeChannel !== null && activeChannel === nextChannelId;
+  clearPendingSwitchAck(nextChannelId);
   clearPendingUserMessages();
-  activeChannel = data.channel_id;
+  activeChannel = nextChannelId;
   currentProjectId = data.project_id || null;
   currentProjectStatus = data.project_status || 'unknown';
   currentIteration = 0;
-  routerTypingActive = false;
-  routerTypingTokens.clear();
+  if (!sameChannelResync) {
+    routerTypingActive = false;
+    routerTypingTokens.clear();
+  }
   localStorage.setItem('dcc_active_channel', String(activeChannel));
-  resetTypingIndicator();
+  if (!sameChannelResync) {
+    resetTypingIndicator();
+  }
 
   const ch = channels.find(c => c.id === activeChannel);
   channelTitle.textContent = ch ? '# ' + ch.name : 'distributed-cc';
