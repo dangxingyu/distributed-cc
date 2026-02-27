@@ -224,6 +224,14 @@ TELEGRAM_BOT_TOKEN=<token> uv run python -m src --frontend telegram
 
 Then add the bot to a group or DM it directly.
 
+Run Web + Telegram together:
+
+```bash
+TELEGRAM_BOT_TOKEN=<token> uv run python -m src --frontend both
+```
+
+In `both` mode, Web and Telegram share project runtime state, while each frontend only renders its own channels (legacy untagged channels stay on Web).
+
 ## Manual Daemon Setup (Optional)
 
 Only needed if you do not use `/setup`.

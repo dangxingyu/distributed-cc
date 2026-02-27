@@ -993,3 +993,33 @@ async def test_progress_log_update_sent_to_ws(aiohttp_client):
 
     await ws.close()
     await store.close()
+
+
+async def test_progress_only_emits_for_web_channels(aiohttp_client):
+    """Progress events should only be emitted to channels with source='web' or None."""
+    client, web_chat, router, store = await _make_web(aiohttp_client)
+
+    # Create a web channel and a telegram channel on the same project
+    web_ch = await store.create_channel("web-chan", project_id="test-proj", source="web")
+    tg_ch = await store.create_channel("tg-chan", project_id="test-proj", source="telegram")
+
+    await router.connect_channel(web_ch, "test-proj", source="web")
+    await router.connect_channel(tg_ch, "test-proj", source="telegram")
+
+    # Fire progress event through the web handler directly
+    await web_chat._handle_progress("test-proj", {
+        "type": "text",
+        "data": "[orchestrator] hello from progress",
+        "iteration": 1,
+        "ts": 1234.0,
+    })
+
+    # Web channel should have the message persisted
+    web_msgs = await store.get_recent_messages(web_ch)
+    assert any("hello from progress" in m["content"] for m in web_msgs)
+
+    # Telegram channel should NOT have the message
+    tg_msgs = await store.get_recent_messages(tg_ch)
+    assert not any("hello from progress" in m["content"] for m in tg_msgs)
+
+    await store.close()

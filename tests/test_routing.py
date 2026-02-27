@@ -334,7 +334,7 @@ async def test_ingest_progress_event_dedupes_event_id():
     async def on_progress(project_id, event):
         seen.append((project_id, event.get("event_id")))
 
-    router.set_progress_callback(on_progress)
+    router.add_progress_listener(on_progress)
 
     event = {"event_id": "evt-1", "type": "iteration", "data": "Iteration 1/20", "iteration": 1}
     accepted_1 = await router.ingest_progress_event("proj", event, source="sse")
@@ -353,7 +353,7 @@ async def test_ingest_progress_event_fallback_signature_dedupe():
     async def on_progress(project_id, event):
         seen.append(project_id)
 
-    router.set_progress_callback(on_progress)
+    router.add_progress_listener(on_progress)
 
     event = {"type": "done", "data": "ok", "iteration": 2, "ts": 123.0}
     accepted_1 = await router.ingest_progress_event("proj", dict(event), source="sse")
@@ -1280,7 +1280,7 @@ async def test_deferred_task_retryable_start_failure_auto_retries():
     async def on_progress(project_id, event):
         progress_events.append(event)
 
-    router.set_progress_callback(on_progress)
+    router.add_progress_listener(on_progress)
 
     await router._maybe_start_deferred_task("proj")
     await asyncio.sleep(0.05)
@@ -1301,7 +1301,7 @@ async def test_connect_channel_calls_persist_callback():
     async def persist(chat_id, project_id):
         persisted[chat_id] = project_id
 
-    router.set_mapping_persist_callback(persist)
+    router.add_mapping_persist_listener(persist)
     await router.connect_channel(1, "proj")
 
     assert persisted[1] == "proj"
@@ -1315,7 +1315,7 @@ async def test_disconnect_channel_calls_persist_with_none():
     async def persist(chat_id, project_id):
         persisted[chat_id] = project_id
 
-    router.set_mapping_persist_callback(persist)
+    router.add_mapping_persist_listener(persist)
     await router.disconnect_channel(1)
 
     assert persisted[1] is None
@@ -1344,7 +1344,7 @@ async def test_deferred_task_notifies_via_progress_callback():
     async def on_progress(project_id, event):
         progress_events.append(event)
 
-    router.set_progress_callback(on_progress)
+    router.add_progress_listener(on_progress)
 
     await router._maybe_start_deferred_task("proj")
 
@@ -1436,3 +1436,122 @@ async def test_router_typing_compat_with_two_arg_callback(tmp_path):
         await router._router_tasks[1]
 
     assert typing_events == [(True, "router"), (False, "router")]
+
+
+# ── Multi-listener fan-out and source cache ──────────────────────────
+
+
+async def test_multi_listener_fan_out():
+    """Multiple progress listeners all receive the same event."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
+
+    seen_a = []
+    seen_b = []
+
+    async def listener_a(project_id, event):
+        seen_a.append(event.get("event_id"))
+
+    async def listener_b(project_id, event):
+        seen_b.append(event.get("event_id"))
+
+    router.add_progress_listener(listener_a)
+    router.add_progress_listener(listener_b)
+
+    event = {"event_id": "multi-1", "type": "iteration", "data": "Iteration 1/5", "iteration": 1}
+    await router.ingest_progress_event("proj", event, source="sse")
+
+    assert seen_a == ["multi-1"]
+    assert seen_b == ["multi-1"]
+
+
+async def test_listener_error_isolation():
+    """A failing listener does not prevent other listeners from running."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
+
+    seen = []
+
+    async def bad_listener(project_id, event):
+        raise RuntimeError("boom")
+
+    async def good_listener(project_id, event):
+        seen.append(event.get("event_id"))
+
+    router.add_progress_listener(bad_listener)
+    router.add_progress_listener(good_listener)
+
+    event = {"event_id": "iso-1", "type": "iteration", "data": "Iteration 1/5", "iteration": 1}
+    await router.ingest_progress_event("proj", event, source="sse")
+
+    assert seen == ["iso-1"]
+
+
+async def test_channel_source_tracking():
+    """set/get_channel_source works correctly."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv")])
+
+    assert router.get_channel_source(1) is None
+
+    router.set_channel_source(1, "web")
+    assert router.get_channel_source(1) == "web"
+
+    router.set_channel_source(1, "telegram")
+    assert router.get_channel_source(1) == "telegram"
+
+
+async def test_connect_channel_sets_source():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv")])
+    await router.connect_channel(1, "proj", source="web")
+    assert router.get_channel_source(1) == "web"
+
+
+async def test_disconnect_channel_clears_source():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv")])
+    await router.connect_channel(1, "proj", source="web")
+    await router.disconnect_channel(1)
+    assert router.get_channel_source(1) is None
+
+
+async def test_hydrate_with_source():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv")])
+    ok = router.hydrate_channel_mapping(1, "proj", source="telegram")
+    assert ok is True
+    assert router.get_channel_source(1) == "telegram"
+
+
+async def test_remove_progress_listener():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
+
+    seen = []
+
+    async def listener(project_id, event):
+        seen.append(1)
+
+    router.add_progress_listener(listener)
+    event = {"event_id": "rm-1", "type": "iteration", "data": "x", "iteration": 1}
+    await router.ingest_progress_event("proj", event, source="sse")
+    assert len(seen) == 1
+
+    router.remove_progress_listener(listener)
+    event2 = {"event_id": "rm-2", "type": "iteration", "data": "y", "iteration": 2}
+    await router.ingest_progress_event("proj", event2, source="sse")
+    assert len(seen) == 1  # listener was removed
+
+
+async def test_multi_mapping_persist_listeners():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv")])
+
+    persisted_a = {}
+    persisted_b = {}
+
+    async def persist_a(chat_id, project_id):
+        persisted_a[chat_id] = project_id
+
+    async def persist_b(chat_id, project_id):
+        persisted_b[chat_id] = project_id
+
+    router.add_mapping_persist_listener(persist_a)
+    router.add_mapping_persist_listener(persist_b)
+
+    await router.connect_channel(1, "proj")
+    assert persisted_a[1] == "proj"
+    assert persisted_b[1] == "proj"

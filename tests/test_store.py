@@ -259,3 +259,110 @@ async def test_json_file_structure(store, tmp_path):
     assert data["messages"][0]["content"] == "hi"
     assert "meta" in data
     assert "project_id" in data["meta"]
+
+
+# -- source field -----------------------------------------------------
+
+
+async def test_create_channel_with_source(store):
+    ch_id = await store.create_channel("web-chan", source="web")
+    src = await store.get_channel_source(ch_id)
+    assert src == "web"
+
+
+async def test_create_channel_default_source_is_none(store):
+    ch_id = await store.create_channel("no-source")
+    src = await store.get_channel_source(ch_id)
+    assert src is None
+
+
+async def test_set_channel_source(store):
+    ch_id = await store.create_channel("tagged")
+    assert await store.get_channel_source(ch_id) is None
+
+    await store.set_channel_source(ch_id, "telegram")
+    assert await store.get_channel_source(ch_id) == "telegram"
+
+
+async def test_set_channel_source_missing_channel_is_noop(store):
+    # Should not crash or create a file
+    await store.set_channel_source(9999, "web")
+    src = await store.get_channel_source(9999)
+    assert src is None
+
+
+async def test_ensure_channel_creates_file_with_source(store):
+    await store.ensure_channel(98765, name="tg chat", source="telegram")
+    assert await store.get_channel_source(98765) == "telegram"
+
+
+async def test_get_channel_list_filtered_by_source(store):
+    id_web = await store.create_channel("web-chan", source="web")
+    id_tg = await store.create_channel("tg-chan", source="telegram")
+    id_legacy = await store.create_channel("legacy-chan")  # source=None
+
+    # All channels
+    all_channels = await store.get_channel_list()
+    assert len(all_channels) == 3
+
+    # Web (explicit): only web
+    web_channels = await store.get_channel_list(source="web")
+    web_ids = {c["id"] for c in web_channels}
+    assert id_web in web_ids
+    assert id_legacy not in web_ids
+    assert id_tg not in web_ids
+
+    # Web (+legacy opt-in): web + legacy
+    web_plus_legacy = await store.get_channel_list(source="web", include_legacy=True)
+    web_plus_legacy_ids = {c["id"] for c in web_plus_legacy}
+    assert id_web in web_plus_legacy_ids
+    assert id_legacy in web_plus_legacy_ids
+    assert id_tg not in web_plus_legacy_ids
+
+    # Telegram: telegram only
+    tg_channels = await store.get_channel_list(source="telegram")
+    tg_ids = {c["id"] for c in tg_channels}
+    assert id_tg in tg_ids
+    assert id_legacy not in tg_ids
+    assert id_web not in tg_ids
+
+
+async def test_get_channel_project_map_by_source(store):
+    id_web = await store.create_channel("web-chan", project_id="proj-a", source="web")
+    id_tg = await store.create_channel("tg-chan", project_id="proj-a", source="telegram")
+    id_legacy = await store.create_channel("legacy-chan", project_id="proj-b")
+
+    web_map = await store.get_channel_project_map_by_source("web")
+    assert id_web in web_map
+    assert id_legacy not in web_map
+    assert id_tg not in web_map
+
+    web_map_with_legacy = await store.get_channel_project_map_by_source("web", include_legacy=True)
+    assert id_web in web_map_with_legacy
+    assert id_legacy in web_map_with_legacy
+    assert id_tg not in web_map_with_legacy
+
+    tg_map = await store.get_channel_project_map_by_source("telegram")
+    assert id_tg in tg_map
+    assert id_legacy not in tg_map
+    assert id_web not in tg_map
+
+
+async def test_backward_compat_source_field_missing(tmp_path):
+    """Old channel files without source field get source=None."""
+    data_dir = str(tmp_path / "data")
+    store = Store(data_dir)
+    await store.init()
+
+    channel_path = os.path.join(data_dir, "channels", "1.json")
+    with open(channel_path, "w") as f:
+        json.dump({
+            "meta": {"name": "old", "project_id": "proj"},
+            "messages": [],
+            "notes": [],
+            "logs": [],
+        }, f)
+
+    src = await store.get_channel_source(1)
+    assert src is None
+    await store.close()

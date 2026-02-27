@@ -42,9 +42,11 @@ class TelegramChat:
         self._next_update_offset: int | None = None
         self._typing_last_sent: dict[int, float] = {}
 
-        # Wire callbacks
-        self._router.set_progress_callback(self._handle_progress)
-        self._router.set_mapping_persist_callback(self._persist_channel_mapping)
+        self.SOURCE = "telegram"
+
+        # Wire listeners
+        self._router.add_progress_listener(self._handle_progress)
+        self._router.add_mapping_persist_listener(self._persist_channel_mapping)
 
     async def start(self):
         if not self._token:
@@ -61,6 +63,9 @@ class TelegramChat:
         log.info("Telegram bot frontend started%s", f" as @{self._bot_username}" if self._bot_username else "")
 
     async def stop(self):
+        self._router.remove_progress_listener(self._handle_progress)
+        self._router.remove_mapping_persist_listener(self._persist_channel_mapping)
+
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -79,9 +84,9 @@ class TelegramChat:
             self._http = None
 
     async def _hydrate_channel_mappings(self):
-        mapping = await self._store.get_channel_project_map()
+        mapping = await self._store.get_channel_project_map_by_source(self.SOURCE)
         for chat_id, project_id in mapping.items():
-            self._router.hydrate_channel_mapping(chat_id, project_id)
+            self._router.hydrate_channel_mapping(chat_id, project_id, source=self.SOURCE)
 
     async def _persist_channel_mapping(self, chat_id: int, project_id: str | None):
         await self._store.set_channel_project(chat_id, project_id)
@@ -164,6 +169,23 @@ class TelegramChat:
                 log.warning("Telegram polling error: %s", e)
                 await asyncio.sleep(2)
 
+    async def _ensure_channel_exists(self, chat_id: int, chat_title: str = ""):
+        """Tag a Telegram chat_id as belonging to this frontend."""
+        current = self._router.get_channel_source(chat_id)
+        if current == self.SOURCE:
+            return
+        if current is not None and current != self.SOURCE:
+            log.warning(
+                "Skipping source tag for Telegram chat %s (already owned by %s)",
+                chat_id,
+                current,
+            )
+            return
+        fallback_name = chat_title or f"Telegram {chat_id}"
+        await self._store.ensure_channel(chat_id, name=fallback_name, source=self.SOURCE)
+        await self._store.set_channel_source(chat_id, self.SOURCE)
+        self._router.set_channel_source(chat_id, self.SOURCE)
+
     async def _handle_update(self, update: dict):
         message = update.get("message")
         if not isinstance(message, dict):
@@ -185,6 +207,10 @@ class TelegramChat:
         text = self._normalize_incoming_text(text_raw, self._bot_username)
         if not text:
             return
+
+        # Ensure this chat is tagged as a telegram channel
+        chat_title = chat.get("title", "") or chat.get("first_name", "") or ""
+        await self._ensure_channel_exists(chat_id, chat_title)
 
         cmd = text.split(None, 1)[0].lower()
         if cmd in ("/start", "/help"):
@@ -334,12 +360,20 @@ class TelegramChat:
         if not chat_ids:
             return
 
+        # Only emit to channels owned by this frontend (NOT legacy None — those are web's)
+        owned_chat_ids = [
+            cid for cid in chat_ids
+            if self._router.get_channel_source(cid) == self.SOURCE
+        ]
+        if not owned_chat_ids:
+            return
+
         event_type = event.get("type", "")
         data_text = event.get("data", "")
         iteration = event.get("iteration", 0)
         ts = event.get("ts")
 
-        for chat_id in chat_ids:
+        for chat_id in owned_chat_ids:
             await self._persist_and_emit_progress(chat_id, project_id, event_type, data_text, iteration, ts)
 
     async def _persist_and_emit_progress(

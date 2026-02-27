@@ -49,9 +49,11 @@ class WebChat:
         self._background_tasks: set[asyncio.Task] = set()
         self._debug_flow = _env_flag("DCC_DEBUG_FLOW")
 
-        # Wire callbacks
-        self._router.set_progress_callback(self._handle_progress)
-        self._router.set_mapping_persist_callback(self._persist_channel_mapping)
+        self.SOURCE = "web"
+
+        # Wire listeners
+        self._router.add_progress_listener(self._handle_progress)
+        self._router.add_mapping_persist_listener(self._persist_channel_mapping)
 
     async def start(self):
         await self._hydrate_channel_mappings()
@@ -75,6 +77,9 @@ class WebChat:
         log.info("Web chat on http://%s:%s", self._host, self._port)
 
     async def stop(self):
+        self._router.remove_progress_listener(self._handle_progress)
+        self._router.remove_mapping_persist_listener(self._persist_channel_mapping)
+
         for ws in list(self._clients.values()):
             if not ws.closed:
                 await ws.close()
@@ -91,9 +96,12 @@ class WebChat:
             await self._runner.cleanup()
 
     async def _hydrate_channel_mappings(self):
-        mapping = await self._store.get_channel_project_map()
+        mapping = await self._store.get_channel_project_map_by_source(
+            self.SOURCE,
+            include_legacy=True,
+        )
         for chat_id, project_id in mapping.items():
-            self._router.hydrate_channel_mapping(chat_id, project_id)
+            self._router.hydrate_channel_mapping(chat_id, project_id, source=self.SOURCE)
 
     async def _persist_channel_mapping(self, chat_id: int, project_id: str | None):
         await self._store.set_channel_project(chat_id, project_id)
@@ -116,7 +124,10 @@ class WebChat:
         return web.json_response(messages)
 
     async def _handle_channels_list(self, request: web.Request) -> web.Response:
-        channels = await self._store.get_channel_list()
+        channels = await self._store.get_channel_list(
+            source=self.SOURCE,
+            include_legacy=True,
+        )
         for ch in channels:
             project_id = self._router.get_channel_project(ch["id"])
             ch["project_id"] = project_id
@@ -135,10 +146,12 @@ class WebChat:
         if project_id and not self._router.has_project(project_id):
             return web.json_response({"error": f"unknown project_id: {project_id}"}, status=400)
 
-        chat_id = await self._store.create_channel(name, project_id=project_id or None)
+        chat_id = await self._store.create_channel(name, project_id=project_id or None, source=self.SOURCE)
 
         if project_id:
-            await self._router.connect_channel(chat_id, project_id)
+            await self._router.connect_channel(chat_id, project_id, source=self.SOURCE)
+        else:
+            self._router.set_channel_source(chat_id, self.SOURCE)
 
         return web.json_response({"id": chat_id, "name": name, "project_id": project_id or None})
 
@@ -415,6 +428,14 @@ class WebChat:
                 )
             return
 
+        # Only emit to channels owned by this frontend (or legacy untagged ones)
+        owned_chat_ids = [
+            cid for cid in chat_ids
+            if self._router.get_channel_source(cid) in (self.SOURCE, None)
+        ]
+        if not owned_chat_ids:
+            return
+
         event_type = event.get("type", "")
         data_text = event.get("data", "")
         iteration = event.get("iteration", 0)
@@ -424,14 +445,14 @@ class WebChat:
             log.info(
                 "[flow/web] progress project=%s mapped_channels=%s event_id=%s type=%s iter=%s data_len=%s",
                 project_id,
-                chat_ids,
+                owned_chat_ids,
                 event.get("event_id", ""),
                 event_type,
                 iteration,
                 len(str(data_text)),
             )
 
-        for chat_id in chat_ids:
+        for chat_id in owned_chat_ids:
             await self._persist_and_emit_progress(chat_id, project_id, event_type, data_text, iteration, ts)
 
     async def _persist_and_emit_progress(

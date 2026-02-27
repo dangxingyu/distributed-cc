@@ -28,9 +28,9 @@ class Store:
     def _channel_path(self, chat_id: int) -> str:
         return os.path.join(self._channels_dir, f"{chat_id}.json")
 
-    def _default_channel_data(self, chat_id: int, name: str = "") -> dict:
+    def _default_channel_data(self, chat_id: int, name: str = "", source: str | None = None) -> dict:
         return {
-            "meta": {"name": name or f"Channel {chat_id}", "project_id": None},
+            "meta": {"name": name or f"Channel {chat_id}", "project_id": None, "source": source},
             "messages": [],
             "notes": [],
             "logs": [],
@@ -71,6 +71,8 @@ class Store:
                 meta["name"] = f"Channel {chat_id}"
             if "project_id" not in meta:
                 meta["project_id"] = None
+            if "source" not in meta:
+                meta["source"] = None
         return data
 
     def _save(self, chat_id: int, data: dict):
@@ -108,24 +110,85 @@ class Store:
 
     # ── channel management ──
 
-    async def create_channel(self, name: str, project_id: str | None = None) -> int:
+    async def create_channel(self, name: str, project_id: str | None = None, source: str | None = None) -> int:
         """Create a new channel with auto-incremented ID. Returns the chat_id."""
         async with self._channels_meta_lock:
             existing = self._list_channel_ids_unlocked()
             chat_id = max(existing, default=0) + 1
-            data = self._default_channel_data(chat_id, name=name)
+            data = self._default_channel_data(chat_id, name=name, source=source)
             data["meta"]["project_id"] = project_id or None
             self._save(chat_id, data)
             self._get_channel_lock(chat_id)
             return chat_id
 
-    async def get_channel_list(self) -> list[dict]:
-        """Return list of {id, name} for all channels, sorted by id."""
+    async def ensure_channel(self, chat_id: int, name: str = "", source: str | None = None):
+        """Ensure a channel file exists for a known chat_id.
+
+        If the channel already exists, fills missing metadata but does not
+        overwrite a non-default name.
+        """
+        async with self._get_channel_lock(chat_id):
+            path = self._channel_path(chat_id)
+            if not os.path.exists(path):
+                data = self._default_channel_data(chat_id, name=name, source=source)
+                self._save(chat_id, data)
+                return
+
+            data = self._load(chat_id)
+            meta = data.setdefault("meta", {})
+            changed = False
+            if name:
+                current_name = meta.get("name", "")
+                if not current_name or current_name == f"Channel {chat_id}":
+                    meta["name"] = name
+                    changed = True
+            if source is not None and meta.get("source") is None:
+                meta["source"] = source
+                changed = True
+            if changed:
+                self._save(chat_id, data)
+
+    async def get_channel_source(self, chat_id: int) -> str | None:
+        async with self._get_channel_lock(chat_id):
+            data = self._load(chat_id)
+            return data.get("meta", {}).get("source")
+
+    async def set_channel_source(self, chat_id: int, source: str | None):
+        async with self._get_channel_lock(chat_id):
+            path = self._channel_path(chat_id)
+            if not os.path.exists(path):
+                return
+            data = self._load(chat_id)
+            data.setdefault("meta", {})
+            data["meta"]["source"] = source
+            self._save(chat_id, data)
+
+    async def get_channel_list(
+        self,
+        source: str | None = None,
+        include_legacy: bool = False,
+    ) -> list[dict]:
+        """Return list of {id, name} for channels, sorted by id.
+
+        If *source* is given, only channels whose source matches are returned.
+        Legacy channels (source=None) are only included when
+        ``include_legacy=True``. If *source* is ``None``, all channels are
+        returned regardless of source.
+        """
         async with self._channels_meta_lock:
             result = []
             for chat_id in self._list_channel_ids_unlocked():
                 data = self._load(chat_id)
-                name = data.get("meta", {}).get("name", "") or f"Channel {chat_id}"
+                meta = data.get("meta", {})
+                ch_source = meta.get("source")
+                if source is not None:
+                    if ch_source == source:
+                        pass
+                    elif include_legacy and ch_source is None:
+                        pass
+                    else:
+                        continue
+                name = meta.get("name", "") or f"Channel {chat_id}"
                 result.append({"id": chat_id, "name": name})
             result.sort(key=lambda c: c["id"])
             return result
@@ -164,6 +227,30 @@ class Store:
     async def get_channel_project_map(self) -> dict[int, str]:
         mapping: dict[int, str] = {}
         for chat_id in await self.get_all_channel_ids():
+            project_id = await self.get_channel_project(chat_id)
+            if project_id:
+                mapping[chat_id] = project_id
+        return mapping
+
+    async def get_channel_project_map_by_source(
+        self,
+        source: str,
+        include_legacy: bool = False,
+    ) -> dict[int, str]:
+        """Like get_channel_project_map but filtered by source.
+
+        Returns channels whose source matches *source*. Legacy channels
+        (source=None) are only included when ``include_legacy=True``.
+        """
+        mapping: dict[int, str] = {}
+        for chat_id in await self.get_all_channel_ids():
+            ch_source = await self.get_channel_source(chat_id)
+            if ch_source == source:
+                pass
+            elif include_legacy and ch_source is None:
+                pass
+            else:
+                continue
             project_id = await self.get_channel_project(chat_id)
             if project_id:
                 mapping[chat_id] = project_id

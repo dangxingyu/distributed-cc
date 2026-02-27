@@ -1,5 +1,6 @@
 """Telegram frontend adapter tests (no real Telegram network calls)."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -109,3 +110,64 @@ async def test_tool_use_progress_only_goes_to_log(telegram_ctx):
     assert len(logs) == 1
     assert "pytest -q" in logs[0]["text"]
     chat._send_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_progress_only_emits_for_telegram_channels(telegram_ctx):
+    """Progress events should only be emitted to channels with source='telegram'."""
+    chat, router, store = telegram_ctx
+
+    # Create a web channel and a telegram channel on the same project
+    web_ch = await store.create_channel("web-chan", project_id="proj-a", source="web")
+    tg_ch = await store.create_channel("tg-chan", project_id="proj-a", source="telegram")
+
+    await router.connect_channel(web_ch, "proj-a", source="web")
+    await router.connect_channel(tg_ch, "proj-a", source="telegram")
+
+    chat._send_text = AsyncMock()
+
+    await chat._handle_progress("proj-a", {
+        "type": "text",
+        "data": "[orchestrator] hello from progress",
+        "iteration": 1,
+        "ts": 1234.0,
+    })
+
+    # Telegram channel should have the message persisted
+    tg_msgs = await store.get_recent_messages(tg_ch)
+    assert any("hello from progress" in m["content"] for m in tg_msgs)
+
+    # Web channel should NOT have the message
+    web_msgs = await store.get_recent_messages(web_ch)
+    assert not any("hello from progress" in m["content"] for m in web_msgs)
+
+
+@pytest.mark.asyncio
+async def test_ensure_channel_exists_sets_source(telegram_ctx):
+    """_ensure_channel_exists tags chat_id with telegram source."""
+    chat, router, store = telegram_ctx
+
+    assert router.get_channel_source(99999) is None
+    await chat._ensure_channel_exists(99999, "Test Group")
+    assert router.get_channel_source(99999) == "telegram"
+    assert await store.get_channel_source(99999) == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_handle_update_persists_source_for_new_chat(telegram_ctx):
+    chat, router, store = telegram_ctx
+    chat._send_text = AsyncMock()
+    chat._route_message = AsyncMock()
+
+    update = {
+        "message": {
+            "chat": {"id": 12345, "type": "private", "first_name": "Alice"},
+            "text": "hello",
+            "from": {"id": 1, "is_bot": False, "first_name": "Alice"},
+        }
+    }
+    await chat._handle_update(update)
+    await asyncio.sleep(0)
+
+    assert router.get_channel_source(12345) == "telegram"
+    assert await store.get_channel_source(12345) == "telegram"

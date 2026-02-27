@@ -83,11 +83,12 @@ class Router:
         self._deferred_tasks: dict[str, list[dict]] = {}
         self._deferred_retry_tasks: dict[str, asyncio.Task] = {}
 
-        # Callback to web layer
-        self._progress_callback = None  # async (project_id, event)
+        # Listener lists (multiple frontends)
+        self._progress_listeners: list[callable] = []
+        self._mapping_persist_listeners: list[callable] = []
 
-        # Optional callback to persist channel mapping
-        self._mapping_persist_callback = None  # async (chat_id, project_id|None)
+        # Channel source cache (frontend that owns each channel)
+        self._channel_source: dict[int, str | None] = {}
 
         # Router sessions — per-channel sysadmin Claude sessions
         self._router_sessions: dict[int, RouterSession] = {}
@@ -453,11 +454,11 @@ class Router:
             elif event_type == "iteration":
                 orch.status = "running"
 
-        if self._progress_callback:
+        for listener in self._progress_listeners:
             try:
-                await self._progress_callback(project_id, event)
+                await listener(project_id, event)
             except Exception:
-                log.warning("Progress callback failed", exc_info=True)
+                log.warning("Progress listener failed", exc_info=True)
 
         if event_type in ("done", "error", "stopped"):
             await self._maybe_start_deferred_task(project_id)
@@ -910,19 +911,20 @@ class Router:
             queue.pop(0)
             remaining = len(queue)
             orch.status = "running"
-            # Notify via progress callback so the web layer can inform the user
-            if self._progress_callback:
-                snippet = next_task["text"]
-                note = f"Starting queued task: {snippet}"
-                if remaining:
-                    note += f" ({remaining} more in queue)"
+            # Notify via progress listeners so frontends can inform the user
+            snippet = next_task["text"]
+            note = f"Starting queued task: {snippet}"
+            if remaining:
+                note += f" ({remaining} more in queue)"
+            deferred_event = {
+                "type": "text",
+                "data": f"@orchestrator {note}",
+                "iteration": 0,
+                "ts": time.time(),
+            }
+            for listener in self._progress_listeners:
                 try:
-                    await self._progress_callback(project_id, {
-                        "type": "text",
-                        "data": f"@orchestrator {note}",
-                        "iteration": 0,
-                        "ts": time.time(),
-                    })
+                    await listener(project_id, deferred_event)
                 except Exception:
                     pass
         else:
@@ -940,18 +942,19 @@ class Router:
                 self._schedule_deferred_retry(project_id, retries)
                 return
 
-            if self._progress_callback:
-                snippet = next_task["text"]
+            snippet = next_task["text"]
+            fail_event = {
+                "type": "text",
+                "data": (
+                    "@orchestrator Failed to start queued task: "
+                    f"{snippet} (attempt {retries})"
+                ),
+                "iteration": 0,
+                "ts": time.time(),
+            }
+            for listener in self._progress_listeners:
                 try:
-                    await self._progress_callback(project_id, {
-                        "type": "text",
-                        "data": (
-                            "@orchestrator Failed to start queued task: "
-                            f"{snippet} (attempt {retries})"
-                        ),
-                        "iteration": 0,
-                        "ts": time.time(),
-                    })
+                    await listener(project_id, fail_event)
                 except Exception:
                     pass
 
@@ -1290,22 +1293,35 @@ class Router:
 
     # -- channel/project mapping --------------------------------------
 
-    def set_mapping_persist_callback(self, callback):
-        self._mapping_persist_callback = callback
+    def add_mapping_persist_listener(self, callback):
+        if callback not in self._mapping_persist_listeners:
+            self._mapping_persist_listeners.append(callback)
+
+    def remove_mapping_persist_listener(self, callback):
+        try:
+            self._mapping_persist_listeners.remove(callback)
+        except ValueError:
+            pass
 
     async def _persist_channel_mapping(self, chat_id: int, project_id: str | None):
-        if self._mapping_persist_callback:
-            await self._mapping_persist_callback(chat_id, project_id)
+        for listener in self._mapping_persist_listeners:
+            try:
+                await listener(chat_id, project_id)
+            except Exception:
+                log.warning("Mapping persist listener failed", exc_info=True)
 
-    async def connect_channel(self, chat_id: int, project_id: str) -> bool:
+    async def connect_channel(self, chat_id: int, project_id: str, source: str | None = None) -> bool:
         if project_id not in self._orchestrators:
             return False
         self._channel_project[chat_id] = project_id
+        if source is not None:
+            self._channel_source[chat_id] = source
         await self._persist_channel_mapping(chat_id, project_id)
         return True
 
     async def disconnect_channel(self, chat_id: int):
         self._channel_project.pop(chat_id, None)
+        self._channel_source.pop(chat_id, None)
         await self._persist_channel_mapping(chat_id, None)
 
     async def _connect_channel(self, chat_id: int, project_id: str, send_reply: callable):
@@ -1350,10 +1366,12 @@ class Router:
         await self.connect_channel(chat_id, project_id)
         await send_reply(f"Connected to **{orch.name}** (`{project_id}`)")
 
-    def hydrate_channel_mapping(self, chat_id: int, project_id: str) -> bool:
+    def hydrate_channel_mapping(self, chat_id: int, project_id: str, source: str | None = None) -> bool:
         if project_id not in self._orchestrators:
             return False
         self._channel_project[chat_id] = project_id
+        if source is not None:
+            self._channel_source[chat_id] = source
         return True
 
     def get_channel_project(self, chat_id: int) -> str | None:
@@ -1404,10 +1422,25 @@ class Router:
     def list_orchestrators(self) -> list[RemoteOrchestrator]:
         return list(self._orchestrators.values())
 
-    # -- callbacks -----------------------------------------------------
+    # -- listeners -----------------------------------------------------
 
-    def set_progress_callback(self, callback: callable):
-        self._progress_callback = callback
+    def add_progress_listener(self, callback: callable):
+        if callback not in self._progress_listeners:
+            self._progress_listeners.append(callback)
+
+    def remove_progress_listener(self, callback: callable):
+        try:
+            self._progress_listeners.remove(callback)
+        except ValueError:
+            pass
+
+    # -- channel source cache ------------------------------------------
+
+    def set_channel_source(self, chat_id: int, source: str | None):
+        self._channel_source[chat_id] = source
+
+    def get_channel_source(self, chat_id: int) -> str | None:
+        return self._channel_source.get(chat_id)
 
     # -- health --------------------------------------------------------
 

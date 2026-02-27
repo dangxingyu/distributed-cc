@@ -57,9 +57,9 @@ async def main():
     parser = argparse.ArgumentParser(description="Distributed Claude Code — Router")
     parser.add_argument(
         "--frontend",
-        choices=["web", "telegram"],
+        choices=["web", "telegram", "both"],
         default="web",
-        help="User-facing frontend",
+        help="User-facing frontend (both = web + telegram simultaneously)",
     )
     parser.add_argument("--http-port", type=int, default=9120, help="Callback HTTP server port")
     parser.add_argument("--web-port", type=int, default=8080, help="Web chat frontend port")
@@ -86,42 +86,54 @@ async def main():
     http_app.router.add_post("/progress", handle_progress)
     http_runner = await start_callback_server(http_app, args.http_port)
 
-    # User frontend
-    if args.frontend == "web":
-        from .web import WebChat
+    # User frontend(s)
+    frontends = []
 
-        frontend = WebChat(
-            router=router,
-            store=store,
-            host=args.web_host,
-            port=args.web_port,
-        )
-        await frontend.start()
-        log.info("Running with Web frontend on http://%s:%s. Ctrl+C to stop.", args.web_host, args.web_port)
-    else:
-        from .telegram_chat import TelegramChat
+    try:
+        if args.frontend in ("web", "both"):
+            from .web import WebChat
 
-        frontend = TelegramChat(
-            router=router,
-            store=store,
-            token=args.telegram_token,
-        )
-        await frontend.start()
-        log.info("Running with Telegram frontend. Ctrl+C to stop.")
+            web_frontend = WebChat(
+                router=router,
+                store=store,
+                host=args.web_host,
+                port=args.web_port,
+            )
+            frontends.append(web_frontend)
+            await web_frontend.start()
+            log.info("Web frontend on http://%s:%s", args.web_host, args.web_port)
 
-    # Wait for signal
-    stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
-    await stop_event.wait()
+        if args.frontend in ("telegram", "both"):
+            from .telegram_chat import TelegramChat
 
-    # Cleanup
-    await frontend.stop()
-    await http_runner.cleanup()
-    await router.close()
-    await store.close()
-    log.info("Shutdown complete.")
+            tg_frontend = TelegramChat(
+                router=router,
+                store=store,
+                token=args.telegram_token,
+            )
+            frontends.append(tg_frontend)
+            await tg_frontend.start()
+            log.info("Telegram frontend started.")
+
+        log.info("Running with %s frontend(s). Ctrl+C to stop.", args.frontend)
+
+        # Wait for signal
+        stop_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+        await stop_event.wait()
+    finally:
+        for frontend in reversed(frontends):
+            try:
+                await frontend.stop()
+            except Exception:
+                log.warning("Frontend shutdown failed", exc_info=True)
+
+        await http_runner.cleanup()
+        await router.close()
+        await store.close()
+        log.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
