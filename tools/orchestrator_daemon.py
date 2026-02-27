@@ -143,6 +143,9 @@ CONTINUOUS_MODE_DEFAULT = os.environ.get("CONTINUOUS_MODE", "1").strip().lower()
 ROLE_CONFIG_DIR = ".claude/roles"
 ORCHESTRATOR_ROLE_FILE = f"{ROLE_CONFIG_DIR}/orchestrator.md"
 WORKER_ROLE_FILE = f"{ROLE_CONFIG_DIR}/worker.md"
+MCP_CONFIG_DIR = ".claude/mcp"
+ORCHESTRATOR_MCP_FILE = f"{MCP_CONFIG_DIR}/orchestrator.json"
+WORKER_MCP_FILE = f"{MCP_CONFIG_DIR}/worker.json"
 
 
 # -- split-role prompts ------------------------------------------------
@@ -402,6 +405,8 @@ orchestrator_sessions: dict[str, str] = {}  # project_id -> orchestrator session
 worker_sessions: dict[str, str] = {}  # project_id -> worker session
 orchestrator_prompt_hashes: dict[str, str] = {}  # project_id -> orchestrator prompt hash
 worker_prompt_hashes: dict[str, str] = {}  # project_id -> worker prompt hash
+orchestrator_plugin_hashes: dict[str, str] = {}  # project_id -> orchestrator MCP plugin hash
+worker_plugin_hashes: dict[str, str] = {}  # project_id -> worker MCP plugin hash
 current_worker_tasks: dict[str, asyncio.Task] = {}  # project_id -> active worker task
 callback_http_session: ClientSession | None = None
 callback_http_lock = asyncio.Lock()
@@ -476,6 +481,67 @@ def _compose_role_prompt(project_dir: str, role: str) -> tuple[str, str]:
             )
 
     return prompt, _hash_text(prompt)
+
+
+def _normalize_mcp_servers_payload(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+
+    if isinstance(raw.get("mcp_servers"), dict):
+        payload = raw["mcp_servers"]
+    elif isinstance(raw.get("servers"), dict):
+        payload = raw["servers"]
+    else:
+        payload = raw
+
+    normalized: dict[str, dict] = {}
+    for name, cfg in payload.items():
+        key = str(name or "").strip()
+        if not key:
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        normalized[key] = cfg
+    return normalized
+
+
+def _load_role_mcp_servers(project_dir: str, role: str) -> tuple[dict, str]:
+    """Load role-specific MCP server declarations from project files."""
+    if role == "orchestrator":
+        path = Path(project_dir) / ORCHESTRATOR_MCP_FILE
+    elif role == "worker":
+        path = Path(project_dir) / WORKER_MCP_FILE
+    else:
+        raise ValueError(f"Unknown role for MCP config: {role}")
+
+    if not path.exists():
+        return {}, _hash_text("{}")
+
+    try:
+        raw_text = path.read_text()
+    except Exception as e:
+        log.warning("Failed reading MCP config %s: %s", path, e)
+        return {}, _hash_text("{}")
+
+    try:
+        data = json.loads(raw_text)
+    except Exception as e:
+        log.warning("Invalid MCP config JSON %s: %s", path, e)
+        return {}, _hash_text("{}")
+
+    servers = _normalize_mcp_servers_payload(data)
+    servers_hash = _hash_text(json.dumps(servers, sort_keys=True))
+    return servers, servers_hash
+
+
+def _merge_mcp_servers(base_servers: dict, extra_servers: dict, reserved_names: set[str]) -> dict:
+    merged = dict(base_servers)
+    for name, cfg in extra_servers.items():
+        if name in reserved_names:
+            log.warning("Ignoring role MCP config server '%s' (reserved name)", name)
+            continue
+        merged[name] = cfg
+    return merged
 
 
 def _interrupt_payload_meta(payload) -> dict:
@@ -952,7 +1018,9 @@ async def _run_worker_turn(
     captured_report: list[str] = []
     worker_mcp = _create_worker_tools(project_id, iteration, captured_report)
     worker_prompt, worker_prompt_hash = _compose_role_prompt(project.project_dir, "worker")
+    worker_plugin_servers, worker_plugin_hash = _load_role_mcp_servers(project.project_dir, "worker")
     previous_hash = worker_prompt_hashes.get(project_id)
+    previous_plugin_hash = worker_plugin_hashes.get(project_id)
 
     # Role memory changed; start a fresh worker session so new instructions load.
     if previous_hash and previous_hash != worker_prompt_hash and worker_session_id:
@@ -962,7 +1030,21 @@ async def _run_worker_turn(
         )
         worker_session_id = ""
         worker_sessions.pop(project_id, None)
+    if previous_plugin_hash and previous_plugin_hash != worker_plugin_hash and worker_session_id:
+        log.info(
+            "Worker MCP plugin config changed for %s; resetting worker session",
+            project_id,
+        )
+        worker_session_id = ""
+        worker_sessions.pop(project_id, None)
     worker_prompt_hashes[project_id] = worker_prompt_hash
+    worker_plugin_hashes[project_id] = worker_plugin_hash
+
+    mcp_servers = _merge_mcp_servers(
+        base_servers={"worker_tools": worker_mcp},
+        extra_servers=worker_plugin_servers,
+        reserved_names={"worker_tools"},
+    )
 
     options = ClaudeAgentOptions(
         permission_mode=permission_mode,
@@ -970,7 +1052,7 @@ async def _run_worker_turn(
         cwd=project.project_dir,
         max_turns=50,
         setting_sources=["project"],  # loads CLAUDE.md from project dir natively
-        mcp_servers={"worker_tools": worker_mcp},
+        mcp_servers=mcp_servers,
     )
 
     if worker_session_id:
@@ -1385,6 +1467,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
 def _build_orchestrator_options(
     project_dir: str,
     mcp_server,
+    plugin_mcp_servers: dict,
     max_iterations: int,
     session_id: str,
     system_prompt: str,
@@ -1399,12 +1482,17 @@ def _build_orchestrator_options(
         max_turns = 160
 
     active_model = session_model if session_id and session_model else model
+    merged_mcp_servers = _merge_mcp_servers(
+        base_servers={"daemon": mcp_server},
+        extra_servers=plugin_mcp_servers,
+        reserved_names={"daemon"},
+    )
     options = ClaudeAgentOptions(
         permission_mode=permission_mode,
         model=active_model,
         cwd=project_dir,
         setting_sources=["project"],  # load shared CLAUDE.md natively
-        mcp_servers={"daemon": mcp_server},
+        mcp_servers=merged_mcp_servers,
         max_turns=max_turns,
     )
     if session_id:
@@ -1468,7 +1556,12 @@ async def run_task(
                 project.project_dir,
                 "orchestrator",
             )
+            orchestrator_plugin_servers, orchestrator_plugin_hash = _load_role_mcp_servers(
+                project.project_dir,
+                "orchestrator",
+            )
             previous_hash = orchestrator_prompt_hashes.get(project_id)
+            previous_plugin_hash = orchestrator_plugin_hashes.get(project_id)
             if previous_hash and previous_hash != orchestrator_prompt_hash and orchestrator_session_id:
                 log.info(
                     "Orchestrator role memory changed for %s; resetting orchestrator session",
@@ -1478,12 +1571,27 @@ async def run_task(
                 orchestrator_sessions.pop(project_id, None)
                 state.orchestrator_session_id = ""
                 state.sdk_session_id = ""
+            if (
+                previous_plugin_hash
+                and previous_plugin_hash != orchestrator_plugin_hash
+                and orchestrator_session_id
+            ):
+                log.info(
+                    "Orchestrator MCP plugin config changed for %s; resetting orchestrator session",
+                    project_id,
+                )
+                orchestrator_session_id = ""
+                orchestrator_sessions.pop(project_id, None)
+                state.orchestrator_session_id = ""
+                state.sdk_session_id = ""
             orchestrator_prompt_hashes[project_id] = orchestrator_prompt_hash
+            orchestrator_plugin_hashes[project_id] = orchestrator_plugin_hash
 
             done_event = asyncio.Event()
             options = _build_orchestrator_options(
                 project_dir=project.project_dir,
                 mcp_server=mcp_server,
+                plugin_mcp_servers=orchestrator_plugin_servers,
                 max_iterations=max_iterations,
                 session_id=orchestrator_session_id,
                 system_prompt=orchestrator_prompt,
@@ -1717,6 +1825,8 @@ def _save_state(
         "worker_session_id": worker_session_id,
         "orchestrator_prompt_hash": orchestrator_prompt_hashes.get(state.project_id, ""),
         "worker_prompt_hash": worker_prompt_hashes.get(state.project_id, ""),
+        "orchestrator_plugin_hash": orchestrator_plugin_hashes.get(state.project_id, ""),
+        "worker_plugin_hash": worker_plugin_hashes.get(state.project_id, ""),
         "started_at": state.started_at,
         "finished_at": state.finished_at,
         "summary": state.summary,
@@ -1738,7 +1848,7 @@ def _load_state(project_id: str) -> dict | None:
 
 
 def _hydrate_sessions_from_state(project_id: str) -> bool:
-    """Restore orchestrator/worker session IDs and prompt hashes from persisted state."""
+    """Restore orchestrator/worker session IDs and prompt/plugin hashes from persisted state."""
     data = _load_state(project_id)
     if not data:
         return False
@@ -1760,6 +1870,12 @@ def _hydrate_sessions_from_state(project_id: str) -> bool:
         orchestrator_prompt_hashes[project_id] = orch_prompt_hash
     if worker_prompt_hash:
         worker_prompt_hashes[project_id] = worker_prompt_hash
+    orch_plugin_hash = str(data.get("orchestrator_plugin_hash") or "").strip()
+    worker_plugin_hash = str(data.get("worker_plugin_hash") or "").strip()
+    if orch_plugin_hash:
+        orchestrator_plugin_hashes[project_id] = orch_plugin_hash
+    if worker_plugin_hash:
+        worker_plugin_hashes[project_id] = worker_plugin_hash
     return bool(orch_sid or worker_sid)
 
 

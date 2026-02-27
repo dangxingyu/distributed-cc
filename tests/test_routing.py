@@ -726,6 +726,42 @@ async def test_upgrade_check_command_routes_to_router():
         mock_router.assert_called_once_with(1, "/upgrade-check ftgs", send_reply, send_log, None)
 
 
+async def test_orchestrator_plugin_command_routes_to_router():
+    """/orchestrator_plugin routes to _handle_router_message."""
+    router = _make_router([])
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_router:
+        await router.route_message(1, "/orchestrator_plugin add filesystem mcp", send_reply, send_log)
+        mock_router.assert_called_once_with(
+            1,
+            "/orchestrator_plugin add filesystem mcp",
+            send_reply,
+            send_log,
+            None,
+        )
+
+
+async def test_worker_plugin_command_routes_to_router():
+    """/worker_plugin routes to _handle_router_message."""
+    router = _make_router([])
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch.object(router, "_handle_router_message", new_callable=AsyncMock) as mock_router:
+        await router.route_message(1, "/worker_plugin add memory mcp", send_reply, send_log)
+        mock_router.assert_called_once_with(
+            1,
+            "/worker_plugin add memory mcp",
+            send_reply,
+            send_log,
+            None,
+        )
+
+
 async def test_setup_project_prompt_enforces_workdir_and_health_gates(tmp_path):
     """Injected /setup-project template requires work_dir + writability + health checks."""
     (tmp_path / "config.json").write_text('{"servers": []}')
@@ -879,6 +915,57 @@ async def test_upgrade_check_prompt_requires_confirmation(tmp_path):
     assert "Proceed with upgrade now? (yes/no)" in prompt
 
 
+async def test_orchestrator_plugin_prompt_includes_role_and_target_file(tmp_path):
+    (tmp_path / "config.json").write_text('{"servers": []}')
+    router = Router(cwd=str(tmp_path))
+    router._orchestrators["ftgs"] = RemoteOrchestrator(
+        project_id="ftgs",
+        name="della-gpu",
+        host="user@host",
+        broker_port=8203,
+        project_dir="/scratch/ftgs",
+        status="idle",
+    )
+    router._channel_project[1] = "ftgs"
+    captured_prompt = {"text": ""}
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            captured_prompt["text"] = prompt
+            return "ok"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return True
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(
+            1,
+            "/orchestrator_plugin add filesystem and memory servers",
+            send_reply,
+            send_log,
+            None,
+        )
+        task = router._router_tasks[1]
+        await task
+
+    prompt = captured_prompt["text"]
+    assert "MCP PLUGIN SETUP MODE (/orchestrator_plugin)" in prompt
+    assert "target_role: orchestrator" in prompt
+    assert "target_plugin_file: .claude/mcp/orchestrator.json" in prompt
+    assert "connected_project: ftgs" in prompt
+    assert "Canonical schema" in prompt
+    assert "activation behavior" in prompt.lower()
+
+
 async def test_setup_server_prompt_is_machine_only(tmp_path):
     (tmp_path / "config.json").write_text('{"servers": []}')
     router = Router(cwd=str(tmp_path))
@@ -965,6 +1052,29 @@ def test_parse_setup_project_command_basic():
 def test_parse_setup_project_command_missing_instruction():
     router = Router()
     parsed = router._parse_setup_project_command("/setup-project")
+    assert parsed["mode"] == "error"
+    assert "missing instruction" in str(parsed["error"]).lower()
+
+
+def test_parse_plugin_setup_command_basic():
+    router = Router()
+    parsed = router._parse_plugin_setup_command("/worker_plugin add memory")
+    assert parsed["mode"] == "plugin_setup"
+    assert parsed["role"] == "worker"
+    assert parsed["instruction"] == "add memory"
+
+
+def test_parse_plugin_setup_command_dash_alias():
+    router = Router()
+    parsed = router._parse_plugin_setup_command("/orchestrator-plugin add filesystem")
+    assert parsed["mode"] == "plugin_setup"
+    assert parsed["role"] == "orchestrator"
+    assert parsed["instruction"] == "add filesystem"
+
+
+def test_parse_plugin_setup_command_missing_instruction():
+    router = Router()
+    parsed = router._parse_plugin_setup_command("/worker_plugin")
     assert parsed["mode"] == "error"
     assert "missing instruction" in str(parsed["error"]).lower()
 

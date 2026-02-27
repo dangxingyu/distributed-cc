@@ -39,6 +39,7 @@ DEFERRED_RETRY_INITIAL_SECONDS = 0.5
 DEFERRED_RETRY_MAX_SECONDS = 10.0
 CHANNEL_CONTEXT_HISTORY_MAX = 24
 DOCTOR_CONTEXT_MESSAGES = 10
+PLUGIN_CONTEXT_MESSAGES = 10
 
 
 @dataclass
@@ -547,11 +548,16 @@ class Router:
             return
 
         # Setup/diagnostics commands are shorthand for @router
+        lower_stripped = stripped.lower()
         if (
-            stripped.startswith("/setup-project")
-            or stripped.startswith("/setup")
-            or stripped.startswith("/doctor")
-            or stripped.startswith("/upgrade-check")
+            lower_stripped.startswith("/setup-project")
+            or lower_stripped.startswith("/setup")
+            or lower_stripped.startswith("/doctor")
+            or lower_stripped.startswith("/upgrade-check")
+            or lower_stripped.startswith("/orchestrator_plugin")
+            or lower_stripped.startswith("/orchestrator-plugin")
+            or lower_stripped.startswith("/worker_plugin")
+            or lower_stripped.startswith("/worker-plugin")
         ):
             await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
             return
@@ -818,6 +824,110 @@ class Router:
                 ),
             }
         return {"mode": "setup_project", "instruction": body}
+
+    def _parse_plugin_setup_command(self, text: str) -> dict[str, object]:
+        stripped = text.strip()
+        lower = stripped.lower()
+        prefixes = (
+            ("/orchestrator_plugin", "orchestrator"),
+            ("/orchestrator-plugin", "orchestrator"),
+            ("/worker_plugin", "worker"),
+            ("/worker-plugin", "worker"),
+        )
+        for prefix, role in prefixes:
+            if lower.startswith(prefix):
+                instruction = stripped[len(prefix):].strip()
+                if not instruction:
+                    return {
+                        "mode": "error",
+                        "error": (
+                            f"Missing instruction. Usage: `{prefix} <plugin instruction>`."
+                        ),
+                    }
+                return {
+                    "mode": "plugin_setup",
+                    "role": role,
+                    "instruction": instruction,
+                    "prefix": prefix,
+                }
+        return {"mode": "none"}
+
+    def _build_plugin_setup_prompt(self, chat_id: int, role: str, instruction: str) -> str:
+        role = role.strip().lower()
+        if role not in ("orchestrator", "worker"):
+            raise ValueError(f"Invalid plugin role: {role}")
+
+        project_id = self._channel_project.get(chat_id)
+        orch = self._orchestrators.get(project_id) if project_id else None
+        if orch:
+            connected = (
+                f"{project_id} (name={orch.name}, host={orch.host}, broker_port={orch.broker_port}, "
+                f"project_dir={orch.project_dir}, status={orch.status})"
+            )
+        elif project_id:
+            connected = f"{project_id} (missing from current config)"
+        else:
+            connected = "(none)"
+
+        known_projects = ", ".join(sorted(self._orchestrators.keys())) or "(none)"
+        raw_history = list(self._channel_context_history.get(chat_id) or [])
+        recent = [
+            line for line in raw_history
+            if not (
+                line.lower().startswith("/orchestrator_plugin")
+                or line.lower().startswith("/orchestrator-plugin")
+                or line.lower().startswith("/worker_plugin")
+                or line.lower().startswith("/worker-plugin")
+            )
+        ]
+        recent = recent[-PLUGIN_CONTEXT_MESSAGES:]
+        recent_lines = "\n".join(f"- {line}" for line in recent) if recent else "- (none)"
+
+        role_file = f".claude/mcp/{role}.json"
+        cmd_name = f"/{role}_plugin"
+
+        return (
+            f"MCP PLUGIN SETUP MODE ({cmd_name})\n\n"
+            "Goal: configure role-specific MCP servers for one project without editing config.json.\n\n"
+            "Context snapshot:\n"
+            f"- channel_id: {chat_id}\n"
+            f"- target_role: {role}\n"
+            f"- target_plugin_file: {role_file}\n"
+            f"- connected_project: {connected}\n"
+            f"- known_projects: {known_projects}\n"
+            f"- user_instruction: {instruction}\n"
+            "- recent_channel_messages:\n"
+            f"{recent_lines}\n\n"
+            "Workflow:\n"
+            "1) Read config.json and config.md (if present).\n"
+            "2) Resolve EXACTLY one target project_id by priority: explicit user instruction > connected project.\n"
+            "   - If ambiguous or missing, ask one precise clarifying question and STOP.\n"
+            "3) Determine host, broker_port, and work_dir from that project.\n"
+            "4) Configure role-specific MCP file at `<work_dir>/.claude/mcp/<role>.json`:\n"
+            "   - Canonical schema:\n"
+            "     {\n"
+            "       \"mcp_servers\": {\n"
+            "         \"name\": {\"command\": \"...\", \"args\": [\"...\"], \"env\": {\"K\": \"V\"}}\n"
+            "       }\n"
+            "     }\n"
+            "   - Keep existing unrelated server entries unless user asks to replace.\n"
+            "   - Do NOT overwrite `.claude/roles/*.md` in this flow.\n"
+            "5) Install/check prerequisites for requested MCP servers on target machine.\n"
+            "   - Validate executable commands (npx/python binaries, package availability).\n"
+            "6) Validate plugin JSON syntax and show a concise diff/evidence.\n"
+            "7) Verify daemon endpoint health for target broker_port:\n"
+            "   - `curl http://127.0.0.1:<broker_port>/health`\n"
+            "   - require `status == \"ok\"` and non-empty `daemon`.\n"
+            "8) Explain activation behavior:\n"
+            "   - orchestrator plugin: effective next orchestrator query cycle\n"
+            "   - worker plugin: effective on next worker assignment\n\n"
+            "Strict rules:\n"
+            "- Do NOT change machine/project mappings in config.json unless user explicitly asks.\n"
+            "- Do NOT leak secrets in chat; reference env vars for sensitive values.\n\n"
+            "Response format:\n"
+            "- READY: project_id, role, plugin_file, servers configured, validation evidence, activation note.\n"
+            "- NOT READY: failing check + exact command/output + next action.\n"
+        )
 
     def _record_channel_context(self, chat_id: int, text: str):
         compact = " ".join((text or "").split())
@@ -1246,7 +1356,16 @@ class Router:
         session.set_callbacks(progress=setup_reply, log=send_log)
 
         stripped = text.strip()
-        if stripped.startswith("/setup-project"):
+        lower_stripped = stripped.lower()
+        plugin_req = self._parse_plugin_setup_command(stripped)
+        if plugin_req.get("mode") == "error":
+            await setup_reply(str(plugin_req.get("error", "Invalid plugin setup command.")))
+            return
+        if plugin_req.get("mode") == "plugin_setup":
+            role = str(plugin_req.get("role", ""))
+            instruction = str(plugin_req.get("instruction", ""))
+            prompt = self._build_plugin_setup_prompt(chat_id, role, instruction)
+        elif lower_stripped.startswith("/setup-project"):
             setup_project_req = self._parse_setup_project_command(stripped)
             if setup_project_req.get("mode") == "error":
                 await setup_reply(str(setup_project_req.get("error", "Invalid /setup-project command.")))
@@ -1284,7 +1403,7 @@ class Router:
                 "- READY: project_id, work_dir, host, broker_port, `/connect <project_id>`, evidence.\n"
                 "- NOT READY: failing check + exact command/output + next action.\n"
             )
-        elif stripped.startswith("/setup"):
+        elif lower_stripped.startswith("/setup"):
             setup_req = self._parse_setup_command(stripped)
             mode = setup_req.get("mode")
             if mode == "error":
@@ -1353,10 +1472,10 @@ class Router:
                     "Flag legacy/invalid payloads (for example `server` without `daemon`) as DOWN. "
                     "Return a concise table: host, broker_port, health(up/down), daemon_name, error(if any)."
                 )
-        elif stripped.startswith("/doctor"):
+        elif lower_stripped.startswith("/doctor"):
             doctor_hint = stripped[len("/doctor"):].strip()
             prompt = self._build_doctor_prompt(chat_id, doctor_hint)
-        elif stripped.startswith("/upgrade-check"):
+        elif lower_stripped.startswith("/upgrade-check"):
             upgrade_hint = stripped[len("/upgrade-check"):].strip()
             prompt = self._build_upgrade_check_prompt(chat_id, upgrade_hint)
         else:

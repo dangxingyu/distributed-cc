@@ -120,6 +120,8 @@ It **must not** set project workdirs or project CLAUDE memory.
 | `/connect` | Show current connection |
 | `/status` | Show current project/daemon status |
 | `/queue [list|edit|delete|move|clear]` | Inspect or modify queued next-task items for current project |
+| `/orchestrator_plugin <instruction>` | Configure role-specific MCP servers for orchestrator (`.claude/mcp/orchestrator.json`) |
+| `/worker_plugin <instruction>` | Configure role-specific MCP servers for worker (`.claude/mcp/worker.json`) |
 | `/stop` | Stop current running router/orchestrator task |
 | `/setup <user@host> [--manual-tunnel]` | Machine setup (daemon + tunnel) |
 | `/setup` | Health-check configured machine endpoints |

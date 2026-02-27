@@ -156,6 +156,74 @@ def test_compose_role_prompt_appends_role_memory(tmp_path):
     assert prompt_hash != baseline_hash
 
 
+def test_load_role_mcp_servers_supports_mcp_servers_schema(tmp_path):
+    from orchestrator_daemon import (
+        _load_role_mcp_servers,
+        ORCHESTRATOR_MCP_FILE,
+    )
+
+    cfg_path = tmp_path / ORCHESTRATOR_MCP_FILE
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "mcp_servers": {
+                    "filesystem": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+                    }
+                }
+            }
+        )
+    )
+
+    servers, cfg_hash = _load_role_mcp_servers(str(tmp_path), "orchestrator")
+    assert "filesystem" in servers
+    assert servers["filesystem"]["command"] == "npx"
+    assert isinstance(cfg_hash, str) and cfg_hash
+
+
+def test_load_role_mcp_servers_supports_direct_mapping_schema(tmp_path):
+    from orchestrator_daemon import (
+        _load_role_mcp_servers,
+        WORKER_MCP_FILE,
+    )
+
+    cfg_path = tmp_path / WORKER_MCP_FILE
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "memory": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-memory"],
+                }
+            }
+        )
+    )
+
+    servers, cfg_hash = _load_role_mcp_servers(str(tmp_path), "worker")
+    assert "memory" in servers
+    assert servers["memory"]["command"] == "npx"
+    assert isinstance(cfg_hash, str) and cfg_hash
+
+
+def test_merge_mcp_servers_skips_reserved_names():
+    from orchestrator_daemon import _merge_mcp_servers
+
+    merged = _merge_mcp_servers(
+        base_servers={"daemon": {"type": "sdk", "name": "daemon"}},
+        extra_servers={
+            "daemon": {"command": "echo", "args": ["oops"]},
+            "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
+        },
+        reserved_names={"daemon"},
+    )
+    assert "daemon" in merged
+    assert merged["daemon"]["type"] == "sdk"
+    assert "filesystem" in merged
+
+
 def test_interrupt_queue_is_bounded_and_typed():
     """Interrupt queue should be typed and bounded, dropping oldest when full."""
     from orchestrator_daemon import (
@@ -419,8 +487,10 @@ def test_normalize_permission_mode_helper():
 def test_hydrate_sessions_from_state(tmp_path):
     from orchestrator_daemon import (
         _hydrate_sessions_from_state,
+        orchestrator_plugin_hashes,
         orchestrator_sessions,
         orchestrator_prompt_hashes,
+        worker_plugin_hashes,
         worker_sessions,
         worker_prompt_hashes,
     )
@@ -436,6 +506,8 @@ def test_hydrate_sessions_from_state(tmp_path):
                 "sdk_session_id": "orch-sid",
                 "orchestrator_prompt_hash": "orch-hash",
                 "worker_prompt_hash": "worker-hash",
+                "orchestrator_plugin_hash": "orch-plugin-hash",
+                "worker_plugin_hash": "worker-plugin-hash",
             }
         )
     )
@@ -446,18 +518,24 @@ def test_hydrate_sessions_from_state(tmp_path):
     worker_sessions.pop(project_id, None)
     orchestrator_prompt_hashes.pop(project_id, None)
     worker_prompt_hashes.pop(project_id, None)
+    orchestrator_plugin_hashes.pop(project_id, None)
+    worker_plugin_hashes.pop(project_id, None)
     try:
         assert _hydrate_sessions_from_state(project_id) is True
         assert orchestrator_sessions[project_id] == "orch-sid"
         assert worker_sessions[project_id] == "worker-sid"
         assert orchestrator_prompt_hashes[project_id] == "orch-hash"
         assert worker_prompt_hashes[project_id] == "worker-hash"
+        assert orchestrator_plugin_hashes[project_id] == "orch-plugin-hash"
+        assert worker_plugin_hashes[project_id] == "worker-plugin-hash"
     finally:
         daemon_mod.STATE_DIR = old_state_dir
         orchestrator_sessions.pop(project_id, None)
         worker_sessions.pop(project_id, None)
         orchestrator_prompt_hashes.pop(project_id, None)
         worker_prompt_hashes.pop(project_id, None)
+        orchestrator_plugin_hashes.pop(project_id, None)
+        worker_plugin_hashes.pop(project_id, None)
 
 
 @pytest.mark.asyncio

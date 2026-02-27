@@ -76,6 +76,7 @@ def _setup_daemon_app():
     app.router.add_post("/task", daemon_mod.handle_task)
     app.router.add_post("/interrupt", daemon_mod.handle_interrupt)
     app.router.add_get("/status", daemon_mod.handle_status)
+    app.router.add_get("/events", daemon_mod.handle_events)
     app.router.add_get("/stream", daemon_mod.handle_stream)
     app.router.add_post("/stop", daemon_mod.handle_stop)
     app.router.add_get("/health", daemon_mod.handle_health)
@@ -104,6 +105,8 @@ def _patch_daemon_globals(name: str, callback_url: str):
         "worker_sessions": dict(daemon_mod.worker_sessions),
         "orchestrator_prompt_hashes": dict(daemon_mod.orchestrator_prompt_hashes),
         "worker_prompt_hashes": dict(daemon_mod.worker_prompt_hashes),
+        "orchestrator_plugin_hashes": dict(daemon_mod.orchestrator_plugin_hashes),
+        "worker_plugin_hashes": dict(daemon_mod.worker_plugin_hashes),
     }
     daemon_mod.DAEMON_NAME = name
     daemon_mod.CALLBACK_URL = callback_url
@@ -118,6 +121,8 @@ def _patch_daemon_globals(name: str, callback_url: str):
     daemon_mod.worker_sessions.clear()
     daemon_mod.orchestrator_prompt_hashes.clear()
     daemon_mod.worker_prompt_hashes.clear()
+    daemon_mod.orchestrator_plugin_hashes.clear()
+    daemon_mod.worker_plugin_hashes.clear()
 
     def restore():
         for task in list(daemon_mod.running_tasks.values()):
@@ -146,6 +151,10 @@ def _patch_daemon_globals(name: str, callback_url: str):
         daemon_mod.orchestrator_prompt_hashes.update(orig["orchestrator_prompt_hashes"])
         daemon_mod.worker_prompt_hashes.clear()
         daemon_mod.worker_prompt_hashes.update(orig["worker_prompt_hashes"])
+        daemon_mod.orchestrator_plugin_hashes.clear()
+        daemon_mod.orchestrator_plugin_hashes.update(orig["orchestrator_plugin_hashes"])
+        daemon_mod.worker_plugin_hashes.clear()
+        daemon_mod.worker_plugin_hashes.update(orig["worker_plugin_hashes"])
         state_dir_ctx.cleanup()
 
     return restore
@@ -1539,6 +1548,175 @@ async def test_e2e_state_persists_prompt_hashes():
                 assert len(orch_hash) == 64, state
                 assert len(worker_hash) == 64, state
                 assert (Path(sandbox) / "state_hash_probe.txt").exists()
+        finally:
+            restore()
+            await runner.cleanup()
+
+
+# ── T16: Orchestrator MCP plugin call is visible in event stream ─────
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_orchestrator_plugin_tool_use_event():
+    """orchestrator.json plugin should expose MCP tools that appear in tool_use events."""
+    _clear_nesting_guard()
+
+    project_id = _unique_project_id("plugin-orch-fs")
+    with tempfile.TemporaryDirectory(prefix="dcc_e2e_orch_plugin_") as sandbox:
+        restore = _patch_daemon_globals(
+            name="e2e-orch-plugin",
+            callback_url="http://127.0.0.1:19999",
+        )
+        app = _setup_daemon_app()
+        runner, port = await _start_test_server(app)
+        base = _base_url(port)
+
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=360)) as http:
+                async with http.post(
+                    f"{base}/register",
+                    json={"project_id": project_id, "project_dir": sandbox, "name": project_id},
+                ) as resp:
+                    assert resp.status == 200
+
+                mcp_dir = Path(sandbox) / ".claude" / "mcp"
+                mcp_dir.mkdir(parents=True, exist_ok=True)
+                (mcp_dir / "orchestrator.json").write_text(
+                    json.dumps(
+                        {
+                            "filesystem": {
+                                "command": "npx",
+                                "args": [
+                                    "-y",
+                                    "@modelcontextprotocol/server-filesystem",
+                                    sandbox,
+                                ],
+                            }
+                        },
+                        indent=2,
+                    )
+                )
+
+                status = await _start_task_and_wait(
+                    http=http,
+                    base=base,
+                    project_id=project_id,
+                    task=(
+                        "Strict requirements:\n"
+                        "1) Use the filesystem MCP tool list_allowed_directories exactly once.\n"
+                        "2) Do NOT call assign_worker.\n"
+                        "3) Call task_complete with one line: FS_PLUGIN_CHECK: done.\n"
+                    ),
+                    max_iterations=3,
+                    timeout_secs=220,
+                )
+                assert status["status"] == "done", status
+                assert "FS_PLUGIN_CHECK: done" in str(status.get("summary", "")), status
+
+                async with http.get(
+                    f"{base}/events",
+                    params={"project_id": project_id, "limit": 500},
+                ) as resp:
+                    assert resp.status == 200
+                    payload = await resp.json()
+
+                events = payload.get("events", [])
+                tool_events = [str(e.get("data", "")) for e in events if e.get("type") == "tool_use"]
+                assert any(
+                    "[orchestrator]" in msg and "list_allowed_directories" in msg
+                    for msg in tool_events
+                ), tool_events[-30:]
+        finally:
+            restore()
+            await runner.cleanup()
+
+
+# ── T17: Worker MCP plugin tools are visible in event stream ─────────
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_e2e_worker_plugin_tool_use_events():
+    """worker.json plugin should expose memory MCP tools used during assign_worker."""
+    _clear_nesting_guard()
+
+    project_id = _unique_project_id("plugin-worker-memory")
+    sentinel_node = f"MCP_MEMORY_SENTINEL_{uuid.uuid4().hex[:8]}"
+
+    with tempfile.TemporaryDirectory(prefix="dcc_e2e_worker_plugin_") as sandbox:
+        restore = _patch_daemon_globals(
+            name="e2e-worker-plugin",
+            callback_url="http://127.0.0.1:19999",
+        )
+        app = _setup_daemon_app()
+        runner, port = await _start_test_server(app)
+        base = _base_url(port)
+
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=420)) as http:
+                async with http.post(
+                    f"{base}/register",
+                    json={"project_id": project_id, "project_dir": sandbox, "name": project_id},
+                ) as resp:
+                    assert resp.status == 200
+
+                mcp_dir = Path(sandbox) / ".claude" / "mcp"
+                mcp_dir.mkdir(parents=True, exist_ok=True)
+                (mcp_dir / "worker.json").write_text(
+                    json.dumps(
+                        {
+                            "memory": {
+                                "command": "npx",
+                                "args": [
+                                    "-y",
+                                    "@modelcontextprotocol/server-memory",
+                                ],
+                            }
+                        },
+                        indent=2,
+                    )
+                )
+
+                status = await _start_task_and_wait(
+                    http=http,
+                    base=base,
+                    project_id=project_id,
+                    task=(
+                        "Follow exactly:\n"
+                        "1) Call assign_worker exactly once (do not edit files directly).\n"
+                        "2) Ask worker to use memory MCP tools:\n"
+                        f"   - call create_entities to create entity {sentinel_node}\n"
+                        "   - call read_graph to verify the entity exists\n"
+                        "3) Worker must create worker_memory_plugin_probe.txt containing MEMORY_PLUGIN_OK.\n"
+                        "4) Call task_complete.\n"
+                    ),
+                    max_iterations=4,
+                    timeout_secs=260,
+                )
+                assert status["status"] == "done", status
+                assert (Path(sandbox) / "worker_memory_plugin_probe.txt").exists()
+
+                report_path = Path(sandbox) / ".reports" / "iteration-1.md"
+                assert report_path.exists(), "Expected worker report file"
+                report = report_path.read_text()
+                assert sentinel_node in report, report
+
+                async with http.get(
+                    f"{base}/events",
+                    params={"project_id": project_id, "limit": 800},
+                ) as resp:
+                    assert resp.status == 200
+                    payload = await resp.json()
+
+                events = payload.get("events", [])
+                tool_events = [str(e.get("data", "")) for e in events if e.get("type") == "tool_use"]
+                assert any(
+                    "[worker]" in msg and "create_entities" in msg for msg in tool_events
+                ), tool_events[-40:]
+                assert any(
+                    "[worker]" in msg and "read_graph" in msg for msg in tool_events
+                ), tool_events[-40:]
         finally:
             restore()
             await runner.cleanup()
