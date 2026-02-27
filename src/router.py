@@ -578,6 +578,13 @@ class Router:
                 await send_reply("No project connected.", sender="system")
             return
 
+        if command == "/queue":
+            if project_id:
+                await self._handle_queue_command(project_id, command_arg, send_reply)
+            else:
+                await send_reply("No project connected.", sender="system")
+            return
+
         # ── Plain messages — route based on channel state ──
 
         if project_id:
@@ -632,9 +639,112 @@ class Router:
         parts = stripped.split(None, 1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
-        if cmd in ("/connect", "/stop", "/status"):
+        if cmd in ("/connect", "/stop", "/status", "/queue"):
             return cmd, arg
         return None, ""
+
+    def _parse_positive_index(self, raw: str) -> int | None:
+        try:
+            idx = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if idx <= 0:
+            return None
+        return idx
+
+    def _format_queue_preview(self, project_id: str) -> str:
+        queue = self._deferred_tasks.get(project_id, [])
+        if not queue:
+            return f"Queue for `{project_id}` is empty."
+
+        lines = [f"Queue for `{project_id}` ({len(queue)}):"]
+        for i, item in enumerate(queue, 1):
+            text = str(item.get("text", "")).strip()
+            if not text:
+                text = "(empty)"
+            retries = int(item.get("retries", 0) or 0)
+            meta = []
+            chat_id = item.get("chat_id")
+            if isinstance(chat_id, int):
+                meta.append(f"ch:{chat_id}")
+            if retries > 0:
+                meta.append(f"retry:{retries}")
+            suffix = f" ({', '.join(meta)})" if meta else ""
+            lines.append(f"{i}. {text}{suffix}")
+        return "\n".join(lines)
+
+    async def _handle_queue_command(self, project_id: str, command_arg: str, send_reply: callable):
+        queue = self._deferred_tasks.setdefault(project_id, [])
+        arg = (command_arg or "").strip()
+        if not arg or arg.lower() == "list":
+            await send_reply(self._format_queue_preview(project_id))
+            return
+
+        parts = arg.split()
+        sub = parts[0].lower()
+
+        if sub == "clear":
+            cleared = len(queue)
+            queue.clear()
+            self._cancel_deferred_retry(project_id)
+            await send_reply(f"Cleared {cleared} queued task(s) for `{project_id}`.")
+            return
+
+        if sub in ("delete", "del", "rm"):
+            if len(parts) != 2:
+                await send_reply("Usage: `/queue delete <index>`")
+                return
+            idx = self._parse_positive_index(parts[1])
+            if idx is None or idx > len(queue):
+                await send_reply(f"Invalid queue index: `{parts[1]}`")
+                return
+            removed = queue.pop(idx - 1)
+            await send_reply(f"Removed queued task #{idx}: {removed.get('text', '')}")
+            return
+
+        if sub == "edit":
+            if len(parts) < 3:
+                await send_reply("Usage: `/queue edit <index> <new text>`")
+                return
+            idx = self._parse_positive_index(parts[1])
+            if idx is None or idx > len(queue):
+                await send_reply(f"Invalid queue index: `{parts[1]}`")
+                return
+            new_text = arg.split(None, 2)[2].strip()
+            if not new_text:
+                await send_reply("New queued text cannot be empty.")
+                return
+            queue[idx - 1]["text"] = new_text
+            queue[idx - 1]["ts"] = time.time()
+            await send_reply(f"Updated queued task #{idx}.")
+            return
+
+        if sub == "move":
+            if len(parts) != 3:
+                await send_reply("Usage: `/queue move <from_index> <to_index>`")
+                return
+            from_idx = self._parse_positive_index(parts[1])
+            to_idx = self._parse_positive_index(parts[2])
+            if from_idx is None or to_idx is None:
+                await send_reply("Indices must be positive integers.")
+                return
+            if from_idx > len(queue) or to_idx > len(queue):
+                await send_reply(
+                    f"Indices out of range. Queue size is {len(queue)}."
+                )
+                return
+            if from_idx == to_idx:
+                await send_reply("No change: source and destination indices are the same.")
+                return
+            item = queue.pop(from_idx - 1)
+            queue.insert(to_idx - 1, item)
+            await send_reply(f"Moved queued task #{from_idx} -> #{to_idx}.")
+            return
+
+        await send_reply(
+            "Unknown `/queue` action. Use: `/queue`, `/queue edit <idx> <text>`, "
+            "`/queue delete <idx>`, `/queue move <from> <to>`, `/queue clear`."
+        )
 
     def _parse_setup_command(self, text: str) -> dict[str, object]:
         """Parse /setup command forms.

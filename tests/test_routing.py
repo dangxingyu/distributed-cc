@@ -216,6 +216,99 @@ async def test_route_status_command():
     assert "queued tasks" in reply.lower()
 
 
+async def test_route_queue_requires_connected_project():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/queue", send_reply)
+
+    send_reply.assert_called_once()
+    assert "no project connected" in send_reply.call_args[0][0].lower()
+
+
+async def test_route_queue_list_shows_entries():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+    router._deferred_tasks["myproj"] = [
+        {"chat_id": 1, "text": "run ablation A", "ts": 1.0},
+        {"chat_id": 2, "text": "run ablation B", "ts": 2.0, "retries": 1},
+    ]
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/queue", send_reply)
+
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0]
+    assert "queue for `myproj` (2)" in reply.lower()
+    assert "1. run ablation A".lower() in reply.lower()
+    assert "2. run ablation B".lower() in reply.lower()
+    assert "retry:1" in reply.lower()
+
+
+async def test_route_queue_edit_updates_entry():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+    router._deferred_tasks["myproj"] = [
+        {"chat_id": 1, "text": "old text", "ts": 1.0},
+    ]
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/queue edit 1 new text", send_reply)
+
+    assert router._deferred_tasks["myproj"][0]["text"] == "new text"
+    send_reply.assert_called_once()
+    assert "updated queued task #1" in send_reply.call_args[0][0].lower()
+
+
+async def test_route_queue_delete_removes_entry():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+    router._deferred_tasks["myproj"] = [
+        {"chat_id": 1, "text": "first", "ts": 1.0},
+        {"chat_id": 1, "text": "second", "ts": 2.0},
+    ]
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/queue delete 1", send_reply)
+
+    assert [t["text"] for t in router._deferred_tasks["myproj"]] == ["second"]
+    send_reply.assert_called_once()
+    assert "removed queued task #1" in send_reply.call_args[0][0].lower()
+
+
+async def test_route_queue_move_reorders_entries():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+    router._deferred_tasks["myproj"] = [
+        {"chat_id": 1, "text": "first", "ts": 1.0},
+        {"chat_id": 1, "text": "second", "ts": 2.0},
+        {"chat_id": 1, "text": "third", "ts": 3.0},
+    ]
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/queue move 3 1", send_reply)
+
+    assert [t["text"] for t in router._deferred_tasks["myproj"]] == ["third", "first", "second"]
+    send_reply.assert_called_once()
+    assert "moved queued task #3 -> #1" in send_reply.call_args[0][0].lower()
+
+
+async def test_route_queue_clear_empties_queue():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+    router._deferred_tasks["myproj"] = [
+        {"chat_id": 1, "text": "first", "ts": 1.0},
+        {"chat_id": 1, "text": "second", "ts": 2.0},
+    ]
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/queue clear", send_reply)
+
+    assert router._deferred_tasks["myproj"] == []
+    send_reply.assert_called_once()
+    assert "cleared 2 queued task(s)" in send_reply.call_args[0][0].lower()
+
+
 async def test_at_orchestrator_status_command_is_normalized():
     router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
     router._channel_project[1] = "myproj"
