@@ -243,7 +243,9 @@ class TelegramChat:
             "/setup <user@host>\n"
             "/setup-project <workdir or instruction>\n"
             "/doctor [hint]\n"
+            "/upgrade-check [hint]\n"
             "/setup_project <workdir or instruction> (Telegram-friendly alias)\n"
+            "/upgrade_check [hint] (Telegram-friendly alias)\n"
             "@router <message>\n"
             "@orchestrator <message>"
         )
@@ -283,6 +285,8 @@ class TelegramChat:
             cmd_lower = cmd.lower()
             if cmd_lower == "/setup_project":
                 cmd = "/setup-project"
+            elif cmd_lower == "/upgrade_check":
+                cmd = "/upgrade-check"
 
             stripped = f"{cmd} {tail}".strip()
 

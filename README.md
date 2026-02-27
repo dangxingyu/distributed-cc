@@ -124,6 +124,7 @@ It **must not** set project workdirs or project CLAUDE memory.
 | `/setup` | Health-check configured machine endpoints |
 | `/setup-project <workdir or instruction>` | Project setup on an existing machine |
 | `/doctor [hint]` | Diagnose daemon/tunnel/register status using channel context + config |
+| `/upgrade-check [hint]` | Check remote daemon/runtime drift against GitHub latest; ask before upgrade |
 | `/setup_project <workdir or instruction>` | Telegram-friendly alias |
 
 Mentions:

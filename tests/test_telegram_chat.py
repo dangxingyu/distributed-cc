@@ -39,6 +39,13 @@ async def test_normalize_setup_project_alias(telegram_ctx):
 
 
 @pytest.mark.asyncio
+async def test_normalize_upgrade_check_alias(telegram_ctx):
+    chat, _, _ = telegram_ctx
+    text = chat._normalize_incoming_text("/upgrade_check ftgs", "mybot")
+    assert text == "/upgrade-check ftgs"
+
+
+@pytest.mark.asyncio
 async def test_normalize_other_bot_command_is_ignored(telegram_ctx):
     chat, _, _ = telegram_ctx
     text = chat._normalize_incoming_text("/connect@OtherBot proj-a", "MyBot")

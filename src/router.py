@@ -545,8 +545,13 @@ class Router:
                     await send_reply(f"Not connected. Use `/connect <project-id>`. Available: {available}")
             return
 
-        # /setup* is a shorthand for @router
-        if stripped.startswith("/setup-project") or stripped.startswith("/setup") or stripped.startswith("/doctor"):
+        # Setup/diagnostics commands are shorthand for @router
+        if (
+            stripped.startswith("/setup-project")
+            or stripped.startswith("/setup")
+            or stripped.startswith("/doctor")
+            or stripped.startswith("/upgrade-check")
+        ):
             await self._handle_router_message(chat_id, stripped, send_reply, send_log, send_typing)
             return
 
@@ -774,6 +779,75 @@ class Router:
             "   - ROOT CAUSE\n"
             "   - FIX APPLIED (or exact next commands)\n"
             "   - FINAL STATUS\n"
+        )
+
+    def _build_upgrade_check_prompt(self, chat_id: int, hint: str) -> str:
+        project_id = self._channel_project.get(chat_id)
+        orch = self._orchestrators.get(project_id) if project_id else None
+
+        if orch:
+            connected = (
+                f"{project_id} (name={orch.name}, host={orch.host}, broker_port={orch.broker_port}, "
+                f"project_dir={orch.project_dir}, status={orch.status})"
+            )
+        elif project_id:
+            connected = f"{project_id} (missing from current config)"
+        else:
+            connected = "(none)"
+
+        known_projects = ", ".join(sorted(self._orchestrators.keys())) or "(none)"
+        raw_history = list(self._channel_context_history.get(chat_id) or [])
+        recent = [
+            line
+            for line in raw_history
+            if not (
+                line.lower().startswith("/doctor")
+                or line.lower().startswith("/upgrade-check")
+            )
+        ]
+        recent = recent[-DOCTOR_CONTEXT_MESSAGES:]
+        recent_lines = "\n".join(f"- {line}" for line in recent) if recent else "- (none)"
+        hint_text = hint or "(none)"
+
+        return (
+            "UPGRADE CHECK MODE (/upgrade-check)\n\n"
+            "Goal: check whether remote daemon/runtime is aligned with latest upstream (GitHub), "
+            "not only with local files.\n\n"
+            "Context snapshot:\n"
+            f"- channel_id: {chat_id}\n"
+            f"- connected_project: {connected}\n"
+            f"- known_projects: {known_projects}\n"
+            f"- user_hint: {hint_text}\n"
+            "- recent_channel_messages:\n"
+            f"{recent_lines}\n\n"
+            "Workflow:\n"
+            "1) Resolve target host/project by priority: explicit user_hint > connected_project > recent messages.\n"
+            "2) Determine latest upstream version from GitHub:\n"
+            "   - `git config --get remote.origin.url`\n"
+            "   - `git ls-remote <origin-url> refs/heads/main`\n"
+            "   - fetch latest daemon source hash from GitHub:\n"
+            "     `curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/tools/orchestrator_daemon.py | shasum -a 256`\n"
+            "3) Collect local reference hash (for context only):\n"
+            "   - `shasum -a 256 tools/orchestrator_daemon.py`\n"
+            "4) Collect remote deployed daemon identity/version:\n"
+            "   - `ssh <host> \"shasum -a 256 ~/.distributed-cc/orchestrator_daemon.py || sha256sum ~/.distributed-cc/orchestrator_daemon.py\"`\n"
+            "   - `ssh <host> \"ps -ef | grep orchestrator_daemon.py | grep -v grep\"`\n"
+            "   - `curl http://127.0.0.1:<broker_port>/health` (must include `status == \\\"ok\\\"` and non-empty `daemon`)\n"
+            "5) Collect key remote runtime versions:\n"
+            "   - Claude Code CLI version (`claude --version`)\n"
+            "   - daemon venv package versions (`claude-agent-sdk`, `aiohttp`)\n"
+            "6) Compare remote vs GitHub latest and classify: UP_TO_DATE / DRIFTED / UNKNOWN.\n\n"
+            "Strict rules:\n"
+            "- Do NOT upgrade automatically in this command.\n"
+            "- If drift is detected, provide minimal exact upgrade commands and risks.\n"
+            "- Then ask exactly: `Proceed with upgrade now? (yes/no)`.\n"
+            "- Only execute upgrade after explicit user confirmation in a follow-up message.\n\n"
+            "Response format:\n"
+            "- TARGET\n"
+            "- VERSION SNAPSHOT\n"
+            "- DRIFT DETECTED (yes/no + evidence)\n"
+            "- UPGRADE PLAN (if needed)\n"
+            "- ACTION NEEDED\n"
         )
 
     def _enqueue_deferred_task(self, project_id: str, chat_id: int, text: str) -> int:
@@ -1169,6 +1243,9 @@ class Router:
         elif stripped.startswith("/doctor"):
             doctor_hint = stripped[len("/doctor"):].strip()
             prompt = self._build_doctor_prompt(chat_id, doctor_hint)
+        elif stripped.startswith("/upgrade-check"):
+            upgrade_hint = stripped[len("/upgrade-check"):].strip()
+            prompt = self._build_upgrade_check_prompt(chat_id, upgrade_hint)
         else:
             prompt = stripped
 
