@@ -1,10 +1,18 @@
-.PHONY: run test test-e2e deploy tunnels doctor install-dev
+.PHONY: run run-telegram run-both test test-e2e deploy tunnels doctor install-dev
 E2E_JOBS ?= 1
 DOCTOR_ARGS ?=
 
 # Run router + web UI (default)
 run:
 	uv run python -m src
+
+# Run router + Telegram frontend (loads TELEGRAM_BOT_TOKEN from .env when present)
+run-telegram:
+	@set -a; [ -f .env ] && . ./.env; set +a; uv run python -m src --frontend telegram
+
+# Run router + Web + Telegram together (loads TELEGRAM_BOT_TOKEN from .env when present)
+run-both:
+	@set -a; [ -f .env ] && . ./.env; set +a; uv run python -m src --frontend both
 
 # Run unit/integration tests (no real Claude calls)
 test:
