@@ -1726,7 +1726,7 @@ body::after {
   <div id="typing-indicator"></div>
   <div id="input-area">
     <div id="command-palette"></div>
-    <textarea id="input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
+    <textarea id="input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline, Esc to edit queued)"></textarea>
     <button id="send-btn">Send</button>
   </div>
 </div>
@@ -1842,7 +1842,7 @@ const TASK_LIST_CACHE_KEY = 'dcc_task_list_cache_v1';
 const LAST_SETUP_SERVER_KEY = 'dcc_last_setup_server';
 const LAST_PROJECT_WORKDIR_KEY = 'dcc_last_project_workdir';
 const SETUP_STAGE_CACHE_KEY = 'dcc_setup_stage_cache_v1';
-const DEFAULT_INPUT_PLACEHOLDER = 'Type a message... (Enter to send, Shift+Enter for newline)';
+const DEFAULT_INPUT_PLACEHOLDER = 'Type a message... (Enter to send, Shift+Enter for newline, Esc to edit queued)';
 let taskListCache = loadTaskListCache();
 let setupStageCache = loadSetupStageCache();
 const setupProjectPromptedChannels = new Set();
