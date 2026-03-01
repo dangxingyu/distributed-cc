@@ -35,6 +35,115 @@ def _preview(text: str, limit: int = 120) -> str:
     return compact[:limit] + "..."
 
 
+def _norm_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalized_machines(cfg: dict) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for item in cfg.get("machines", []):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            (
+                _norm_text(item.get("name")),
+                _norm_text(item.get("host")),
+                _norm_text(item.get("broker_port")),
+            )
+        )
+    rows.sort()
+    return rows
+
+
+def _normalized_projects(cfg: dict) -> list[tuple[str, str, str, str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str, str, str, str]] = []
+    for item in cfg.get("projects", []):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            (
+                _norm_text(item.get("project_id")),
+                _norm_text(item.get("name")),
+                _norm_text(item.get("machine")),
+                _norm_text(item.get("server")),
+                _norm_text(item.get("host")),
+                _norm_text(item.get("broker_port")),
+                _norm_text(item.get("work_dir")),
+                _norm_text(item.get("project_dir")),
+            )
+        )
+    rows.sort()
+    return rows
+
+
+def _normalized_orchestrators(cfg: dict) -> list[tuple[str, str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for item in cfg.get("orchestrators", []):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            (
+                _norm_text(item.get("project_id")),
+                _norm_text(item.get("name")),
+                _norm_text(item.get("host")),
+                _norm_text(item.get("broker_port")),
+                _norm_text(item.get("project_dir")),
+                _norm_text(item.get("work_dir")),
+            )
+        )
+    rows.sort()
+    return rows
+
+
+def _normalized_servers_project_fields(cfg: dict) -> list[tuple[str, str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for item in cfg.get("servers", []):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            (
+                _norm_text(item.get("name")),
+                _norm_text(item.get("project_id")),
+                _norm_text(item.get("work_dir")),
+                _norm_text(item.get("project_dir")),
+                _norm_text(item.get("machine")),
+                _norm_text(item.get("server")),
+            )
+        )
+    rows.sort()
+    return rows
+
+
+def _normalized_servers_machine_fields(cfg: dict) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for item in cfg.get("servers", []):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            (
+                _norm_text(item.get("name")),
+                _norm_text(item.get("host")),
+                _norm_text(item.get("broker_port")),
+            )
+        )
+    rows.sort()
+    return rows
+
+
+def _normalized_orchestrator_defaults(cfg: dict) -> tuple[str, str, str]:
+    defaults = cfg.get("orchestrator")
+    if not isinstance(defaults, dict):
+        return ("", "", "")
+    return (
+        _norm_text(defaults.get("model")),
+        _norm_text(defaults.get("session_model")),
+        _norm_text(defaults.get("permission_mode")),
+    )
+
+
+MISSING_CONFIG_SNAPSHOT = "__DCC_CONFIG_WAS_MISSING__"
 DEFERRED_RETRY_INITIAL_SECONDS = 0.5
 DEFERRED_RETRY_MAX_SECONDS = 10.0
 CHANNEL_CONTEXT_HISTORY_MAX = 24
@@ -852,6 +961,90 @@ class Router:
                 }
         return {"mode": "none"}
 
+    def _config_path(self) -> str:
+        return os.path.join(self._cwd, "config.json")
+
+    def _capture_config_snapshot(self) -> tuple[str | None, dict | None]:
+        path = self._config_path()
+        if not os.path.exists(path):
+            return MISSING_CONFIG_SNAPSHOT, {}
+        try:
+            with open(path) as f:
+                raw = f.read()
+        except Exception:
+            return None, None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return raw, None
+        if not isinstance(parsed, dict):
+            return raw, None
+        return raw, parsed
+
+    def _restore_config_snapshot(self, raw: str | None):
+        if raw is None:
+            return
+        try:
+            path = self._config_path()
+            if raw == MISSING_CONFIG_SNAPSHOT:
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            with open(path, "w") as f:
+                f.write(raw)
+        except Exception:
+            log.warning("Failed to restore config.json snapshot", exc_info=True)
+
+    def _check_setup_scope_guard(
+        self,
+        scope_mode: str | None,
+        before_raw: str | None,
+        before_cfg: dict | None,
+    ) -> tuple[bool, str]:
+        if not scope_mode or before_cfg is None:
+            return True, ""
+
+        _after_raw, after_cfg = self._capture_config_snapshot()
+        if after_cfg is None:
+            # Keep setup resilient when config.json is missing or malformed.
+            return True, ""
+
+        violations: list[str] = []
+        if scope_mode == "machine_setup":
+            if _normalized_projects(before_cfg) != _normalized_projects(after_cfg):
+                violations.append("`projects` entries changed")
+            if _normalized_orchestrators(before_cfg) != _normalized_orchestrators(after_cfg):
+                violations.append("`orchestrators` entries changed")
+            if _normalized_servers_project_fields(before_cfg) != _normalized_servers_project_fields(after_cfg):
+                violations.append("project-related fields in `servers` changed")
+        elif scope_mode == "project_setup":
+            if _normalized_machines(before_cfg) != _normalized_machines(after_cfg):
+                violations.append("`machines` entries changed")
+            if _normalized_servers_machine_fields(before_cfg) != _normalized_servers_machine_fields(after_cfg):
+                violations.append("machine connectivity fields in `servers` changed")
+            if _normalized_orchestrator_defaults(before_cfg) != _normalized_orchestrator_defaults(after_cfg):
+                violations.append("top-level `orchestrator` defaults changed")
+
+        if not violations:
+            return True, ""
+
+        self._restore_config_snapshot(before_raw)
+        if scope_mode == "machine_setup":
+            return (
+                False,
+                "Scope guard blocked out-of-scope config changes during `/setup` "
+                f"(machine setup only): {', '.join(violations)}. "
+                "Reverted `config.json` to pre-setup state. "
+                "Re-run `/setup` for machine setup, then use `/setup-project` separately.",
+            )
+        return (
+            False,
+            "Scope guard blocked out-of-scope config changes during `/setup-project` "
+            f"(project setup only): {', '.join(violations)}. "
+            "Reverted `config.json` to pre-setup state. "
+            "Re-run `/setup-project` without editing machine connectivity.",
+        )
+
     def _build_plugin_setup_prompt(self, chat_id: int, role: str, instruction: str) -> str:
         role = role.strip().lower()
         if role not in ("orchestrator", "worker"):
@@ -1357,6 +1550,7 @@ class Router:
 
         stripped = text.strip()
         lower_stripped = stripped.lower()
+        scope_mode: str | None = None
         plugin_req = self._parse_plugin_setup_command(stripped)
         if plugin_req.get("mode") == "error":
             await setup_reply(str(plugin_req.get("error", "Invalid plugin setup command.")))
@@ -1366,6 +1560,7 @@ class Router:
             instruction = str(plugin_req.get("instruction", ""))
             prompt = self._build_plugin_setup_prompt(chat_id, role, instruction)
         elif lower_stripped.startswith("/setup-project"):
+            scope_mode = "project_setup"
             setup_project_req = self._parse_setup_project_command(stripped)
             if setup_project_req.get("mode") == "error":
                 await setup_reply(str(setup_project_req.get("error", "Invalid /setup-project command.")))
@@ -1410,6 +1605,7 @@ class Router:
                 await setup_reply(str(setup_req.get("error", "Invalid /setup command.")))
                 return
             if mode == "setup":
+                scope_mode = "machine_setup"
                 host = str(setup_req["host"])
                 auto_tunnel = bool(setup_req.get("auto_tunnel", True))
                 if auto_tunnel:
@@ -1482,13 +1678,22 @@ class Router:
             prompt = stripped
 
         typing_token = f"router-{uuid.uuid4().hex}"
+        snapshot_raw, snapshot_cfg = self._capture_config_snapshot() if scope_mode else (None, None)
 
         async def _run():
             await self._safe_send_typing(send_typing, True, "router", typing_token)
             try:
                 result = await session.run(prompt)
+                scope_ok, scope_error = self._check_setup_scope_guard(
+                    scope_mode,
+                    snapshot_raw,
+                    snapshot_cfg,
+                )
                 # Reload config before announcing completion so immediate /connect sees new projects.
                 self.reload_config()
+                if not scope_ok:
+                    await setup_reply(scope_error)
+                    return
                 if session.should_emit_final_result(result):
                     await setup_reply(result)
             except Exception as e:
@@ -1593,7 +1798,11 @@ class Router:
                 return
 
         await self.connect_channel(chat_id, project_id)
-        await send_reply(f"Connected to **{orch.name}** (`{project_id}`)")
+        await send_reply(
+            f"Connected to **{orch.name}** (`{project_id}`). "
+            "Note: task queue and runtime are project-scoped and shared across channels "
+            "connected to the same project."
+        )
 
     def hydrate_channel_mapping(self, chat_id: int, project_id: str, source: str | None = None) -> bool:
         if project_id not in self._orchestrators:

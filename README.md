@@ -142,6 +142,7 @@ Without mentions:
 - No project connected: message goes to **Router**
 - Project connected + idle: message starts new orchestrator task
 - Project connected + running: message is queued as non-urgent next-task context
+- Queue/runtime scope is **per-project**, so channels connected to the same project share the same running state and next-task queue.
 
 Urgency while running:
 
@@ -156,6 +157,13 @@ Defaults:
 
 - `STANDBY_HEARTBEAT_SECONDS=1800` (~30 minutes)
 - `STANDBY_WAKE_MAX_ITERATIONS=1`
+
+## Session Context & Compaction
+
+- Orchestrator and worker keep reusing the same SDK session via `resume`.
+- When context fills, Claude may auto-compact and continue the session.
+- After compact, behavior continues, but raw full history is no longer guaranteed in-context.
+- Durable memory should live in project files (`task_list.md`, `LOG.md`, and `CLAUDE.md`), not only in chat context.
 
 ## Configuration
 
@@ -213,7 +221,8 @@ Field notes:
 Compatibility:
 
 - `servers[]` (legacy) and `orchestrators[]` schemas are still supported.
-- For new setups, prefer `machines[] + projects[]` for clearer machine/project separation.
+- For new setups, treat `machines[] + projects[]` as the default path.
+- Treat `servers[]`/`orchestrators[]` as migration compatibility, not the primary workflow.
 
 `config.json` is local-only. Never commit real hosts/tokens.
 

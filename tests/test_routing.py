@@ -561,6 +561,7 @@ async def test_connect_command_reloads_config_before_lookup(tmp_path):
     assert router.get_channel_project(1) == "proj-new"
     send_reply.assert_called_once()
     assert "connected" in send_reply.call_args[0][0].lower()
+    assert "shared across channels" in send_reply.call_args[0][0].lower()
 
 
 async def test_connect_unknown_project_while_router_task_running(tmp_path):
@@ -1004,6 +1005,145 @@ async def test_setup_server_prompt_is_machine_only(tmp_path):
     assert "machine connectivity only" in prompt.lower()
     assert "do not create or modify project/work_dir entries" in prompt.lower()
     assert "do not create or edit work_dir/claude.md" in prompt.lower()
+
+
+async def test_setup_machine_scope_guard_reverts_project_changes(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "machines": [{"name": "m1", "host": "user@h1", "broker_port": 8201}],
+                "projects": [{"project_id": "p1", "machine": "m1", "work_dir": "/work/p1"}],
+            }
+        )
+    )
+    router = Router(cwd=str(tmp_path))
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            cfg = json.loads(config_path.read_text())
+            cfg["projects"] = [{"project_id": "bad", "machine": "m1", "work_dir": "/tmp/bad"}]
+            config_path.write_text(json.dumps(cfg))
+            return "setup complete"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return True
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(
+            1,
+            "/setup user@server",
+            send_reply,
+            send_log,
+            None,
+        )
+        await router._router_tasks[1]
+
+    restored = json.loads(config_path.read_text())
+    assert restored["projects"] == [{"project_id": "p1", "machine": "m1", "work_dir": "/work/p1"}]
+    msg = send_reply.call_args[0][0].lower()
+    assert "scope guard blocked" in msg
+    assert "/setup-project" in msg
+
+
+async def test_setup_project_scope_guard_reverts_machine_changes(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "machines": [{"name": "m1", "host": "user@h1", "broker_port": 8201}],
+                "projects": [{"project_id": "p1", "machine": "m1", "work_dir": "/work/p1"}],
+            }
+        )
+    )
+    router = Router(cwd=str(tmp_path))
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            cfg = json.loads(config_path.read_text())
+            cfg["machines"] = [{"name": "m2", "host": "user@h2", "broker_port": 8301}]
+            config_path.write_text(json.dumps(cfg))
+            return "project setup complete"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return True
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(
+            1,
+            "/setup-project /work/p1",
+            send_reply,
+            send_log,
+            None,
+        )
+        await router._router_tasks[1]
+
+    restored = json.loads(config_path.read_text())
+    assert restored["machines"] == [{"name": "m1", "host": "user@h1", "broker_port": 8201}]
+    msg = send_reply.call_args[0][0].lower()
+    assert "scope guard blocked" in msg
+    assert "/setup-project" in msg
+
+
+async def test_setup_machine_scope_guard_blocks_project_fields_when_config_missing(tmp_path):
+    config_path = tmp_path / "config.json"
+    router = Router(cwd=str(tmp_path))
+
+    class FakeRouterSession:
+        def __init__(self, cwd="."):
+            self.cwd = cwd
+
+        def set_callbacks(self, progress=None, log=None):
+            return None
+
+        async def run(self, prompt: str) -> str:
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "machines": [{"name": "m1", "host": "user@h1", "broker_port": 8201}],
+                        "projects": [{"project_id": "bad", "machine": "m1", "work_dir": "/tmp/bad"}],
+                    }
+                )
+            )
+            return "setup complete"
+
+        def should_emit_final_result(self, result_text: str) -> bool:
+            return True
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+
+    with patch("src.router.RouterSession", FakeRouterSession):
+        await router._handle_router_message(
+            1,
+            "/setup user@server",
+            send_reply,
+            send_log,
+            None,
+        )
+        await router._router_tasks[1]
+
+    assert not config_path.exists()
+    msg = send_reply.call_args[0][0].lower()
+    assert "scope guard blocked" in msg
 
 
 def test_parse_setup_command_health_default():
