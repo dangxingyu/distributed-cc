@@ -71,6 +71,42 @@ async def test_get_recent_messages_empty(store):
     assert msgs == []
 
 
+async def test_pop_last_user_message_removes_latest_match(store):
+    await store.add_message(1, "user", "keep")
+    await store.add_message(1, "assistant", "ack")
+    await store.add_message(1, "user", "remove me")
+    await store.add_message(1, "user", "keep")
+    await store.add_message(1, "user", "remove me")
+
+    ok = await store.pop_last_user_message(1, "remove me")
+
+    assert ok is True
+    msgs = await store.get_recent_messages(1)
+    assert [m["content"] for m in msgs] == ["keep", "ack", "remove me", "keep"]
+
+
+async def test_pop_last_user_message_returns_false_when_missing(store):
+    await store.add_message(1, "assistant", "not user")
+    await store.add_message(1, "user", "different text")
+
+    ok = await store.pop_last_user_message(1, "absent")
+
+    assert ok is False
+    msgs = await store.get_recent_messages(1)
+    assert [m["content"] for m in msgs] == ["not user", "different text"]
+
+
+async def test_pop_user_message_by_id_removes_exact_entry(store):
+    await store.add_message(1, "user", "a", message_id="m-a")
+    await store.add_message(1, "user", "b", message_id="m-b")
+
+    ok = await store.pop_user_message_by_id(1, "m-a")
+
+    assert ok is True
+    msgs = await store.get_recent_messages(1)
+    assert [m["id"] for m in msgs if m["role"] == "user"] == ["m-b"]
+
+
 # -- channels ---------------------------------------------------------
 
 

@@ -248,6 +248,129 @@ async def test_ws_message_requires_channel(aiohttp_client):
     await store.close()
 
 
+async def test_ws_recall_queued_message_requires_channel(aiohttp_client):
+    client, _, _, store = await _make_web(aiohttp_client)
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "recall_queued_message"})
+
+    msg = await ws.receive_json()
+    assert msg["type"] == "error"
+    assert "No channel" in msg["text"]
+
+    await ws.close()
+    await store.close()
+
+
+async def test_ws_recall_queued_message_returns_latest_for_channel(aiohttp_client):
+    client, _, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("recall-ch")
+    await router.connect_channel(ch_id, "test-proj")
+    first_mid = await store.add_message(ch_id, "user", "first queued")
+    latest_mid = await store.add_message(ch_id, "user", "latest queued")
+    router._deferred_tasks["test-proj"] = [
+        {"chat_id": ch_id, "text": "first queued", "message_id": first_mid, "ts": 1.0},
+        {"chat_id": 999999, "text": "other channel item", "ts": 2.0},
+        {"chat_id": ch_id, "text": "latest queued", "message_id": latest_mid, "ts": 3.0},
+    ]
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await ws.send_json({"type": "recall_queued_message"})
+    first = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    second = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    message_retracted = first if first["type"] == "message_retracted" else second
+    recalled = first if first["type"] == "queue_recall" else second
+
+    assert message_retracted["type"] == "message_retracted"
+    assert message_retracted["sender"] == "user"
+    assert message_retracted["text"] == "latest queued"
+    assert message_retracted["message_id"] == latest_mid
+    assert message_retracted["ok"] is True
+
+    assert recalled["type"] == "queue_recall"
+    assert recalled["ok"] is True
+    assert recalled["retracted"] is True
+    assert recalled["text"] == "latest queued"
+    assert recalled["message_id"] == latest_mid
+
+    assert [item["text"] for item in router._deferred_tasks["test-proj"]] == [
+        "first queued",
+        "other channel item",
+    ]
+    history = await store.get_recent_messages(ch_id)
+    assert [m["content"] for m in history if m["role"] == "user"] == ["first queued"]
+
+    await ws.close()
+    await store.close()
+
+
+async def test_ws_recall_broadcasts_retraction_to_same_channel_viewers(aiohttp_client):
+    client, _, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("recall-broadcast")
+    await router.connect_channel(ch_id, "test-proj")
+    mid = await store.add_message(ch_id, "user", "queued from me")
+    router._deferred_tasks["test-proj"] = [
+        {"chat_id": ch_id, "text": "queued from me", "message_id": mid, "ts": 1.0},
+    ]
+
+    ws1 = await client.ws_connect("/ws")
+    ws2 = await client.ws_connect("/ws")
+    await ws1.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws2.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws1.receive_json()
+    await ws2.receive_json()
+    await ws1.send_json({"type": "recall_queued_message"})
+
+    got_ws1 = []
+    got_ws2 = []
+    for _ in range(2):
+        got_ws1.append(await asyncio.wait_for(ws1.receive_json(), timeout=1))
+    got_ws2.append(await asyncio.wait_for(ws2.receive_json(), timeout=1))
+
+    assert any(m["type"] == "message_retracted" for m in got_ws1)
+    assert any(m["type"] == "queue_recall" for m in got_ws1)
+    assert got_ws2[0]["type"] == "message_retracted"
+    assert got_ws2[0]["text"] == "queued from me"
+    assert got_ws2[0]["message_id"] == mid
+
+    await ws1.close()
+    await ws2.close()
+    await store.close()
+
+
+async def test_ws_restore_retracted_message_requeues_and_persists(aiohttp_client):
+    client, _, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("restore")
+    await router.connect_channel(ch_id, "test-proj")
+
+    ws = await client.ws_connect("/ws")
+    await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
+    await ws.receive_json()
+
+    await ws.send_json({"type": "restore_retracted_message", "text": "put it back", "message_id": "mid-x"})
+    first = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    second = await asyncio.wait_for(ws.receive_json(), timeout=1)
+    restored = first if first["type"] == "message_restored" else second
+    ack = first if first["type"] == "queue_restore" else second
+
+    assert restored["type"] == "message_restored"
+    assert restored["text"] == "put it back"
+    assert restored["message_id"] == "mid-x"
+    assert ack["type"] == "queue_restore"
+    assert ack["ok"] is True
+    assert ack["queue_size"] == 1
+
+    assert router._deferred_tasks["test-proj"][0]["text"] == "put it back"
+    assert router._deferred_tasks["test-proj"][0]["message_id"] == "mid-x"
+    msgs = await store.get_recent_messages(ch_id)
+    assert any(m["role"] == "user" and m["content"] == "put it back" and m.get("id") == "mid-x" for m in msgs)
+
+    await ws.close()
+    await store.close()
+
+
 async def test_ws_message_ack(aiohttp_client):
     client, _, router, store = await _make_web(aiohttp_client)
     ch_id = await store.create_channel("ack-ch")
@@ -267,6 +390,7 @@ async def test_ws_message_ack(aiohttp_client):
     msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
     assert msg["type"] == "message_ack"
     assert msg["client_msg_id"] == "cmsg-1"
+    assert isinstance(msg.get("message_id"), str) and msg["message_id"]
 
     history = await store.get_recent_messages(ch_id)
     assert any(m["role"] == "user" and m["content"] == "hello ack" for m in history)

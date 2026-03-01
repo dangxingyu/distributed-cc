@@ -327,7 +327,7 @@ class WebChat:
             client_msg_id = data.get("client_msg_id")
 
             try:
-                await self._store.add_message(channel_id, "user", text, sender="user")
+                message_id = await self._store.add_message(channel_id, "user", text, sender="user")
             except Exception as e:
                 await self._ws_send_to_client(client_id, {"type": "error", "text": f"Failed to persist message: {e}"})
                 return
@@ -335,7 +335,12 @@ class WebChat:
             if client_msg_id:
                 await self._ws_send_to_client(
                     client_id,
-                    {"type": "message_ack", "client_msg_id": str(client_msg_id), "ts": time.time()},
+                    {
+                        "type": "message_ack",
+                        "client_msg_id": str(client_msg_id),
+                        "message_id": message_id,
+                        "ts": time.time(),
+                    },
                 )
 
             async def send_reply(msg: str, sender: str = "system"):
@@ -356,7 +361,21 @@ class WebChat:
 
             async def _route_message():
                 try:
-                    await self._router.route_message(channel_id, text, send_reply, send_log, send_typing)
+                    try:
+                        await self._router.route_message(
+                            channel_id,
+                            text,
+                            send_reply,
+                            send_log,
+                            send_typing,
+                            user_message_id=message_id,
+                        )
+                    except TypeError as e:
+                        # Compatibility for tests/custom mocks that haven't added
+                        # the optional `user_message_id` parameter yet.
+                        if "user_message_id" not in str(e):
+                            raise
+                        await self._router.route_message(channel_id, text, send_reply, send_log, send_typing)
                 except Exception as e:
                     log.exception("Routing failed for channel %s", channel_id)
                     ts = time.time()
@@ -375,6 +394,93 @@ class WebChat:
                     )
 
             self._start_background_task(_route_message())
+            return
+
+        if msg_type == "recall_queued_message":
+            channel_id = self._client_active_channel.get(client_id)
+            if channel_id is None:
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "No channel selected"})
+                return
+            recalled = self._router.pop_last_deferred_task_for_channel(channel_id)
+            retracted = False
+            if recalled is not None:
+                recalled_text = str(recalled.get("text", "")).strip()
+                recalled_message_id = str(recalled.get("message_id", "")).strip() or None
+                if recalled_message_id:
+                    retracted = await self._store.pop_user_message_by_id(channel_id, recalled_message_id)
+                if not retracted:
+                    retracted = await self._store.pop_last_user_message(channel_id, recalled_text)
+                await self._ws_send_to_channel(
+                    channel_id,
+                    {
+                        "type": "message_retracted",
+                        "sender": "user",
+                        "text": recalled_text,
+                        "message_id": recalled_message_id,
+                        "ok": retracted,
+                        "ts": time.time(),
+                    },
+                )
+            await self._ws_send_to_client(
+                client_id,
+                {
+                    "type": "queue_recall",
+                    "ok": recalled is not None,
+                    "retracted": retracted,
+                    "text": (str(recalled.get("text", "")).strip() if recalled else ""),
+                    "message_id": (str(recalled.get("message_id", "")).strip() if recalled else ""),
+                    "ts": time.time(),
+                },
+            )
+            return
+
+        if msg_type == "restore_retracted_message":
+            channel_id = self._client_active_channel.get(client_id)
+            if channel_id is None:
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "No channel selected"})
+                return
+            text = str(data.get("text", "")).strip()
+            message_id = str(data.get("message_id", "")).strip() or None
+            if not text:
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "missing text"})
+                return
+            queue_size = self._router.restore_deferred_task_for_channel(
+                channel_id,
+                text,
+                message_id=message_id,
+            )
+            if queue_size is None:
+                await self._ws_send_to_client(client_id, {"type": "error", "text": "No project connected"})
+                return
+            restored_message_id = await self._store.add_message(
+                channel_id,
+                "user",
+                text,
+                sender="user",
+                message_id=message_id,
+            )
+            await self._ws_send_to_channel(
+                channel_id,
+                {
+                    "type": "message_restored",
+                    "sender": "user",
+                    "text": text,
+                    "message_id": restored_message_id,
+                    "queue_size": queue_size,
+                    "ts": time.time(),
+                },
+            )
+            await self._ws_send_to_client(
+                client_id,
+                {
+                    "type": "queue_restore",
+                    "ok": True,
+                    "text": text,
+                    "message_id": restored_message_id,
+                    "queue_size": queue_size,
+                    "ts": time.time(),
+                },
+            )
             return
 
         await self._ws_send_to_client(client_id, {"type": "error", "text": f"Unknown message type: {msg_type}"})

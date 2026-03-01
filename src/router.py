@@ -149,6 +149,12 @@ DEFERRED_RETRY_MAX_SECONDS = 10.0
 CHANNEL_CONTEXT_HISTORY_MAX = 24
 DOCTOR_CONTEXT_MESSAGES = 10
 PLUGIN_CONTEXT_MESSAGES = 10
+AUTO_RECOVER_TUNNEL = os.getenv("DCC_AUTO_RECOVER_TUNNEL", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 @dataclass
@@ -205,6 +211,7 @@ class Router:
         self._router_tasks: dict[int, asyncio.Task] = {}
         self._channel_context_history: dict[int, deque[str]] = {}
         self._debug_flow = _env_flag("DCC_DEBUG_FLOW")
+        self._last_health_detail: dict[str, str] = {}
 
     async def init(self):
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -616,7 +623,15 @@ class Router:
 
     # -- message routing ------------------------------------------------
 
-    async def route_message(self, chat_id: int, text: str, send_reply: callable, send_log: callable = None, send_typing: callable = None):
+    async def route_message(
+        self,
+        chat_id: int,
+        text: str,
+        send_reply: callable,
+        send_log: callable = None,
+        send_typing: callable = None,
+        user_message_id: str | None = None,
+    ):
         stripped = text.strip()
         if stripped:
             self._record_channel_context(chat_id, stripped)
@@ -731,7 +746,12 @@ class Router:
             elif addressed_to_orchestrator:
                 await self._interrupt_task(chat_id, project_id, effective_text, send_reply, urgency="urgent")
             else:
-                queue_size = self._enqueue_deferred_task(project_id, chat_id, stripped)
+                queue_size = self._enqueue_deferred_task(
+                    project_id,
+                    chat_id,
+                    stripped,
+                    message_id=user_message_id,
+                )
                 await send_reply(f"(queued as next task #{queue_size} — use `@orchestrator ...` for urgent interruption)")
         else:
             # No project connected → router (sysadmin brain)
@@ -1264,10 +1284,70 @@ class Router:
             "- ACTION NEEDED\n"
         )
 
-    def _enqueue_deferred_task(self, project_id: str, chat_id: int, text: str) -> int:
+    def _enqueue_deferred_task(
+        self,
+        project_id: str,
+        chat_id: int,
+        text: str,
+        message_id: str | None = None,
+    ) -> int:
         queue = self._deferred_tasks.setdefault(project_id, [])
-        queue.append({"chat_id": chat_id, "text": text, "ts": time.time()})
+        queue.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "message_id": (message_id or "").strip() or None,
+                "ts": time.time(),
+            }
+        )
         return len(queue)
+
+    def pop_last_deferred_task_for_channel(self, chat_id: int) -> dict | None:
+        """Pop newest deferred task authored by this channel."""
+        project_id = self._channel_project.get(chat_id)
+        if not project_id:
+            return None
+        queue = self._deferred_tasks.get(project_id) or []
+        if not queue:
+            return None
+
+        for idx in range(len(queue) - 1, -1, -1):
+            item = queue[idx]
+            if item.get("chat_id") != chat_id:
+                continue
+            queue.pop(idx)
+            if not queue:
+                self._cancel_deferred_retry(project_id)
+            text = str(item.get("text", "")).strip()
+            if not text:
+                return None
+            message_id_raw = str(item.get("message_id", "")).strip()
+            return {
+                "text": text,
+                "message_id": message_id_raw or None,
+                "chat_id": chat_id,
+                "project_id": project_id,
+            }
+        return None
+
+    def restore_deferred_task_for_channel(
+        self,
+        chat_id: int,
+        text: str,
+        message_id: str | None = None,
+    ) -> int | None:
+        project_id = self._channel_project.get(chat_id)
+        if not project_id:
+            return None
+        body = str(text or "").strip()
+        if not body:
+            return None
+        return self._enqueue_deferred_task(
+            project_id=project_id,
+            chat_id=chat_id,
+            text=body,
+            message_id=message_id,
+        )
 
     def _cancel_deferred_retry(self, project_id: str):
         task = self._deferred_retry_tasks.pop(project_id, None)
@@ -1784,9 +1864,12 @@ class Router:
             health_ok = await self.check_health(project_id)
             if not health_ok:
                 orch.status = "disconnected"
+                detail = self._last_health_detail.get(project_id, "")
+                detail_suffix = f" Detail: `{_preview(detail, 180)}`." if detail else ""
                 await send_reply(
                     f"Cannot connect `{project_id}`: daemon is unreachable at "
                     f"http://127.0.0.1:{orch.broker_port}. Check tunnel/daemon, then retry."
+                    f"{detail_suffix} Try `/doctor {project_id}` for systematic diagnosis."
                 )
                 return
 
@@ -1885,19 +1968,117 @@ class Router:
     async def check_health(self, project_id: str) -> bool:
         orch = self._orchestrators.get(project_id)
         if not orch:
+            self._last_health_detail[project_id] = "unknown project_id"
             return False
+        ok, detail = await self._check_health_once(orch)
+        if ok:
+            self._last_health_detail[project_id] = detail
+            return True
+
+        if self._should_attempt_tunnel_recover(orch, detail):
+            recovered, recover_detail = await self._try_auto_recover_tunnel(orch)
+            if recovered:
+                ok2, detail2 = await self._check_health_once(orch)
+                if ok2:
+                    self._last_health_detail[project_id] = (
+                        f"auto-recovered tunnel; {detail2}"
+                    )
+                    return True
+                detail = f"{detail2}; auto-recover attempted ({recover_detail})"
+            elif recover_detail:
+                detail = f"{detail}; auto-recover failed ({recover_detail})"
+
+        self._last_health_detail[project_id] = detail
+        return False
+
+    async def _check_health_once(self, orch: RemoteOrchestrator) -> tuple[bool, str]:
+        if not self._http:
+            return False, "router HTTP client is not initialized"
         try:
             url = f"{self._daemon_url(orch)}/health"
             async with self._http.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status != 200:
-                    return False
+                    body = await resp.text()
+                    return False, f"HTTP {resp.status}: {_preview(body, 160)}"
                 payload = await self._resp_json(resp)
                 if not isinstance(payload, dict):
-                    return False
+                    return False, "health payload is not JSON object"
                 status = str(payload.get("status", "")).strip().lower()
                 daemon_name = str(payload.get("daemon", "")).strip()
+                if status != "ok":
+                    return False, f"status={payload.get('status')!r}"
                 # Signature guard: old/foreign services may return {"status":"ok"}
                 # but do not expose orchestrator_daemon identity.
-                return status == "ok" and bool(daemon_name)
-        except Exception:
+                if not daemon_name:
+                    if "server" in payload:
+                        return False, "missing `daemon` (legacy/foreign service)"
+                    return False, "missing `daemon` field"
+                return True, f"daemon={daemon_name}"
+        except Exception as e:
+            return False, str(e)
+
+    def _should_attempt_tunnel_recover(self, orch: RemoteOrchestrator, detail: str) -> bool:
+        if not AUTO_RECOVER_TUNNEL:
             return False
+        if not orch.host:
+            return False
+        lowered = (detail or "").lower()
+        if "cannot connect to host 127.0.0.1" in lowered:
+            return True
+        if "connect call failed ('127.0.0.1'" in lowered:
+            return True
+        if "connection refused" in lowered and "127.0.0.1" in lowered:
+            return True
+        return False
+
+    async def _try_auto_recover_tunnel(self, orch: RemoteOrchestrator) -> tuple[bool, str]:
+        if not orch.host:
+            return False, "missing host"
+
+        cmd = [
+            "ssh",
+            "-fNT",
+            "-L",
+            f"{orch.broker_port}:localhost:8200",
+            "-R",
+            "9120:localhost:9120",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            str(orch.host),
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                return False, "ssh tunnel command timed out"
+            out = (stdout or b"").decode(errors="replace").strip()
+            err = (stderr or b"").decode(errors="replace").strip()
+            if proc.returncode == 0:
+                detail = out or err or "ssh tunnel started"
+                log.info(
+                    "Auto-recovered SSH tunnel for %s on local port %s",
+                    orch.host,
+                    orch.broker_port,
+                )
+                return True, _preview(detail, 160)
+            detail = err or out or f"ssh exited with code {proc.returncode}"
+            return False, _preview(detail, 200)
+        except FileNotFoundError:
+            return False, "ssh command not found"
+        except Exception as e:
+            return False, str(e)

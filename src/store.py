@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 
 
 class Store:
@@ -84,14 +85,23 @@ class Store:
 
     # ── messages ──
 
-    async def add_message(self, chat_id: int, role: str, content: str, sender: str = ""):
+    async def add_message(
+        self,
+        chat_id: int,
+        role: str,
+        content: str,
+        sender: str = "",
+        message_id: str | None = None,
+    ) -> str:
         async with self._get_channel_lock(chat_id):
-            entry = {"role": role, "content": content, "ts": time.time()}
+            mid = (message_id or "").strip() or uuid.uuid4().hex
+            entry = {"id": mid, "role": role, "content": content, "ts": time.time()}
             if sender:
                 entry["sender"] = sender
             data = self._load(chat_id)
             data["messages"].append(entry)
             self._save(chat_id, data)
+            return mid
 
     async def get_recent_messages(self, chat_id: int) -> list[dict]:
         async with self._get_channel_lock(chat_id):
@@ -103,10 +113,49 @@ class Store:
                     "content": m.get("content", ""),
                     "ts": m.get("ts"),
                 }
+                if m.get("id"):
+                    msg["id"] = m["id"]
                 if m.get("sender"):
                     msg["sender"] = m["sender"]
                 messages.append(msg)
             return messages
+
+    async def pop_user_message_by_id(self, chat_id: int, message_id: str) -> bool:
+        needle = (message_id or "").strip()
+        if not needle:
+            return False
+        async with self._get_channel_lock(chat_id):
+            data = self._load(chat_id)
+            messages = data.get("messages", [])
+            for idx in range(len(messages) - 1, -1, -1):
+                msg = messages[idx]
+                if msg.get("role") != "user":
+                    continue
+                if str(msg.get("id", "")).strip() != needle:
+                    continue
+                messages.pop(idx)
+                self._save(chat_id, data)
+                return True
+            return False
+
+    async def pop_last_user_message(self, chat_id: int, content: str) -> bool:
+        """Remove the latest user message whose content exactly matches."""
+        needle = (content or "").strip()
+        if not needle:
+            return False
+        async with self._get_channel_lock(chat_id):
+            data = self._load(chat_id)
+            messages = data.get("messages", [])
+            for idx in range(len(messages) - 1, -1, -1):
+                msg = messages[idx]
+                if msg.get("role") != "user":
+                    continue
+                if str(msg.get("content", "")).strip() != needle:
+                    continue
+                messages.pop(idx)
+                self._save(chat_id, data)
+                return True
+            return False
 
     # ── channel management ──
 

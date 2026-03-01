@@ -309,6 +309,53 @@ async def test_route_queue_clear_empties_queue():
     assert "cleared 2 queued task(s)" in send_reply.call_args[0][0].lower()
 
 
+async def test_pop_last_deferred_task_for_channel_returns_newest_matching_entry():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+    router._deferred_tasks["myproj"] = [
+        {"chat_id": 1, "text": "first from ch1", "ts": 1.0},
+        {"chat_id": 2, "text": "other channel", "ts": 2.0},
+        {"chat_id": 1, "text": "latest from ch1", "ts": 3.0},
+    ]
+
+    recalled = router.pop_last_deferred_task_for_channel(1)
+
+    assert recalled == {
+        "text": "latest from ch1",
+        "message_id": None,
+        "chat_id": 1,
+        "project_id": "myproj",
+    }
+    assert [item["text"] for item in router._deferred_tasks["myproj"]] == [
+        "first from ch1",
+        "other channel",
+    ]
+
+
+async def test_pop_last_deferred_task_for_channel_returns_none_when_not_found():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+    router._deferred_tasks["myproj"] = [
+        {"chat_id": 2, "text": "other channel", "ts": 2.0},
+    ]
+
+    recalled = router.pop_last_deferred_task_for_channel(1)
+
+    assert recalled is None
+    assert [item["text"] for item in router._deferred_tasks["myproj"]] == ["other channel"]
+
+
+async def test_restore_deferred_task_for_channel_appends_with_message_id():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    router._channel_project[1] = "myproj"
+
+    size = router.restore_deferred_task_for_channel(1, "redo this", message_id="mid-1")
+
+    assert size == 1
+    assert router._deferred_tasks["myproj"][0]["text"] == "redo this"
+    assert router._deferred_tasks["myproj"][0]["message_id"] == "mid-1"
+
+
 async def test_at_orchestrator_status_command_is_normalized():
     router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
     router._channel_project[1] = "myproj"
@@ -417,6 +464,55 @@ async def test_check_health_rejects_legacy_payload_without_daemon():
 
     ok = await router.check_health("proj")
     assert ok is False
+
+
+async def test_check_health_auto_recovers_tunnel_once():
+    router = _make_router(
+        [
+            RemoteOrchestrator(
+                project_id="proj",
+                name="srv",
+                status="idle",
+                host="user@host",
+                broker_port=8203,
+            )
+        ]
+    )
+    router._check_health_once = AsyncMock(
+        side_effect=[
+            (False, "Cannot connect to host 127.0.0.1:8203"),
+            (True, "daemon=della-gpu"),
+        ]
+    )
+    router._try_auto_recover_tunnel = AsyncMock(return_value=(True, "ssh tunnel started"))
+
+    ok = await router.check_health("proj")
+
+    assert ok is True
+    router._try_auto_recover_tunnel.assert_awaited_once()
+    assert "auto-recovered tunnel" in router._last_health_detail["proj"]
+
+
+async def test_check_health_no_auto_recover_for_non_tunnel_errors():
+    router = _make_router(
+        [
+            RemoteOrchestrator(
+                project_id="proj",
+                name="srv",
+                status="idle",
+                host="user@host",
+                broker_port=8203,
+            )
+        ]
+    )
+    router._check_health_once = AsyncMock(return_value=(False, "missing `daemon` field"))
+    router._try_auto_recover_tunnel = AsyncMock(return_value=(True, "ssh tunnel started"))
+
+    ok = await router.check_health("proj")
+
+    assert ok is False
+    router._try_auto_recover_tunnel.assert_not_awaited()
+    assert "missing `daemon`" in router._last_health_detail["proj"]
 
 
 async def test_ingest_progress_event_dedupes_event_id():
@@ -600,6 +696,7 @@ async def test_connect_command_fails_fast_when_daemon_unreachable():
     reply = send_reply.call_args[0][0].lower()
     assert "cannot connect" in reply
     assert "unreachable" in reply
+    assert "/doctor proj-a" in reply
     router._ensure_registered.assert_not_called()
 
 

@@ -971,6 +971,59 @@ body::after {
   color: var(--red);
 }
 
+.msg-retracted {
+  opacity: 0.84;
+}
+
+.msg-retracted .msg-body {
+  background: rgba(120, 120, 120, 0.1);
+  border: 1px dashed rgba(120, 120, 120, 0.35);
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+
+.msg-retracted .msg-sender {
+  color: var(--text-muted);
+}
+
+.msg-retract-actions {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.msg-retract-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.msg-retract-undo {
+  border: 1px solid rgba(11, 124, 117, 0.35);
+  background: rgba(11, 124, 117, 0.12);
+  color: var(--accent);
+  border-radius: 8px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.msg-retract-undo:hover {
+  filter: brightness(1.03);
+}
+
+.msg-retract-undo:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.msg-retract-out {
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
 /* ── Message body wrapper ───────────────────────── */
 
 .msg-body-wrapper {
@@ -1774,6 +1827,8 @@ let lastWsMessageAt = 0;
 let wsWatchdogTimer = null;
 let pendingSwitchAck = null;
 let monitorAutoScroll = true;
+let queuedRecallInFlight = false;
+const pendingRestoreMessageIds = new Set();
 const pendingUserMessages = new Map();
 const requestScopes = {
   history: { token: 0, controller: null },
@@ -2184,11 +2239,14 @@ function clearPendingUserMessages() {
   pendingUserMessages.clear();
 }
 
-function markPendingUserMessageDelivered(clientMsgId) {
+function markPendingUserMessageDelivered(clientMsgId, messageId) {
   const entry = pendingUserMessages.get(clientMsgId);
   if (!entry) return;
   clearTimeout(entry.timeout);
   const msgEl = entry.el;
+  if (typeof messageId === 'string' && messageId.trim()) {
+    msgEl.dataset.messageId = messageId.trim();
+  }
   msgEl.classList.remove('msg-pending', 'msg-failed');
   const delivery = msgEl.querySelector('.msg-delivery');
   if (delivery) {
@@ -2214,6 +2272,136 @@ function markPendingUserMessageFailed(clientMsgId, reason) {
   pendingUserMessages.delete(clientMsgId);
 }
 
+function removePendingEntryForElement(msgEl) {
+  for (const [id, entry] of pendingUserMessages.entries()) {
+    if (!entry || entry.el !== msgEl) continue;
+    clearTimeout(entry.timeout);
+    pendingUserMessages.delete(id);
+    break;
+  }
+}
+
+function findLastRenderedUserMessageById(messageId) {
+  const needle = typeof messageId === 'string' ? messageId.trim() : '';
+  if (!needle) return null;
+  const userMessages = messagesEl.querySelectorAll('.msg.msg-user');
+  for (let i = userMessages.length - 1; i >= 0; i--) {
+    const msgEl = userMessages[i];
+    if ((msgEl.dataset.messageId || '') === needle) {
+      return msgEl;
+    }
+  }
+  return null;
+}
+
+function findLastRenderedUserMessageByText(text) {
+  const needle = typeof text === 'string' ? text.trim() : String(text ?? '').trim();
+  if (!needle) return null;
+  const userMessages = messagesEl.querySelectorAll('.msg.msg-user');
+  for (let i = userMessages.length - 1; i >= 0; i--) {
+    const msgEl = userMessages[i];
+    const bodyEl = msgEl.querySelector('.msg-body');
+    const bodyText = bodyEl ? bodyEl.textContent.trim() : '';
+    if (bodyText === needle) {
+      return msgEl;
+    }
+  }
+  return null;
+}
+
+function requestRestoreRetractedMessage(messageId, text) {
+  const mid = typeof messageId === 'string' ? messageId.trim() : '';
+  const body = typeof text === 'string' ? text.trim() : String(text ?? '').trim();
+  if (!body) return false;
+  if (mid && pendingRestoreMessageIds.has(mid)) return false;
+  if (!ws || ws.readyState !== WebSocket.OPEN || activeChannel === null) return false;
+  try {
+    if (mid) {
+      pendingRestoreMessageIds.add(mid);
+    }
+    ws.send(JSON.stringify({ type: 'restore_retracted_message', message_id: mid, text: body }));
+    return true;
+  } catch (_) {
+    if (mid) {
+      pendingRestoreMessageIds.delete(mid);
+    }
+    return false;
+  }
+}
+
+function retractMessageElement(msgEl, messageId, originalText) {
+  if (!msgEl || msgEl.classList.contains('msg-retracted')) return false;
+  removePendingEntryForElement(msgEl);
+  msgEl.classList.remove('msg-pending', 'msg-failed');
+  msgEl.classList.add('msg-retracted');
+
+  const bodyEl = msgEl.querySelector('.msg-body');
+  if (!bodyEl) return false;
+  const text = typeof originalText === 'string' ? originalText : bodyEl.textContent;
+  const normalized = String(text ?? '').trim();
+  if (!normalized) return false;
+  if (typeof messageId === 'string' && messageId.trim()) {
+    msgEl.dataset.messageId = messageId.trim();
+  }
+  msgEl.dataset.retractedText = normalized;
+  msgEl.dataset.retracted = '1';
+  bodyEl.textContent = 'Moved back to editor.';
+
+  const actions = document.createElement('div');
+  actions.className = 'msg-retract-actions';
+  const label = document.createElement('span');
+  label.className = 'msg-retract-label';
+  label.textContent = 'Queued message recalled';
+  const undoBtn = document.createElement('button');
+  undoBtn.type = 'button';
+  undoBtn.className = 'msg-retract-undo';
+  undoBtn.textContent = 'Undo';
+  undoBtn.addEventListener('click', function() {
+    const mid = msgEl.dataset.messageId || '';
+    const raw = msgEl.dataset.retractedText || '';
+    if (!requestRestoreRetractedMessage(mid, raw)) return;
+    undoBtn.disabled = true;
+    undoBtn.textContent = 'Restoring...';
+  });
+  actions.appendChild(label);
+  actions.appendChild(undoBtn);
+  bodyEl.appendChild(actions);
+
+  const token = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  msgEl.dataset.retractToken = token;
+  setTimeout(() => {
+    if (!msgEl.isConnected) return;
+    if (msgEl.dataset.retractToken !== token) return;
+    if (msgEl.dataset.retracted !== '1') return;
+    msgEl.classList.add('msg-retract-out');
+    setTimeout(() => {
+      if (!msgEl.isConnected) return;
+      if (msgEl.dataset.retracted !== '1') return;
+      msgEl.remove();
+      refreshConversationVisibility(messagesEl.childElementCount > 0);
+    }, 200);
+  }, 8000);
+  return true;
+}
+
+function restoreRetractedMessageElement(msgEl, messageId, text) {
+  if (!msgEl) return false;
+  const normalized = typeof text === 'string' ? text : String(text ?? '');
+  if (typeof messageId === 'string' && messageId.trim()) {
+    msgEl.dataset.messageId = messageId.trim();
+    pendingRestoreMessageIds.delete(messageId.trim());
+  }
+  msgEl.classList.remove('msg-retracted', 'msg-retract-out');
+  delete msgEl.dataset.retracted;
+  delete msgEl.dataset.retractedText;
+  delete msgEl.dataset.retractToken;
+  const bodyEl = msgEl.querySelector('.msg-body');
+  if (!bodyEl) return false;
+  bodyEl.textContent = normalized;
+  scrollToBottom();
+  return true;
+}
+
 const SENDER_CONFIG = {
   user:         { label: 'You',          avatar: 'Y', css: 'msg-user' },
   orchestrator: { label: 'Orchestrator', avatar: 'O', css: 'msg-orchestrator' },
@@ -2234,6 +2422,9 @@ function addMessage(text, sender, tsSeconds, opts) {
   div.className = 'msg ' + cssClass;
   if (options.clientMsgId) {
     div.dataset.clientMsgId = options.clientMsgId;
+  }
+  if (options.messageId) {
+    div.dataset.messageId = options.messageId;
   }
   if (options.pending) {
     div.classList.add('msg-pending');
@@ -2776,6 +2967,19 @@ function sendMessage() {
   clearAwaitingInput();
 }
 
+function requestQueuedMessageRecall() {
+  if (queuedRecallInFlight) return false;
+  if (!ws || ws.readyState !== WebSocket.OPEN || activeChannel === null) return false;
+  try {
+    queuedRecallInFlight = true;
+    ws.send(JSON.stringify({ type: 'recall_queued_message' }));
+    return true;
+  } catch (_) {
+    queuedRecallInFlight = false;
+    return false;
+  }
+}
+
 function loadHistory(channelId, req = beginScopedRequest('history')) {
   fetchJson('/api/history?channel=' + channelId, { signal: req.signal })
     .then(messages => {
@@ -2783,7 +2987,7 @@ function loadHistory(channelId, req = beginScopedRequest('history')) {
       messagesEl.innerHTML = '';
       for (const msg of messages) {
         const sender = msg.sender || (msg.role === 'user' ? 'user' : classifyMessageLegacy(msg.content));
-        addMessage(msg.content, sender, msg.ts);
+        addMessage(msg.content, sender, msg.ts, { messageId: msg.id || '' });
       }
       refreshConversationVisibility(messages.length > 0);
     })
@@ -3204,6 +3408,15 @@ inputEl.addEventListener('keydown', function(e) {
     }
   }
 
+  if (e.key === 'Escape') {
+    if (!inputEl.value.trim() && !newChannelModal.classList.contains('open')) {
+      if (requestQueuedMessageRecall()) {
+        e.preventDefault();
+        return;
+      }
+    }
+  }
+
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendMessage();
@@ -3318,6 +3531,8 @@ function connect() {
     clearPendingSwitchAck();
     routerTypingActive = false;
     routerTypingTokens.clear();
+    queuedRecallInFlight = false;
+    pendingRestoreMessageIds.clear();
     resetTypingIndicator();
     const pendingIds = Array.from(pendingUserMessages.keys());
     for (const id of pendingIds) {
@@ -3425,7 +3640,47 @@ function connect() {
 
     } else if (data.type === 'message_ack') {
       if (data.client_msg_id) {
-        markPendingUserMessageDelivered(String(data.client_msg_id));
+        markPendingUserMessageDelivered(
+          String(data.client_msg_id),
+          typeof data.message_id === 'string' ? data.message_id : ''
+        );
+      }
+
+    } else if (data.type === 'queue_recall') {
+      queuedRecallInFlight = false;
+      if (typeof data.text === 'string' && data.text.trim() && !inputEl.value.trim()) {
+        inputEl.value = data.text;
+        inputEl.dispatchEvent(new Event('input'));
+        inputEl.focus();
+      }
+
+    } else if (data.type === 'message_retracted') {
+      if ((data.sender || 'user') === 'user') {
+        const messageId = typeof data.message_id === 'string' ? data.message_id.trim() : '';
+        const msgEl = messageId
+          ? findLastRenderedUserMessageById(messageId)
+          : findLastRenderedUserMessageByText(data.text);
+        if (msgEl) {
+          retractMessageElement(msgEl, messageId, data.text);
+        }
+      }
+
+    } else if (data.type === 'message_restored') {
+      if ((data.sender || 'user') === 'user') {
+        const messageId = typeof data.message_id === 'string' ? data.message_id.trim() : '';
+        const msgEl = messageId
+          ? findLastRenderedUserMessageById(messageId)
+          : findLastRenderedUserMessageByText('Moved back to editor.');
+        if (msgEl && msgEl.classList.contains('msg-retracted')) {
+          restoreRetractedMessageElement(msgEl, messageId, data.text);
+        } else {
+          addMessage(data.text, 'user', data.ts, { messageId: messageId || '' });
+        }
+      }
+
+    } else if (data.type === 'queue_restore') {
+      if (typeof data.message_id === 'string' && data.message_id.trim()) {
+        pendingRestoreMessageIds.delete(data.message_id.trim());
       }
 
     } else if (data.type === 'typing') {
@@ -3457,6 +3712,8 @@ function connect() {
       }
 
     } else if (data.type === 'error') {
+      queuedRecallInFlight = false;
+      pendingRestoreMessageIds.clear();
       addMessage('Error: ' + data.text, 'system', data.ts);
     } else {
       console.warn('Unhandled WebSocket message type:', data.type);
