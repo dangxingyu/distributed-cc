@@ -272,6 +272,9 @@ curl http://127.0.0.1:8201/health
 
 - Check tunnel health: `curl http://127.0.0.1:<broker_port>/health`
 - Check daemon process remotely (`tmux ls`)
+- On `/connect`, Router now attempts one non-interactive tunnel self-heal (`ssh -fNT ...`) for remote hosts.
+  This requires key-based SSH auth (`BatchMode=yes`); password-only hosts still need manual `/setup` or tunnel restart.
+  Set `DCC_AUTO_RECOVER_TUNNEL=0` to disable this behavior.
 - In a channel, run `/doctor [hint]` to let Router diagnose current project/server context
 - Run systematic diagnostics (health signature + register/status probes):
   `make doctor`
