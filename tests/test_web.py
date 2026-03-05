@@ -123,6 +123,31 @@ async def test_history_with_channel_param_has_ts(aiohttp_client):
     await store.close()
 
 
+async def test_history_limit_returns_latest_messages(aiohttp_client):
+    client, _, _, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("history-limit")
+    await store.add_message(ch_id, "user", "m1")
+    await store.add_message(ch_id, "assistant", "m2")
+    await store.add_message(ch_id, "assistant", "m3")
+
+    resp = await client.get(f"/api/history?channel={ch_id}&limit=2")
+    assert resp.status == 200
+    data = await resp.json()
+    assert [m["content"] for m in data] == ["m2", "m3"]
+    await store.close()
+
+
+async def test_history_limit_invalid_rejected(aiohttp_client):
+    client, _, _, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("history-limit-invalid")
+
+    resp = await client.get(f"/api/history?channel={ch_id}&limit=0")
+    assert resp.status == 400
+    payload = await resp.json()
+    assert "limit" in payload["error"].lower()
+    await store.close()
+
+
 async def test_projects_list(aiohttp_client):
     client, _, _, store = await _make_web(aiohttp_client)
     resp = await client.get("/api/projects")
@@ -604,6 +629,31 @@ async def test_logs_api(aiohttp_client):
     data = await resp.json()
     assert len(data) == 1
     assert data[0]["text"] == "tool call: Bash"
+    await store.close()
+
+
+async def test_logs_limit_returns_latest_entries(aiohttp_client):
+    client, _, _, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("log-limit")
+    await store.add_log(ch_id, "l1")
+    await store.add_log(ch_id, "l2")
+    await store.add_log(ch_id, "l3")
+
+    resp = await client.get(f"/api/logs?channel={ch_id}&limit=2")
+    assert resp.status == 200
+    data = await resp.json()
+    assert [row["text"] for row in data] == ["l2", "l3"]
+    await store.close()
+
+
+async def test_logs_limit_invalid_rejected(aiohttp_client):
+    client, _, _, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("log-limit-invalid")
+
+    resp = await client.get(f"/api/logs?channel={ch_id}&limit=-1")
+    assert resp.status == 400
+    payload = await resp.json()
+    assert "limit" in payload["error"].lower()
     await store.close()
 
 

@@ -103,11 +103,15 @@ class Store:
             self._save(chat_id, data)
             return mid
 
-    async def get_recent_messages(self, chat_id: int) -> list[dict]:
+    async def get_recent_messages(self, chat_id: int, limit: int | None = None) -> list[dict]:
         async with self._get_channel_lock(chat_id):
             data = self._load(chat_id)
+            raw_messages = data["messages"]
+            if isinstance(limit, int) and limit > 0:
+                raw_messages = raw_messages[-limit:]
+
             messages = []
-            for m in data["messages"]:
+            for m in raw_messages:
                 msg = {
                     "role": m.get("role", ""),
                     "content": m.get("content", ""),
@@ -313,10 +317,13 @@ class Store:
             data["logs"].append({"text": text, "ts": time.time()})
             self._save(chat_id, data)
 
-    async def get_logs(self, chat_id: int) -> list[dict]:
+    async def get_logs(self, chat_id: int, limit: int | None = None) -> list[dict]:
         async with self._get_channel_lock(chat_id):
             data = self._load(chat_id)
-            return data.get("logs", [])
+            logs = data.get("logs", [])
+            if isinstance(limit, int) and limit > 0:
+                return logs[-limit:]
+            return logs
 
     # ── notes ──
 

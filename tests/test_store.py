@@ -55,6 +55,14 @@ async def test_message_all_returned(store):
     assert msgs[-1]["content"] == "msg 29"
 
 
+async def test_get_recent_messages_with_limit_returns_latest_slice(store):
+    for i in range(10):
+        await store.add_message(1, "user", f"msg {i}")
+
+    msgs = await store.get_recent_messages(1, limit=3)
+    assert [m["content"] for m in msgs] == ["msg 7", "msg 8", "msg 9"]
+
+
 async def test_concurrent_message_writes_do_not_drop_entries(store):
     async def _write(i: int):
         await store.add_message(1, "user", f"msg-{i}")
@@ -232,6 +240,15 @@ async def test_add_and_get_logs(store):
     logs = await store.get_logs(1)
     assert len(logs) == 2
     assert logs[0]["text"] == "tool call: Bash"
+
+
+async def test_get_logs_with_limit_returns_latest_slice(store):
+    await store.add_log(1, "log-1")
+    await store.add_log(1, "log-2")
+    await store.add_log(1, "log-3")
+
+    logs = await store.get_logs(1, limit=2)
+    assert [entry["text"] for entry in logs] == ["log-2", "log-3"]
 
 
 async def test_empty_logs(store):

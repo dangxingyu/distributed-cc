@@ -120,7 +120,17 @@ class WebChat:
         except ValueError:
             return web.json_response({"error": "invalid channel id"}, status=400)
 
-        messages = await self._store.get_recent_messages(channel_id)
+        limit_raw = request.query.get("limit")
+        limit: int | None = None
+        if limit_raw is not None and limit_raw != "":
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return web.json_response({"error": "invalid limit"}, status=400)
+            if limit <= 0:
+                return web.json_response({"error": "limit must be > 0"}, status=400)
+
+        messages = await self._store.get_recent_messages(channel_id, limit=limit)
         return web.json_response(messages)
 
     async def _handle_channels_list(self, request: web.Request) -> web.Response:
@@ -212,7 +222,17 @@ class WebChat:
         except ValueError:
             return web.json_response({"error": "invalid channel id"}, status=400)
 
-        logs = await self._store.get_logs(channel_id)
+        limit_raw = request.query.get("limit")
+        limit: int | None = None
+        if limit_raw is not None and limit_raw != "":
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return web.json_response({"error": "invalid limit"}, status=400)
+            if limit <= 0:
+                return web.json_response({"error": "limit must be > 0"}, status=400)
+
+        logs = await self._store.get_logs(channel_id, limit=limit)
         return web.json_response(logs)
 
     async def _handle_projects_list(self, request: web.Request) -> web.Response:

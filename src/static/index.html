@@ -827,6 +827,13 @@ body::after {
   box-shadow: 0 8px 16px rgba(66, 48, 16, 0.05);
 }
 
+.msg-body.msg-body-plain {
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.52;
+}
+
 /* ── Rendered markdown in messages ───────────── */
 
 .msg-body p { margin: 0 0 8px 0; }
@@ -1838,6 +1845,13 @@ const requestScopes = {
 const STALE_WS_MS = 45000;
 const WATCHDOG_POLL_MS = 15000;
 const SWITCH_ACK_TIMEOUT_MS = 8000;
+const HISTORY_FETCH_LIMIT = 180;
+const LOG_FETCH_LIMIT = 600;
+const MAX_RENDERED_MESSAGES = 320;
+const MAX_RENDERED_LOGS = 900;
+const LARGE_MARKDOWN_RENDER_THRESHOLD = 3000;
+const LARGE_LOG_PARSE_THRESHOLD = 4096;
+const MEMBERS_REFRESH_DEBOUNCE_MS = 1200;
 const TASK_LIST_CACHE_KEY = 'dcc_task_list_cache_v1';
 const LAST_SETUP_SERVER_KEY = 'dcc_last_setup_server';
 const LAST_PROJECT_WORKDIR_KEY = 'dcc_last_project_workdir';
@@ -2470,6 +2484,10 @@ function addMessage(text, sender, tsSeconds, opts) {
   bodyEl.className = 'msg-body';
   if (cssClass === 'msg-user') {
     bodyEl.textContent = body;
+  } else if (body.length > LARGE_MARKDOWN_RENDER_THRESHOLD) {
+    // Keep full content but avoid expensive markdown parse/sanitize on giant payloads.
+    bodyEl.classList.add('msg-body-plain');
+    bodyEl.textContent = body;
   } else {
     bodyEl.innerHTML = renderMarkdown(body);
   }
@@ -2479,18 +2497,40 @@ function addMessage(text, sender, tsSeconds, opts) {
   content.appendChild(bodyWrapper);
   div.appendChild(content);
   messagesEl.appendChild(div);
-  refreshConversationVisibility(true);
-  scrollToBottom();
+  while (messagesEl.childElementCount > MAX_RENDERED_MESSAGES) {
+    const oldest = messagesEl.firstElementChild;
+    if (!oldest) break;
+    removePendingEntryForElement(oldest);
+    oldest.remove();
+  }
+  if (!options.skipVisibility) {
+    refreshConversationVisibility(true);
+  }
+  if (!options.skipScroll) {
+    scrollToBottom();
+  }
   return div;
 }
 
 // ── Channel management ──────────────────────────────────────────────
+
+let _channelListRenderPending = false;
+
+function scheduleChannelListRender() {
+  if (_channelListRenderPending) return;
+  _channelListRenderPending = true;
+  requestAnimationFrame(() => {
+    renderChannelList();
+    _channelListRenderPending = false;
+  });
+}
 
 function renderChannelList() {
   channelListEl.innerHTML = '';
   for (const ch of channels) {
     const item = document.createElement('div');
     item.className = 'channel-item' + (activeChannel === ch.id ? ' active' : '');
+    item.dataset.channelId = String(ch.id);
 
     const status = ch.project_status || 'unconnected';
     item.innerHTML = '<span class="hash">#</span>'
@@ -2571,6 +2611,10 @@ function onChannelSwitched(data) {
   const nextChannelId = Number(data.channel_id);
   const sameChannelResync = activeChannel !== null && activeChannel === nextChannelId;
   clearPendingSwitchAck(nextChannelId);
+  if (_membersRefreshTimer) {
+    clearTimeout(_membersRefreshTimer);
+    _membersRefreshTimer = null;
+  }
   clearPendingUserMessages();
   activeChannel = nextChannelId;
   currentProjectId = data.project_id || null;
@@ -2885,6 +2929,18 @@ function refreshActiveChannelData(channelId) {
   loadLogs(channelId, logsReq);
 }
 
+let _membersRefreshTimer = null;
+
+function scheduleMembersRefresh() {
+  if (activeChannel === null) return;
+  if (_membersRefreshTimer) return;
+  _membersRefreshTimer = setTimeout(() => {
+    _membersRefreshTimer = null;
+    if (activeChannel === null) return;
+    loadMembers(activeChannel, beginScopedRequest('members'));
+  }, MEMBERS_REFRESH_DEBOUNCE_MS);
+}
+
 function loadMembers(channelId, req = beginScopedRequest('members')) {
   fetchJson('/api/channels/' + channelId + '/members', { signal: req.signal })
     .then(members => {
@@ -2981,15 +3037,22 @@ function requestQueuedMessageRecall() {
 }
 
 function loadHistory(channelId, req = beginScopedRequest('history')) {
-  fetchJson('/api/history?channel=' + channelId, { signal: req.signal })
+  fetchJson('/api/history?channel=' + channelId + '&limit=' + HISTORY_FETCH_LIMIT, { signal: req.signal })
     .then(messages => {
       if (!isActiveRequest('history', req.token, channelId)) return;
       messagesEl.innerHTML = '';
       for (const msg of messages) {
         const sender = msg.sender || (msg.role === 'user' ? 'user' : classifyMessageLegacy(msg.content));
-        addMessage(msg.content, sender, msg.ts, { messageId: msg.id || '' });
+        addMessage(msg.content, sender, msg.ts, {
+          messageId: msg.id || '',
+          skipScroll: true,
+          skipVisibility: true,
+        });
       }
       refreshConversationVisibility(messages.length > 0);
+      if (messages.length > 0) {
+        scrollToBottom();
+      }
     })
     .catch((err) => {
       if (err && err.name === 'AbortError') return;
@@ -2999,12 +3062,12 @@ function loadHistory(channelId, req = beginScopedRequest('history')) {
 }
 
 function loadLogs(channelId, req = beginScopedRequest('logs')) {
-  fetchJson('/api/logs?channel=' + channelId, { signal: req.signal })
+  fetchJson('/api/logs?channel=' + channelId + '&limit=' + LOG_FETCH_LIMIT, { signal: req.signal })
     .then(logs => {
       if (!isActiveRequest('logs', req.token, channelId)) return;
       monitorLog.innerHTML = '';
       for (const entry of logs) {
-        addLogEntry(entry.text, entry.ts);
+        addLogEntry(entry.text, entry.ts, { skipAutoScroll: true });
       }
       if (monitorAutoScroll) {
         scrollMonitorToBottom();
@@ -3052,24 +3115,28 @@ function scrollMonitorToBottom() {
   monitorLog.scrollTop = monitorLog.scrollHeight;
 }
 
-function addLogEntry(text, ts) {
+function addLogEntry(text, ts, opts) {
+  const options = opts || {};
   const entry = document.createElement('div');
 
-  // Parse log entry to extract source, tool name, and display text
-  const isError = text.startsWith('[ERROR]');
-  const assignMatch = text.match(/^→\s*\[orchestrator\s*->\s*worker\]\s*(.*)/s);
-  const toolMatch = text.match(/^→\s*\[(orchestrator|worker)\]\s*(\w+):\s*(.*)/s);
-  const orchText = text.match(/^\[orchestrator\]\s*(.*)/s);
-  const atOrchWorker = text.match(/^@orchestrator\s*->\s*@worker:\s*(.*)/s);
-  const atWorkerOrch = text.match(/^@worker\s*->\s*@orchestrator:\s*(.*)/s);
-  const isIteration = /^(Worker assignment|Starting task)/i.test(text);
+  // Parse log entry to extract source, tool name, and display text.
+  // For giant payloads, skip expensive regex parsing to keep UI responsive.
+  const normalizedText = typeof text === 'string' ? text : String(text ?? '');
+  const isLargeLog = normalizedText.length > LARGE_LOG_PARSE_THRESHOLD;
+  const isError = normalizedText.startsWith('[ERROR]');
+  const assignMatch = isLargeLog ? null : normalizedText.match(/^→\s*\[orchestrator\s*->\s*worker\]\s*(.*)/s);
+  const toolMatch = isLargeLog ? null : normalizedText.match(/^→\s*\[(orchestrator|worker)\]\s*(\w+):\s*(.*)/s);
+  const orchText = isLargeLog ? null : normalizedText.match(/^\[orchestrator\]\s*(.*)/s);
+  const atOrchWorker = isLargeLog ? null : normalizedText.match(/^@orchestrator\s*->\s*@worker:\s*(.*)/s);
+  const atWorkerOrch = isLargeLog ? null : normalizedText.match(/^@worker\s*->\s*@orchestrator:\s*(.*)/s);
+  const isIteration = isLargeLog ? false : /^(Worker assignment|Starting task)/i.test(normalizedText);
 
   let entryClass, source, toolName, displayText;
 
   if (isError) {
     entryClass = 'log-entry-error';
     source = 'system';
-    displayText = text.replace(/^\[ERROR\]\s*/, '');
+    displayText = normalizedText.replace(/^\[ERROR\]\s*/, '');
   } else if (assignMatch) {
     entryClass = 'log-entry-iteration';
     source = 'orchestrator';
@@ -3099,7 +3166,7 @@ function addLogEntry(text, ts) {
   } else {
     entryClass = 'log-entry-text';
     source = null;
-    displayText = text;
+    displayText = normalizedText;
   }
 
   entry.className = 'log-entry ' + entryClass;
@@ -3136,8 +3203,13 @@ function addLogEntry(text, ts) {
   entry.appendChild(contentEl);
 
   monitorLog.appendChild(entry);
+  while (monitorLog.childElementCount > MAX_RENDERED_LOGS) {
+    const oldest = monitorLog.firstElementChild;
+    if (!oldest) break;
+    oldest.remove();
+  }
 
-  if (monitorAutoScroll && !_monitorScrollPending) {
+  if (!options.skipAutoScroll && monitorAutoScroll && !_monitorScrollPending) {
     _monitorScrollPending = true;
     requestAnimationFrame(() => {
       scrollMonitorToBottom();
@@ -3589,7 +3661,7 @@ function connect() {
         if (data.project_id !== undefined) {
           channels[idx].project_id = data.project_id;
         }
-        renderChannelList();
+        scheduleChannelListRender();
       }
       if (activeChannel === data.channel_id) {
         currentProjectId = data.project_id || currentProjectId;
@@ -3636,7 +3708,7 @@ function connect() {
         maybePrefillSetupProjectFromRouterReply(data.text);
         maybePrefillConnectFromRouterReply(data.text);
       }
-      if (activeChannel !== null) loadMembers(activeChannel, beginScopedRequest('members'));
+      scheduleMembersRefresh();
 
     } else if (data.type === 'message_ack') {
       if (data.client_msg_id) {
