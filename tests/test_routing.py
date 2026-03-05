@@ -430,6 +430,66 @@ async def test_route_to_disconnected_daemon():
     assert "cannot reach" in send_reply.call_args[0][0].lower()
 
 
+async def test_ensure_registered_checks_health_before_register_when_disconnected():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="disconnected")])
+    router._http = object()
+
+    orch = router._orchestrators["proj"]
+    router.check_health = AsyncMock(return_value=False)
+    router._register_project = AsyncMock()
+
+    ok = await router._ensure_registered(orch)
+
+    assert ok is False
+    router.check_health.assert_awaited_once_with("proj")
+    router._register_project.assert_not_awaited()
+
+
+async def test_ensure_registered_registers_after_health_when_disconnected():
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="disconnected")])
+    router._http = object()
+
+    orch = router._orchestrators["proj"]
+    router.check_health = AsyncMock(return_value=True)
+
+    async def _register_side_effect(arg):
+        assert arg is orch
+        orch.status = "idle"
+
+    router._register_project = AsyncMock(side_effect=_register_side_effect)
+
+    ok = await router._ensure_registered(orch)
+
+    assert ok is True
+    router.check_health.assert_awaited_once_with("proj")
+    router._register_project.assert_awaited_once_with(orch)
+
+
+async def test_route_message_after_restart_recovers_then_starts_task():
+    """Mapped channel should recover tunnel/register path before starting task."""
+    router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="disconnected")])
+    router._channel_project[1] = "proj"
+    router._http = object()
+
+    orch = router._orchestrators["proj"]
+    router.check_health = AsyncMock(return_value=True)
+
+    async def _register_side_effect(arg):
+        assert arg is orch
+        orch.status = "idle"
+
+    router._register_project = AsyncMock(side_effect=_register_side_effect)
+    router._start_task = AsyncMock()
+
+    send_reply = AsyncMock()
+    send_log = AsyncMock()
+    await router.route_message(1, "resume work", send_reply, send_log)
+
+    router.check_health.assert_awaited_once_with("proj")
+    router._register_project.assert_awaited_once_with(orch)
+    router._start_task.assert_awaited_once_with(1, "proj", "resume work", send_reply, send_log)
+
+
 async def test_check_health_requires_orchestrator_daemon_signature():
     """Health check should require status=ok plus non-empty daemon field."""
     router = _make_router([RemoteOrchestrator(project_id="proj", name="srv", status="idle")])
@@ -957,6 +1017,10 @@ async def test_doctor_prompt_includes_channel_context(tmp_path):
     assert "user_hint: verify communication path" in prompt
     assert "daemon connect failed on ftgs" in prompt
     assert "tools/doctor.py --project <project_id>" in prompt
+    assert "MANDATORY quick checks" in prompt
+    assert "lsof -nP -iTCP:8203 -sTCP:LISTEN" in prompt
+    assert "ssh user@host \"ps -ef | rg orchestrator_daemon.py | rg -v rg\"" in prompt
+    assert "do not claim 'tunnel down'" in prompt
     assert "ROOT CAUSE" in prompt
 
 

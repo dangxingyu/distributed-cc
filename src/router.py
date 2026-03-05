@@ -29,7 +29,7 @@ def _env_flag(name: str) -> bool:
 
 
 def _preview(text: str, limit: int = 120) -> str:
-    compact = " ".join((text or "").split())
+    compact = " ".join(str(text or "").split())
     if len(compact) <= limit:
         return compact
     return compact[:limit] + "..."
@@ -417,10 +417,23 @@ class Router:
             log.warning("Cannot reach daemon for %s: %s", orch.project_id, e)
             orch.status = "disconnected"
 
-    async def _ensure_registered(self, orch: RemoteOrchestrator) -> bool:
+    async def _ensure_registered(
+        self,
+        orch: RemoteOrchestrator,
+        require_health: bool = True,
+    ) -> bool:
         """Lazily register with daemon on first interaction. Returns True if ready."""
         if orch.status not in ("unknown", "disconnected"):
             return True
+
+        # Re-hydrated channels often hit this path right after local router restart.
+        # If the SSH tunnel died with the previous process, run health first so
+        # auto-recover can recreate the tunnel before attempting /register.
+        if require_health and self._http:
+            if not await self.check_health(orch.project_id):
+                orch.status = "disconnected"
+                return False
+
         await self._register_project(orch)
         return orch.status not in ("unknown", "disconnected")
 
@@ -725,7 +738,12 @@ class Router:
                 return
 
             if not await self._ensure_registered(orch):
-                await send_reply(f"Cannot reach daemon for `{project_id}`. Is the daemon running and SSH tunnel open?")
+                detail = self._last_health_detail.get(project_id, "")
+                detail_suffix = f" Detail: `{_preview(detail, 180)}`." if detail else ""
+                await send_reply(
+                    f"Cannot reach daemon for `{project_id}`. Is the daemon running and SSH tunnel open?"
+                    f"{detail_suffix} Try `/doctor {project_id}` for systematic diagnosis."
+                )
                 return
 
             effective_text = orchestrator_body if addressed_to_orchestrator else stripped
@@ -1157,6 +1175,8 @@ class Router:
     def _build_doctor_prompt(self, chat_id: int, hint: str) -> str:
         project_id = self._channel_project.get(chat_id)
         orch = self._orchestrators.get(project_id) if project_id else None
+        host_value = str(orch.host).strip() if orch and orch.host else "<host>"
+        broker_port_value = str(orch.broker_port) if orch else "<broker_port>"
 
         if orch:
             connected = (
@@ -1201,18 +1221,24 @@ class Router:
             "2) Run systematic checks first with local tool:\n"
             "   - if a project_id is known: `uv run python tools/doctor.py --project <project_id> --timeout 5`\n"
             "   - else: `uv run python tools/doctor.py --timeout 5`\n"
-            "3) For each failing check, run focused follow-ups and classify root cause:\n"
+            "3) MANDATORY quick checks (run before concluding root cause when host/port are known):\n"
+            f"   - local endpoint owner: `lsof -nP -iTCP:{broker_port_value} -sTCP:LISTEN`\n"
+            f"   - local tunnel process: `ps aux | rg \"ssh.*-L {broker_port_value}:localhost:8200\" | rg -v rg`\n"
+            f"   - remote daemon process: `ssh {host_value} \"ps -ef | rg orchestrator_daemon.py | rg -v rg\"`\n"
+            f"   - remote daemon port owner: `ssh {host_value} \"lsof -nP -iTCP:8200 -sTCP:LISTEN || ss -ltnp | rg :8200\"`\n"
+            "4) For each failing check, run focused follow-ups and classify root cause:\n"
             "   - tunnel down / wrong broker_port mapping\n"
             "   - wrong service on port (legacy broker or non-orchestrator daemon)\n"
             "   - daemon process absent/crashed or remote port conflict\n"
             "   - register/status failure from project_dir mismatch/permissions\n"
-            "4) If safe, apply minimal fixes and re-run doctor once to verify.\n"
-            "5) Return concise structured output:\n"
+            "5) If safe, apply minimal fixes and re-run doctor once to verify.\n"
+            "6) Return concise structured output:\n"
             "   - TARGET\n"
             "   - CHECK RESULTS\n"
             "   - ROOT CAUSE\n"
             "   - FIX APPLIED (or exact next commands)\n"
             "   - FINAL STATUS\n"
+            "Hard rule: do not claim 'tunnel down' unless quick-check evidence includes BOTH local endpoint owner and local tunnel process checks.\n"
         )
 
     def _build_upgrade_check_prompt(self, chat_id: int, hint: str) -> str:
@@ -1873,7 +1899,7 @@ class Router:
                 )
                 return
 
-            if not await self._ensure_registered(orch):
+            if not await self._ensure_registered(orch, require_health=False):
                 await send_reply(
                     f"Cannot connect `{project_id}`: daemon is up but project registration failed. "
                     f"Check project_dir `{orch.project_dir}` and daemon logs, then retry."
