@@ -151,7 +151,7 @@ Urgency while running:
 
 ## Heartbeat Behavior
 
-Heartbeat only runs in **standby** state (`done/idle`): daemon wakes orchestrator for lightweight triage only when meaningful signals exist (for example queued advisor messages or unchecked `task_list.md` items).
+Heartbeat only runs in **standby** state (`done/idle`): daemon wakes orchestrator for lightweight triage only when meaningful signals exist (for example queued advisor messages or unchecked `task_list.md` items). Unchanged signals are deduped to avoid repetitive wakeups, and repetitive "stay resting" summaries are routed to monitor logs (not chat bubbles).
 
 Defaults:
 

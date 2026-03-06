@@ -134,6 +134,7 @@ STANDBY_HEARTBEAT_ENABLED = os.environ.get("STANDBY_HEARTBEAT_ENABLED", "1").str
 )
 STANDBY_HEARTBEAT_SECONDS = _env_int("STANDBY_HEARTBEAT_SECONDS", 1800, minimum=60)
 STANDBY_WAKE_MAX_ITERATIONS = _env_int("STANDBY_WAKE_MAX_ITERATIONS", 1, minimum=1)
+STANDBY_WAKEUP_MARKER = "[STANDBY HEARTBEAT WAKEUP]"
 CONTINUOUS_MODE_DEFAULT = os.environ.get("CONTINUOUS_MODE", "1").strip().lower() not in (
     "0",
     "false",
@@ -163,8 +164,9 @@ the source of truth for this project's status. Keep them current so that anyone
 (including yourself after a session restart) can pick up exactly where you left off.
 
 When the advisor is silent, keep working. Their silence means "carry on".
-Only stop when all goals are met (call task_complete) or you hit a genuine
-decision that requires their input (call ask_user).
+Only stop when all goals are met (call task_complete), when you intentionally
+enter standby (call stay_idle), or when you hit a genuine decision that
+requires their input (call ask_user).
 """
 
 ORCH_TOOLS = """\
@@ -175,6 +177,8 @@ Besides the standard Read/Glob/Grep/WebSearch/WebFetch for investigation, you ha
 - **assign_worker(task)** — send a concrete assignment to your worker agent.
   This is your primary execution path for substantial implementation/investigation work.
   The worker has full tool access (Edit, Write, Bash, etc). Returns their report.
+- **stay_idle(reason)** — enter standby when triage finds no meaningful action right now.
+  This ends the current run cleanly and lets heartbeat/user messages wake you later.
 - **task_complete(summary)** — mark the overall task as done.
 - **ask_user(question)** — ask the professor a blocking question (use sparingly).
 - **pull_user_messages()** — fetch queued user guidance/urgent interruptions when useful.
@@ -196,7 +200,8 @@ ORCH_WORKFLOW = """\
    with concrete evidence (read the diff, run the test, check the artifact) before
    marking progress on that item.
 6. Iterate: Refine based on evidence until the goal is met.
-7. Complete: Call task_complete with a summary.
+7. Complete: Call task_complete with a summary when done, or call stay_idle(reason)
+   when there is no meaningful next action yet.
 """
 
 ORCH_EXECUTION_POLICY = """\
@@ -412,6 +417,8 @@ callback_http_session: ClientSession | None = None
 callback_http_lock = asyncio.Lock()
 project_last_standby_wake_ts: dict[str, float] = {}
 standby_heartbeat_tasks: dict[str, asyncio.Task] = {}
+project_last_standby_signal_hash: dict[str, str] = {}
+project_last_standby_resting_hash: dict[str, str] = {}
 
 
 def _ensure_interrupt_queue(project_id: str) -> asyncio.Queue:
@@ -789,46 +796,61 @@ async def _gpu_idle_hint(project_dir: str) -> str:
 
 def _task_list_has_unchecked_items(project_id: str) -> bool:
     """Return True when task_list.md contains unchecked checkbox items."""
+    has_unchecked, _signal = _task_list_unchecked_state(project_id)
+    return has_unchecked
+
+
+def _task_list_unchecked_state(project_id: str) -> tuple[bool, str]:
+    """Return task-list unchecked status and a stable signal hash."""
     project = projects.get(project_id)
     if not project:
-        return False
+        return False, ""
 
     path = Path(project.project_dir) / "task_list.md"
     if not path.exists():
-        return False
+        return False, ""
 
     try:
         content = path.read_text()
     except Exception:
-        return False
+        return False, ""
 
     unchecked = re.compile(r"^\s*[-*]\s*\[\s\]\s+")
-    return any(unchecked.match(line) for line in content.splitlines())
+    unchecked_lines = [line.strip() for line in content.splitlines() if unchecked.match(line)]
+    if not unchecked_lines:
+        return False, ""
+
+    return True, _hash_text("\n".join(unchecked_lines))
 
 
-def _queued_user_message_count(project_id: str) -> int:
-    """Count queued user messages without draining the interrupt queue."""
+def _queued_user_messages(project_id: str) -> list[dict]:
+    """Snapshot queued user messages without draining the interrupt queue."""
     queue = interrupt_queues.get(project_id)
     if not queue or queue.empty():
-        return 0
+        return []
 
     try:
         pending = list(queue._queue)  # type: ignore[attr-defined]
     except Exception:
-        # Fallback: best-effort signal if queue introspection fails.
-        return queue.qsize()
+        # Fallback: best-effort when queue internals are unavailable.
+        return [{"kind": "user_message", "urgency": "normal", "text": "__queued__", "ts": 0.0}] * queue.qsize()
 
-    count = 0
+    messages: list[dict] = []
     for payload in pending:
         meta = _interrupt_payload_meta(payload)
         if meta.get("kind") == "user_message" and meta.get("text"):
-            count += 1
-    return count
+            messages.append(meta)
+    return messages
+
+
+def _queued_user_message_count(project_id: str) -> int:
+    """Count queued user messages without draining the interrupt queue."""
+    return len(_queued_user_messages(project_id))
 
 
 def _build_standby_wakeup_prompt(reasons: list[str], gpu_hint: str) -> str:
     lines = [
-        "[STANDBY HEARTBEAT WAKEUP]",
+        STANDBY_WAKEUP_MARKER,
         "PhDLoop heartbeat woke you from rest (default cadence: ~30 minutes).",
         "You were resting after a completed milestone.",
         "Purpose: prevent stagnation, NOT generate busywork.",
@@ -843,7 +865,7 @@ def _build_standby_wakeup_prompt(reasons: list[str], gpu_hint: str) -> str:
             "3. Check for redundant resource usage (stale processes, duplicate jobs, avoidable re-runs).",
             "4. Decide if there is ONE meaningful next action with clear expected value right now.",
             "5. If yes: execute surgically (usually via assign_worker), then verify evidence.",
-            "6. If no: explicitly choose to stay resting and end this wake cycle.",
+            "6. If no: call stay_idle with a brief reason and end this wake cycle.",
             "Hard rule: do not invent speculative tasks just to appear active.",
             "Hard rule: do not repeat expensive actions unless new evidence justifies rerunning.",
         ]
@@ -877,9 +899,25 @@ async def _maybe_start_standby_wakeup(project_id: str) -> bool:
     if now - last_wake < STANDBY_HEARTBEAT_SECONDS:
         return False
 
-    queued_user_messages = _queued_user_message_count(project_id)
-    has_unchecked_items = _task_list_has_unchecked_items(project_id)
+    queued_messages = _queued_user_messages(project_id)
+    queued_user_messages = len(queued_messages)
+    has_unchecked_items, unchecked_signal = _task_list_unchecked_state(project_id)
     if queued_user_messages <= 0 and not has_unchecked_items:
+        return False
+
+    signal_payload = {
+        "queued": [
+            {
+                "text": item.get("text", ""),
+                "urgency": item.get("urgency", "normal"),
+                "ts": float(item.get("ts", 0.0)),
+            }
+            for item in queued_messages
+        ],
+        "task_list_unchecked_signal": unchecked_signal,
+    }
+    signal_hash = _hash_text(json.dumps(signal_payload, sort_keys=True, ensure_ascii=False))
+    if project_last_standby_signal_hash.get(project_id) == signal_hash:
         return False
 
     reasons: list[str] = []
@@ -891,6 +929,8 @@ async def _maybe_start_standby_wakeup(project_id: str) -> bool:
     gpu_hint = await _gpu_idle_hint(project.project_dir) if has_unchecked_items else ""
     wake_prompt = _build_standby_wakeup_prompt(reasons, gpu_hint)
     project_last_standby_wake_ts[project_id] = now
+    project_last_standby_signal_hash[project_id] = signal_hash
+    project_last_standby_resting_hash.pop(project_id, None)
 
     await emit_progress(
         project_id,
@@ -1244,6 +1284,55 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         return {"content": [{"type": "text", "text": result_text}]}
 
     @tool(
+        "stay_idle",
+        "Enter standby when triage finds no meaningful action right now. "
+        "This cleanly ends the current run and waits for future wake signals "
+        "(user guidance or heartbeat signals). Use this instead of repeatedly "
+        "narrating that you're resting.\n\n"
+        "**When to use:** After checking task_list, queued user messages, and "
+        "resource state, if there is no high-value next action now.\n\n"
+        "**Required input:** A concise reason so the advisor can understand why "
+        "you chose standby.",
+        {"reason": str},
+    )
+    async def stay_idle(args):
+        reason = str(args.get("reason", "")).strip() or "No meaningful next action right now."
+        state.status = "done"
+        state.summary = f"Standby: {reason}"
+        state.finished_at = time.time()
+
+        await emit_progress(
+            project_id,
+            ProgressEvent(
+                type="log_update",
+                data=f"[orchestrator] Entering standby: {reason}",
+                iteration=state.iteration,
+            ),
+        )
+        await emit_progress(
+            project_id,
+            ProgressEvent(type="done", data="", iteration=state.iteration),
+        )
+
+        _save_state(
+            state,
+            orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
+            worker_session_id=worker_sessions.get(project_id, ""),
+        )
+
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Entered standby. I will resume when new advisor guidance arrives "
+                        "or heartbeat detects meaningful signals."
+                    ),
+                }
+            ]
+        }
+
+    @tool(
         "task_complete",
         "Mark the overall user task as complete. "
         "Call this when all goals are achieved.\n\n"
@@ -1451,6 +1540,7 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         "daemon",
         tools=[
             assign_worker,
+            stay_idle,
             task_complete,
             pull_user_messages,
             ask_user,
@@ -1548,6 +1638,7 @@ async def run_task(
     )
 
     prompt = f"[TASK]\n{task_text}"
+    is_standby_wakeup = task_text.startswith(STANDBY_WAKEUP_MARKER)
 
     try:
         next_prompt = prompt
@@ -1612,7 +1703,11 @@ async def run_task(
             ):
                 if isinstance(message, AssistantMessage):
                     await _forward_assistant_message(
-                        project_id, message, state.iteration, source="orchestrator"
+                        project_id,
+                        message,
+                        state.iteration,
+                        source="orchestrator",
+                        standby_wakeup=is_standby_wakeup,
                     )
                 elif isinstance(message, SystemMessage):
                     await emit_progress(
@@ -1674,7 +1769,7 @@ async def run_task(
                 "1. Read task_list.md — what's the next unchecked item?\n"
                 "2. Pull user messages — any new guidance to integrate?\n"
                 "3. Drive the next item to completion: assign worker, verify, update task_list.\n"
-                "If all items are done, call task_complete."
+                "If all items are done, call task_complete. If no meaningful action exists now, call stay_idle."
             )
             await asyncio.sleep(0.2)
 
@@ -1758,12 +1853,42 @@ async def _forward_assistant_message(
     message: AssistantMessage,
     iteration: int,
     source: str,
+    standby_wakeup: bool = False,
 ):
     """Forward intermediate assistant output as progress events."""
+
+    def _is_standby_resting_text(text: str) -> bool:
+        lowered = " ".join(text.lower().split())
+        markers = (
+            "decision: stay resting",
+            "staying resting",
+            "stay resting",
+            "nothing to act on",
+            "nothing to do",
+            "no pending work",
+            "all deliverables shipped",
+            "project is complete",
+        )
+        return any(marker in lowered for marker in markers)
+
     for block in message.content:
         if isinstance(block, TextBlock):
             text = block.text.strip()
             if text:
+                if standby_wakeup and _is_standby_resting_text(text):
+                    resting_hash = _hash_text(" ".join(text.lower().split()))
+                    if project_last_standby_resting_hash.get(project_id) == resting_hash:
+                        continue
+                    project_last_standby_resting_hash[project_id] = resting_hash
+                    await emit_progress(
+                        project_id,
+                        ProgressEvent(
+                            type="log_update",
+                            data=f"[{source}] {text}",
+                            iteration=iteration,
+                        ),
+                    )
+                    continue
                 await emit_progress(
                     project_id,
                     ProgressEvent(
@@ -2185,6 +2310,8 @@ async def on_cleanup(_app: web.Application):
         except Exception:
             pass
     standby_heartbeat_tasks.clear()
+    project_last_standby_signal_hash.clear()
+    project_last_standby_resting_hash.clear()
 
     if callback_http_session and not callback_http_session.closed:
         await callback_http_session.close()

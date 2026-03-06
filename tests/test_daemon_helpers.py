@@ -34,6 +34,74 @@ def test_create_orchestrator_tools_returns_server():
     assert mcp_instance is not None
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_tools_include_stay_idle():
+    """Orchestrator MCP server should expose stay_idle with a clear description."""
+    from orchestrator_daemon import _create_orchestrator_tools, TaskState
+
+    server = _create_orchestrator_tools("p1", TaskState(task_id="t1", project_id="p1", task_text="x"))
+    mcp_instance = server["instance"]
+
+    # _get_cached_tool_definition lazily resolves and caches the tool definition.
+    tool_def = await mcp_instance._get_cached_tool_definition("stay_idle")
+
+    assert tool_def is not None
+    assert tool_def.name == "stay_idle"
+    assert "standby" in (tool_def.description or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stay_idle_tool_sets_done_and_emits_log_and_done(tmp_path, monkeypatch):
+    """stay_idle should transition task to done and emit log_update + done events."""
+    import orchestrator_daemon as daemon_mod
+    import mcp.types as mt
+    from orchestrator_daemon import _create_orchestrator_tools, Project, TaskState, projects
+
+    project_id = "stay-idle-tool"
+    state = TaskState(task_id="t-stay-idle", project_id=project_id, task_text="x", status="running")
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="x")
+
+    events = []
+
+    async def fake_emit_progress(pid, event):
+        events.append((pid, event.type, event.data))
+        return None
+
+    saved = {"called": False}
+
+    def fake_save_state(*_args, **_kwargs):
+        saved["called"] = True
+
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+    monkeypatch.setattr(daemon_mod, "_save_state", fake_save_state)
+
+    try:
+        server = _create_orchestrator_tools(project_id, state)
+        mcp_instance = server["instance"]
+        call_handler = mcp_instance.request_handlers[mt.CallToolRequest]
+        req = mt.CallToolRequest(
+            method="tools/call",
+            params=mt.CallToolRequestParams(
+                name="stay_idle",
+                arguments={"reason": "Waiting for advisor prioritization."},
+            ),
+        )
+        result = await call_handler(req)
+
+        assert result.root is not None
+        assert state.status == "done"
+        assert state.summary.startswith("Standby:")
+        assert "advisor prioritization" in state.summary
+        assert state.finished_at > 0
+        assert saved["called"] is True
+        assert len(events) >= 2
+        assert events[0][1] == "log_update"
+        assert events[1][1] == "done"
+        assert events[1][2] == ""
+    finally:
+        projects.pop(project_id, None)
+
+
 # ── _create_worker_tools ─────────────────────────────────────────────
 
 
@@ -339,6 +407,56 @@ def test_task_list_has_unchecked_items(tmp_path):
         projects.pop(project_id, None)
 
 
+def test_task_list_unchecked_state_hash_changes_with_unchecked_content(tmp_path):
+    from orchestrator_daemon import _task_list_unchecked_state, projects, Project
+
+    project_id = "task-list-unchecked-state"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="x")
+    try:
+        (tmp_path / "task_list.md").write_text("- [x] done\n- [ ] first item\n")
+        has_unchecked, signal_a = _task_list_unchecked_state(project_id)
+        assert has_unchecked is True
+        assert signal_a
+
+        (tmp_path / "task_list.md").write_text("- [x] done\n- [ ] first item\n")
+        has_unchecked, signal_b = _task_list_unchecked_state(project_id)
+        assert has_unchecked is True
+        assert signal_b == signal_a
+
+        (tmp_path / "task_list.md").write_text("- [x] done\n- [ ] second item\n")
+        has_unchecked, signal_c = _task_list_unchecked_state(project_id)
+        assert has_unchecked is True
+        assert signal_c != signal_a
+
+        (tmp_path / "task_list.md").write_text("- [x] done\n- [x] done2\n")
+        has_unchecked, signal_d = _task_list_unchecked_state(project_id)
+        assert has_unchecked is False
+        assert signal_d == ""
+    finally:
+        projects.pop(project_id, None)
+
+
+def test_queued_user_messages_filters_non_user_payloads():
+    from orchestrator_daemon import (
+        _ensure_interrupt_queue,
+        _queued_user_messages,
+        interrupt_queues,
+    )
+
+    project_id = "queued-user-messages-filter"
+    interrupt_queues.pop(project_id, None)
+    queue = _ensure_interrupt_queue(project_id)
+    queue.put_nowait({"kind": "system_nudge", "text": "heartbeat", "ts": 0})
+    queue.put_nowait({"kind": "user_message", "text": "  ", "ts": 0})
+    queue.put_nowait({"kind": "user_message", "text": "advisor note", "urgency": "urgent", "ts": 1})
+
+    messages = _queued_user_messages(project_id)
+    assert len(messages) == 1
+    assert messages[0]["text"] == "advisor note"
+    assert messages[0]["urgency"] == "urgent"
+    interrupt_queues.pop(project_id, None)
+
+
 @pytest.mark.asyncio
 async def test_maybe_start_standby_wakeup_requires_meaningful_signal(tmp_path, monkeypatch):
     import orchestrator_daemon as daemon_mod
@@ -346,6 +464,8 @@ async def test_maybe_start_standby_wakeup_requires_meaningful_signal(tmp_path, m
         _maybe_start_standby_wakeup,
         Project,
         TaskState,
+        project_last_standby_resting_hash,
+        project_last_standby_signal_hash,
         projects,
         running_tasks,
         task_states,
@@ -382,6 +502,80 @@ async def test_maybe_start_standby_wakeup_requires_meaningful_signal(tmp_path, m
         task_states.pop(project_id, None)
         running_tasks.pop(project_id, None)
         project_last_standby_wake_ts.pop(project_id, None)
+        project_last_standby_signal_hash.pop(project_id, None)
+        project_last_standby_resting_hash.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_maybe_start_standby_wakeup_restarts_when_queue_signal_changes(
+    tmp_path, monkeypatch
+):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import (
+        _enqueue_interrupt,
+        _maybe_start_standby_wakeup,
+        Project,
+        TaskState,
+        interrupt_queues,
+        project_last_standby_resting_hash,
+        project_last_standby_signal_hash,
+        project_last_standby_wake_ts,
+        projects,
+        running_tasks,
+        task_states,
+    )
+
+    project_id = "standby-queue-signal"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="x")
+    task_states[project_id] = TaskState(
+        task_id="t-standby-queue-signal",
+        project_id=project_id,
+        task_text="done work",
+        status="done",
+    )
+
+    called = {"count": 0}
+
+    async def fake_run_task(*_args, **_kwargs):
+        called["count"] += 1
+
+    async def fake_emit_progress(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(daemon_mod, "run_task", fake_run_task)
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+    monkeypatch.setattr(daemon_mod, "STANDBY_HEARTBEAT_ENABLED", True)
+
+    try:
+        _enqueue_interrupt(project_id, "first queued message", urgency="normal")
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is True
+        first_task = running_tasks.get(project_id)
+        assert first_task is not None
+        await first_task
+        assert called["count"] == 1
+
+        project_last_standby_wake_ts[project_id] = 0
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is False
+        assert called["count"] == 1
+
+        _enqueue_interrupt(project_id, "second queued message", urgency="normal")
+        project_last_standby_wake_ts[project_id] = 0
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is True
+        second_task = running_tasks.get(project_id)
+        assert second_task is not None
+        await second_task
+        assert called["count"] == 2
+    finally:
+        projects.pop(project_id, None)
+        task_states.pop(project_id, None)
+        running_tasks.pop(project_id, None)
+        interrupt_queues.pop(project_id, None)
+        project_last_standby_wake_ts.pop(project_id, None)
+        project_last_standby_signal_hash.pop(project_id, None)
+        project_last_standby_resting_hash.pop(project_id, None)
 
 
 @pytest.mark.asyncio
@@ -394,6 +588,8 @@ async def test_maybe_start_standby_wakeup_starts_when_unchecked_items_exist(
         _maybe_start_standby_wakeup,
         Project,
         TaskState,
+        project_last_standby_resting_hash,
+        project_last_standby_signal_hash,
         projects,
         running_tasks,
         task_states,
@@ -462,6 +658,180 @@ async def test_maybe_start_standby_wakeup_starts_when_unchecked_items_exist(
         task_states.pop(project_id, None)
         running_tasks.pop(project_id, None)
         project_last_standby_wake_ts.pop(project_id, None)
+        project_last_standby_signal_hash.pop(project_id, None)
+        project_last_standby_resting_hash.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_maybe_start_standby_wakeup_skips_unchanged_signal_until_state_changes(
+    tmp_path, monkeypatch
+):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import (
+        _maybe_start_standby_wakeup,
+        Project,
+        TaskState,
+        projects,
+        running_tasks,
+        task_states,
+        project_last_standby_wake_ts,
+        project_last_standby_signal_hash,
+        project_last_standby_resting_hash,
+    )
+
+    project_id = "standby-signal-dedupe"
+    projects[project_id] = Project(project_id=project_id, project_dir=str(tmp_path), name="x")
+    task_states[project_id] = TaskState(
+        task_id="t-standby-signal-dedupe",
+        project_id=project_id,
+        task_text="done work",
+        status="done",
+        model="model-a",
+        session_model="model-b",
+        permission_mode="default",
+    )
+    task_list = tmp_path / "task_list.md"
+    task_list.write_text("- [ ] first unchecked item\n")
+
+    called = {"count": 0}
+
+    async def fake_run_task(*_args, **_kwargs):
+        called["count"] += 1
+
+    async def fake_emit_progress(*_args, **_kwargs):
+        return None
+
+    async def fake_gpu_hint(_project_dir: str) -> str:
+        return ""
+
+    monkeypatch.setattr(daemon_mod, "run_task", fake_run_task)
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+    monkeypatch.setattr(daemon_mod, "_gpu_idle_hint", fake_gpu_hint)
+    monkeypatch.setattr(daemon_mod, "STANDBY_HEARTBEAT_ENABLED", True)
+
+    try:
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is True
+        first_task = running_tasks.get(project_id)
+        assert first_task is not None
+        await first_task
+        assert called["count"] == 1
+
+        project_last_standby_wake_ts[project_id] = 0
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is False
+        assert called["count"] == 1
+
+        task_list.write_text("- [ ] second unchecked item\n")
+        project_last_standby_wake_ts[project_id] = 0
+        started = await _maybe_start_standby_wakeup(project_id)
+        assert started is True
+        second_task = running_tasks.get(project_id)
+        assert second_task is not None
+        await second_task
+        assert called["count"] == 2
+    finally:
+        projects.pop(project_id, None)
+        task_states.pop(project_id, None)
+        running_tasks.pop(project_id, None)
+        project_last_standby_wake_ts.pop(project_id, None)
+        project_last_standby_signal_hash.pop(project_id, None)
+        project_last_standby_resting_hash.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_forward_assistant_message_standby_resting_text_logs_and_dedups(monkeypatch):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import (
+        _forward_assistant_message,
+        project_last_standby_resting_hash,
+    )
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    project_id = "standby-resting-text"
+    events = []
+
+    async def fake_emit_progress(_project_id, event):
+        events.append((_project_id, event.type, event.data))
+        return None
+
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+    project_last_standby_resting_hash.pop(project_id, None)
+    try:
+        msg1 = AssistantMessage(
+            content=[TextBlock("Task list reviewed. **Decision: Stay resting.** All deliverables shipped.")],
+            model="test-model",
+        )
+        msg2 = AssistantMessage(
+            content=[TextBlock(" Task   list reviewed. **Decision: Stay resting.** All deliverables shipped. ")],
+            model="test-model",
+        )
+
+        await _forward_assistant_message(
+            project_id=project_id,
+            message=msg1,
+            iteration=1,
+            source="orchestrator",
+            standby_wakeup=True,
+        )
+        await _forward_assistant_message(
+            project_id=project_id,
+            message=msg2,
+            iteration=1,
+            source="orchestrator",
+            standby_wakeup=True,
+        )
+
+        assert len(events) == 1
+        assert events[0][0] == project_id
+        assert events[0][1] == "log_update"
+        assert events[0][2].startswith("[orchestrator]")
+    finally:
+        project_last_standby_resting_hash.pop(project_id, None)
+
+
+@pytest.mark.asyncio
+async def test_forward_assistant_message_non_standby_or_non_resting_remains_text(monkeypatch):
+    import orchestrator_daemon as daemon_mod
+    from orchestrator_daemon import _forward_assistant_message
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    events = []
+
+    async def fake_emit_progress(_project_id, event):
+        events.append((event.type, event.data))
+        return None
+
+    monkeypatch.setattr(daemon_mod, "emit_progress", fake_emit_progress)
+
+    non_standby_resting = AssistantMessage(
+        content=[TextBlock("Task list reviewed. Decision: Stay resting.")],
+        model="test-model",
+    )
+    standby_non_resting = AssistantMessage(
+        content=[TextBlock("Launching worker to run the next experiment.")],
+        model="test-model",
+    )
+
+    await _forward_assistant_message(
+        project_id="p1",
+        message=non_standby_resting,
+        iteration=1,
+        source="orchestrator",
+        standby_wakeup=False,
+    )
+    await _forward_assistant_message(
+        project_id="p2",
+        message=standby_non_resting,
+        iteration=1,
+        source="orchestrator",
+        standby_wakeup=True,
+    )
+
+    assert events[0][0] == "text"
+    assert events[0][1].startswith("[orchestrator]")
+    assert events[1][0] == "text"
+    assert events[1][1].startswith("[orchestrator]")
 
 
 def test_parse_bool_helper():
