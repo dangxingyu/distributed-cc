@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -22,9 +23,64 @@ from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 from claude_agent_sdk.types import PermissionResultAllow
 
 
+_CLAUDE_AUTH_AVAILABLE: bool | None = None
+
+
+def _skip_if_claude_not_logged_in(result_text: str) -> None:
+    lowered = (result_text or "").strip().lower()
+    if "not logged in" in lowered or "please run /login" in lowered:
+        pytest.skip("Claude Code is not authenticated in this environment")
+
+
+def _skip_if_claude_runtime_error(error_text: str) -> None:
+    lowered = (error_text or "").strip().lower()
+    if "not logged in" in lowered or "please run /login" in lowered:
+        pytest.skip("Claude Code runtime is not authenticated in this environment")
+
+
 def _clear_nesting_guard():
     """Remove CLAUDECODE env var to allow spawning Claude subprocesses."""
     os.environ.pop("CLAUDECODE", None)
+
+
+async def _ensure_claude_auth() -> None:
+    global _CLAUDE_AUTH_AVAILABLE
+    if _CLAUDE_AUTH_AVAILABLE is True:
+        return
+    if _CLAUDE_AUTH_AVAILABLE is False:
+        pytest.skip("Claude Code is not authenticated in this environment")
+
+    _clear_nesting_guard()
+
+    def _run_preflight() -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        return subprocess.run(
+            ["claude", "-p", "Reply with exactly: AUTH_OK"],
+            cwd="/tmp",
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
+    proc = await asyncio.to_thread(_run_preflight)
+    combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
+    try:
+        _skip_if_claude_not_logged_in(combined)
+    except pytest.skip.Exception:
+        _CLAUDE_AUTH_AVAILABLE = False
+        raise
+
+    if proc.returncode != 0:
+        _CLAUDE_AUTH_AVAILABLE = False
+        pytest.skip(f"Claude preflight failed: {combined[:200]}")
+
+    if "AUTH_OK" not in combined:
+        _CLAUDE_AUTH_AVAILABLE = False
+        pytest.skip(f"Claude preflight returned unexpected output: {combined[:200]}")
+
+    _CLAUDE_AUTH_AVAILABLE = True
 
 
 async def _prompt_stream(text: str, done: asyncio.Event | None = None):
@@ -167,6 +223,7 @@ def _patch_daemon_globals(name: str, callback_url: str):
 @pytest.mark.asyncio
 async def test_e2e_sdk_basic():
     """Agent SDK query() works and returns a ResultMessage."""
+    await _ensure_claude_auth()
     _clear_nesting_guard()
     options = ClaudeAgentOptions(
         model="haiku",
@@ -179,6 +236,7 @@ async def test_e2e_sdk_basic():
             got_result = True
             assert message.session_id, "No session_id in ResultMessage"
             assert message.result, "No result text"
+            _skip_if_claude_not_logged_in(message.result)
             assert "SDK_OK" in message.result, f"Unexpected: {message.result[:200]}"
             print(f"SDK result: {message.result[:100]}")
             print(f"Cost: ${message.total_cost_usd}")
@@ -193,6 +251,7 @@ async def test_e2e_sdk_basic():
 @pytest.mark.asyncio
 async def test_e2e_sdk_resume():
     """Session resume works via Agent SDK — context persists across calls."""
+    await _ensure_claude_auth()
     _clear_nesting_guard()
 
     # First query: establish context
@@ -201,9 +260,11 @@ async def test_e2e_sdk_resume():
 
     async for message in query(prompt="Remember: PINEAPPLE", options=options):
         if isinstance(message, ResultMessage):
+            _skip_if_claude_not_logged_in(message.result or "")
             session_id = message.session_id
 
-    assert session_id, "No session_id from first query"
+    if not session_id:
+        pytest.skip("Claude Code did not return a session_id; likely not authenticated")
 
     # Second query: resume and verify context
     options2 = ClaudeAgentOptions(model="haiku", cwd="/tmp", resume=session_id)
@@ -212,6 +273,7 @@ async def test_e2e_sdk_resume():
         options=options2,
     ):
         if isinstance(message, ResultMessage):
+            _skip_if_claude_not_logged_in(message.result or "")
             assert "PINEAPPLE" in message.result.upper(), f"Resume failed: {message.result}"
             print(f"Resumed OK: {message.result[:100]}")
 
@@ -249,6 +311,7 @@ async def test_e2e_daemon_health():
 @pytest.mark.asyncio
 async def test_e2e_daemon_task():
     """Register a project on the daemon and start a task that runs RALPH loop."""
+    await _ensure_claude_auth()
     _clear_nesting_guard()
 
     project_id = _unique_project_id("e2e-task")
@@ -308,6 +371,7 @@ async def test_e2e_daemon_task():
                 pytest.fail("Task did not complete within timeout")
 
             print(f"Task final status: {status}")
+            _skip_if_claude_runtime_error(status.get("error", ""))
             assert status["status"] == "done", f"Expected done, got {status['status']}: {status.get('error', '')}"
 
     finally:
@@ -322,6 +386,7 @@ async def test_e2e_daemon_task():
 @pytest.mark.asyncio
 async def test_e2e_daemon_interrupt():
     """Interrupt a running daemon task — verify interrupt is queued."""
+    await _ensure_claude_auth()
     _clear_nesting_guard()
 
     project_id = _unique_project_id("e2e-int")
@@ -397,6 +462,7 @@ async def test_e2e_daemon_interrupt():
                 pytest.fail("Interrupt test did not complete within timeout")
 
             print(f"Interrupt test final status: {status}")
+            _skip_if_claude_runtime_error(status.get("error", ""))
             # Task should finish (done or stuck, not error)
             assert status["status"] in ("done", "stuck")
 
@@ -417,6 +483,7 @@ async def test_e2e_sdk_can_use_tool():
     Some SDK/model combinations may satisfy the task without invoking callback
     events; filename correctness is the hard requirement.
     """
+    await _ensure_claude_auth()
     _clear_nesting_guard()
 
     with tempfile.TemporaryDirectory(prefix="dcc_e2e_tools_") as sandbox:
@@ -450,6 +517,7 @@ async def test_e2e_sdk_can_use_tool():
             if isinstance(message, ResultMessage):
                 got_result = True
                 result_text = message.result or ""
+                _skip_if_claude_not_logged_in(result_text)
                 done_event.set()
                 print(f"can_use_tool result: {result_text[:200]}")
                 print(f"Tools used: {tool_calls}")
@@ -475,6 +543,7 @@ async def _run_daemon_task(
     timeout_secs: int = 180,
 ) -> dict:
     """Spin up a daemon, register a sandbox project, run a task, return final status."""
+    await _ensure_claude_auth()
     restore = _patch_daemon_globals(
         name=f"e2e-{project_id}",
         callback_url="http://127.0.0.1:19999",
@@ -508,6 +577,7 @@ async def _run_daemon_task(
                 async with http.get(f"{base}/status?project_id={project_id}") as resp:
                     status = await resp.json()
                     if status.get("status") in ("done", "error", "stuck"):
+                        _skip_if_claude_runtime_error(status.get("error", ""))
                         return status
             pytest.fail(f"Task did not complete within {timeout_secs}s")
     finally:
@@ -548,6 +618,7 @@ async def _start_task_and_wait(
         async with http.get(f"{base}/status?project_id={project_id}") as resp:
             status = await resp.json()
             if status.get("status") in ("done", "error", "stuck"):
+                _skip_if_claude_runtime_error(status.get("error", ""))
                 return status
     pytest.fail(f"Task did not complete within {timeout_secs}s")
 
@@ -572,6 +643,7 @@ async def _claude_eval_yes_no_score(
     min_score: int = 8,
 ) -> dict:
     """Run a second-pass Claude evaluator and assert yes/no + score contract."""
+    await _ensure_claude_auth()
     _clear_nesting_guard()
 
     prompt = (
@@ -594,6 +666,7 @@ async def _claude_eval_yes_no_score(
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, ResultMessage):
             result_text = message.result or ""
+            _skip_if_claude_not_logged_in(result_text)
 
     parsed = _extract_json_object(result_text)
     decision = str(parsed.get("pass", "")).strip().lower()

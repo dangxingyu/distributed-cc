@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import traceback
 import uuid
@@ -30,6 +31,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, web
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
 from claude_agent_sdk.types import (
     AssistantMessage,
