@@ -31,22 +31,24 @@ def _env_flag(name: str) -> bool:
 class WebChat:
     def _status_label(self, status: str | None) -> str:
         normalized = str(status or "").strip().lower()
-        if normalized in {"running", "busy"}:
-            return "Working"
+        if normalized == "running":
+            return "Running"
+        if normalized == "busy":
+            return "Busy"
         if normalized == "stuck":
-            return "Needs your input"
+            return "Stuck"
         if normalized == "done":
-            return "Finished"
+            return "Done"
         if normalized == "stopped":
             return "Stopped"
         if normalized == "error":
-            return "Failed"
+            return "Error"
         if normalized == "idle":
-            return "Ready"
+            return "Idle"
         if normalized == "disconnected":
-            return "Daemon unreachable"
+            return "Disconnected"
         if normalized == "unconnected":
-            return "No project connected"
+            return "Unconnected"
         return normalized or "Unknown"
 
     def _runtime_label(self, provider: str | None, permission_mode: str | None, sandbox_mode: str | None, approval_policy: str | None) -> str:
@@ -273,9 +275,9 @@ class WebChat:
                         "queue_size": queue_size,
                     }
                 )
-                worker_detail = "Active" if orch.status in {"running", "busy"} else "Ready"
+                worker_detail = "Running" if orch.status == "running" else "Busy" if orch.status == "busy" else "Idle"
                 if orch.status == "stuck":
-                    worker_detail = "Waiting for orchestrator"
+                    worker_detail = "Stuck"
                 members.append(
                     {
                         "name": f"Worker ({orch.name})",

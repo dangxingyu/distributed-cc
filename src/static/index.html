@@ -2190,15 +2190,15 @@ function loadSetupNotes() {
 
 function humanProjectStatus(status, iteration) {
   if (status === 'running' || status === 'busy') {
-    return iteration ? `Working (${iteration})` : 'Working';
+    return iteration ? `Running (${iteration})` : 'Running';
   }
-  if (status === 'stuck') return 'Needs your input';
-  if (status === 'done') return 'Finished';
+  if (status === 'stuck') return 'Stuck';
+  if (status === 'done') return 'Done';
   if (status === 'stopped') return 'Stopped';
-  if (status === 'error') return 'Failed';
-  if (status === 'idle') return 'Ready';
-  if (status === 'disconnected') return 'Daemon unreachable';
-  if (status === 'unconnected') return 'No project connected';
+  if (status === 'error') return 'Error';
+  if (status === 'idle') return 'Idle';
+  if (status === 'disconnected') return 'Disconnected';
+  if (status === 'unconnected') return 'Unconnected';
   return currentProjectId || 'Unknown';
 }
 
@@ -2279,20 +2279,50 @@ function updateProjectBadge(status, iteration, data) {
 let _hideTimer = null;
 let _indicatorActive = false;
 
+const RUNNING_LABELS = {
+  orchestrator: 'Orchestrator',
+  worker: 'Worker',
+  router: 'Router',
+  system: 'System',
+};
+
+const RUNNING_PHRASES = {
+  orchestrator: ['is running', 'is thinking', 'is planning', 'is reasoning', 'is processing', 'is executing', 'is working'],
+  worker: ['is running', 'is executing', 'is editing', 'is checking', 'is processing', 'is working'],
+  router: ['is running', 'is routing', 'is coordinating', 'is syncing', 'is processing', 'is updating'],
+  system: ['is running', 'is processing', 'is working'],
+};
+
+function typingIndicatorLabel(label) {
+  const key = String(label || 'system').trim().toLowerCase() || 'system';
+  return RUNNING_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
+}
+
+function typingIndicatorPhrase(label) {
+  const key = String(label || 'system').trim().toLowerCase() || 'system';
+  const phrases = RUNNING_PHRASES[key] || RUNNING_PHRASES.system;
+  const idx = Math.floor(Date.now() / 5000) % phrases.length;
+  return phrases[idx];
+}
+
 function showTypingIndicator(label) {
   if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
 
-  const displayLabel = label || 'working';
-  const currentLabel = typingIndicator.getAttribute('data-label');
-  if (_indicatorActive && typingIndicator.classList.contains('active') && currentLabel === displayLabel) {
+  const rawLabel = String(label || 'system').trim().toLowerCase() || 'system';
+  const displayLabel = typingIndicatorLabel(rawLabel);
+  const phrase = typingIndicatorPhrase(rawLabel);
+  const phraseKey = `${rawLabel}:${phrase}`;
+  const currentPhraseKey = typingIndicator.getAttribute('data-phrase-key');
+  if (_indicatorActive && typingIndicator.classList.contains('active') && currentPhraseKey === phraseKey) {
     return;
   }
 
   _indicatorActive = true;
-  typingIndicator.setAttribute('data-label', displayLabel);
+  typingIndicator.setAttribute('data-label', rawLabel);
+  typingIndicator.setAttribute('data-phrase-key', phraseKey);
   typingIndicator.innerHTML =
     '<span class="dot-pulse"><span></span><span></span><span></span></span>' +
-    `<span class="status-label">${displayLabel} is working</span>`;
+    `<span class="status-label">${displayLabel} ${phrase}</span>`;
   typingIndicator.classList.add('active');
 }
 
@@ -2301,6 +2331,7 @@ function hideTypingIndicator() {
   _hideTimer = setTimeout(() => {
     _indicatorActive = false;
     typingIndicator.removeAttribute('data-label');
+    typingIndicator.removeAttribute('data-phrase-key');
     typingIndicator.classList.remove('active');
     _hideTimer = null;
   }, 800);
@@ -2310,6 +2341,7 @@ function resetTypingIndicator() {
   if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
   _indicatorActive = false;
   typingIndicator.removeAttribute('data-label');
+  typingIndicator.removeAttribute('data-phrase-key');
   typingIndicator.classList.remove('active');
 }
 
