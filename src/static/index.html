@@ -433,6 +433,101 @@ body::after {
   white-space: nowrap;
 }
 
+.member-item {
+  align-items: flex-start;
+  padding: 9px 14px;
+}
+
+.member-dot {
+  margin-top: 5px;
+}
+
+.member-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.member-name {
+  font-weight: 600;
+}
+
+.member-detail {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  margin-left: 0;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.member-detail-secondary,
+.member-detail-tertiary {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+  max-width: 280px;
+  word-break: break-word;
+}
+
+.member-detail-tertiary {
+  opacity: 0.9;
+}
+
+.member-queue {
+  margin-left: auto;
+  flex-shrink: 0;
+  align-self: center;
+  border-radius: 999px;
+  background: rgba(188, 109, 47, 0.12);
+  border: 1px solid rgba(188, 109, 47, 0.18);
+  color: var(--orange);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+}
+
+.member-queue.hidden {
+  display: none;
+}
+
+.member-empty {
+  padding: 12px 14px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.log-entry-error .log-content {
+  color: var(--red);
+}
+
+.log-entry-error .log-content[title] {
+  cursor: help;
+}
+
+.msg-system .msg-body[title] {
+  cursor: help;
+}
+
+.msg-system .msg-body.humanized {
+  color: #7b5a28;
+}
+
+.msg-system .msg-body.humanized::before {
+  content: '↳ ';
+  opacity: 0.75;
+}
+
+.msg-system .msg-body.humanized-error {
+  color: var(--red);
+}
+
+.msg-system .msg-body.humanized-error::before {
+  content: '⚠ ';
+}
+
 #status {
   font-size: 12px;
   display: flex;
@@ -2140,6 +2235,9 @@ function updateRuntimeBadge() {
   const detailBits = [currentProjectMeta.project_id];
   if (currentProjectMeta.host) detailBits.push(currentProjectMeta.host);
   if (currentProjectMeta.project_dir) detailBits.push(currentProjectMeta.project_dir);
+  const queueSize = Number(currentProjectMeta.queue_size || 0);
+  if (queueSize > 0) detailBits.push(`queued:${queueSize}`);
+  if (currentProjectMeta.health_detail) detailBits.push(String(currentProjectMeta.health_detail));
   runtimeBadge.title = detailBits.join(' · ');
 }
 
@@ -2517,6 +2615,16 @@ function addMessage(text, sender, tsSeconds, opts) {
   bodyEl.className = 'msg-body';
   if (cssClass === 'msg-user') {
     bodyEl.textContent = body;
+  } else if (cssClass === 'msg-system') {
+    const humanized = humanizeOperationalText(body);
+    bodyEl.textContent = humanized.text;
+    if (humanized.text !== body) {
+      bodyEl.title = body;
+      bodyEl.classList.add('humanized');
+      if (humanized.kind === 'error') {
+        bodyEl.classList.add('humanized-error');
+      }
+    }
   } else if (body.length > LARGE_MARKDOWN_RENDER_THRESHOLD) {
     // Keep full content but avoid expensive markdown parse/sanitize on giant payloads.
     bodyEl.classList.add('msg-body-plain');
@@ -2994,14 +3102,28 @@ function loadMembers(channelId, req = beginScopedRequest('members')) {
 }
 
 function renderMembersPopover() {
+  if (!channelMembers || channelMembers.length === 0) {
+    membersPopover.innerHTML = '<div class="member-empty">No active participants</div>';
+    return;
+  }
   let html = '';
   for (const m of channelMembers) {
+    const queueSize = Number(m.queue_size || 0);
     html += '<div class="member-item">';
     html += '<div class="member-dot ' + escapeHtml(m.role) + '"></div>';
+    html += '<div class="member-body">';
     html += '<span class="member-name">' + escapeHtml(m.name) + '</span>';
     if (m.detail) {
       html += '<span class="member-detail">' + escapeHtml(m.detail) + '</span>';
     }
+    if (m.detail2) {
+      html += '<span class="member-detail-secondary">' + escapeHtml(m.detail2) + '</span>';
+    }
+    if (m.detail3) {
+      html += '<span class="member-detail-tertiary">' + escapeHtml(m.detail3) + '</span>';
+    }
+    html += '</div>';
+    html += '<span class="member-queue' + (queueSize > 0 ? '' : ' hidden') + '">q=' + queueSize + '</span>';
     html += '</div>';
   }
   membersPopover.innerHTML = html;
@@ -3150,6 +3272,34 @@ function scrollMonitorToBottom() {
   monitorLog.scrollTop = monitorLog.scrollHeight;
 }
 
+function humanizeOperationalText(text) {
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+  const lowered = raw.trim().toLowerCase();
+  if (!lowered) return { text: raw, kind: '' };
+  if (lowered.includes('not logged in') || lowered.includes('please run /login')) {
+    return { text: 'Provider authentication is missing or expired. Re-authenticate the runtime on the target machine.', kind: 'error' };
+  }
+  if (lowered.includes('cannot reach daemon') || lowered.includes('daemon is unreachable')) {
+    return { text: 'Daemon unreachable. Check the daemon process, local tunnel, and /doctor output.', kind: 'error' };
+  }
+  if (lowered.includes('routing failure')) {
+    return { text: 'Router could not hand off this message to the project runtime. Check connectivity and recent monitor logs.', kind: 'error' };
+  }
+  if (lowered.includes('sandbox') && (lowered.includes('approval') || lowered.includes('permission') || lowered.includes('blocked'))) {
+    return { text: 'A command was blocked by the current runtime safety settings. Adjust sandbox/approval mode or keep the action inside the workspace.', kind: 'error' };
+  }
+  if (lowered.includes('unclosed client session')) {
+    return { text: 'Background cleanup warning: an HTTP client session was left open during shutdown.', kind: 'warning' };
+  }
+  if (lowered.includes('failed to start task')) {
+    return { text: 'Could not start the remote task. Check daemon health and current project registration.', kind: 'error' };
+  }
+  if (lowered.includes('failed to interrupt')) {
+    return { text: 'Could not deliver the interrupt to the running task.', kind: 'error' };
+  }
+  return { text: raw, kind: '' };
+}
+
 function addLogEntry(text, ts, opts) {
   const options = opts || {};
   const entry = document.createElement('div');
@@ -3232,9 +3382,13 @@ function addLogEntry(text, ts, opts) {
   }
 
   // Content
+  const humanizedLog = humanizeOperationalText(displayText);
   const contentEl = document.createElement('span');
   contentEl.className = 'log-content';
-  contentEl.textContent = displayText;
+  contentEl.textContent = humanizedLog.text;
+  if (humanizedLog.text !== displayText) {
+    contentEl.title = displayText;
+  }
   entry.appendChild(contentEl);
 
   monitorLog.appendChild(entry);

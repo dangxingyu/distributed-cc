@@ -18,7 +18,16 @@ async def _make_web(aiohttp_client):
 
     router = Router()
     router._orchestrators = {
-        "test-proj": RemoteOrchestrator(project_id="test-proj", name="test-server", status="idle"),
+        "test-proj": RemoteOrchestrator(
+            project_id="test-proj",
+            name="test-server",
+            host="user@test-host",
+            project_dir="/tmp/test-proj",
+            provider="codex",
+            sandbox_mode="workspace-write",
+            approval_policy="never",
+            status="idle",
+        ),
     }
 
     web_chat = WebChat(router=router, store=store)

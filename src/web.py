@@ -29,6 +29,42 @@ def _env_flag(name: str) -> bool:
 
 
 class WebChat:
+    def _status_label(self, status: str | None) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized in {"running", "busy"}:
+            return "Working"
+        if normalized == "stuck":
+            return "Needs your input"
+        if normalized == "done":
+            return "Finished"
+        if normalized == "stopped":
+            return "Stopped"
+        if normalized == "error":
+            return "Failed"
+        if normalized == "idle":
+            return "Ready"
+        if normalized == "disconnected":
+            return "Daemon unreachable"
+        if normalized == "unconnected":
+            return "No project connected"
+        return normalized or "Unknown"
+
+    def _runtime_label(self, provider: str | None, permission_mode: str | None, sandbox_mode: str | None, approval_policy: str | None) -> str:
+        bits: list[str] = []
+        provider_text = str(provider or "").strip().lower()
+        if provider_text:
+            bits.append("Codex" if provider_text == "codex" else "Claude")
+        sandbox_text = str(sandbox_mode or "").strip()
+        approval_text = str(approval_policy or "").strip()
+        permission_text = str(permission_mode or "").strip()
+        if sandbox_text:
+            bits.append(sandbox_text)
+        if approval_text:
+            bits.append(f"approval:{approval_text}")
+        elif permission_text:
+            bits.append(permission_text)
+        return " · ".join(bits)
+
     def _project_runtime_payload(self, project_id: str | None) -> dict:
         if not project_id:
             return {}
@@ -47,6 +83,8 @@ class WebChat:
             "permission_mode": orch.permission_mode,
             "sandbox_mode": orch.sandbox_mode,
             "approval_policy": orch.approval_policy,
+            "queue_size": len(self._router._deferred_tasks.get(project_id, [])),
+            "health_detail": self._router._last_health_detail.get(project_id, ""),
         }
 
     def __init__(
@@ -216,18 +254,35 @@ class WebChat:
         if project_id:
             orch = self._router._orchestrators.get(project_id)
             if orch:
+                queue_size = len(self._router._deferred_tasks.get(project_id, []))
+                runtime_label = self._runtime_label(
+                    orch.provider,
+                    orch.permission_mode,
+                    orch.sandbox_mode,
+                    orch.approval_policy,
+                )
+                location_bits = [bit for bit in [project_id, orch.host, orch.project_dir] if bit]
+                health_detail = self._router._last_health_detail.get(project_id, "")
                 members.append(
                     {
                         "name": f"Orchestrator ({orch.name})",
                         "role": "orchestrator",
-                        "detail": f"{project_id} — {orch.status}",
+                        "detail": self._status_label(orch.status),
+                        "detail2": runtime_label,
+                        "detail3": health_detail or " · ".join(location_bits),
+                        "queue_size": queue_size,
                     }
                 )
+                worker_detail = "Active" if orch.status in {"running", "busy"} else "Ready"
+                if orch.status == "stuck":
+                    worker_detail = "Waiting for orchestrator"
                 members.append(
                     {
                         "name": f"Worker ({orch.name})",
                         "role": "worker",
-                        "detail": "active" if orch.status == "running" else "idle",
+                        "detail": worker_detail,
+                        "detail2": runtime_label,
+                        "detail3": f"Queued tasks: {queue_size}" if queue_size else "Queue empty",
                     }
                 )
 
