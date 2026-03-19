@@ -777,6 +777,8 @@ async def emit_progress(project_id: str, event: ProgressEvent):
 
     try:
         http = await _get_callback_http_session()
+        if http is None:
+            return
         async with http.post(
             f"{CALLBACK_URL}/progress",
             json={

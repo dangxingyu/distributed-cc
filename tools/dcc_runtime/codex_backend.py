@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 
 from .base import EventSink, RuntimeEvent, RuntimeRequest, RuntimeResult, ToolSpec, extract_tool_text
@@ -150,6 +151,25 @@ async def _wait_for_http_ready(url: str, timeout: float = 10.0) -> None:
             await asyncio.sleep(0.1)
 
 
+async def _wait_for_tcp_ready(host: str, port: int, timeout: float = 10.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=1.0,
+            )
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+        except Exception:
+            pass
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(f"Timed out waiting for tcp://{host}:{port}")
+        await asyncio.sleep(0.1)
+
+
 async def _terminate_process(proc: asyncio.subprocess.Process | None) -> str:
     if proc is None:
         return ""
@@ -165,6 +185,35 @@ async def _terminate_process(proc: asyncio.subprocess.Process | None) -> str:
         with contextlib.suppress(Exception):
             stderr = (await proc.stderr.read()).decode("utf-8", errors="replace")
     return stderr.strip()
+
+
+async def _start_fastmcp_http_server(mcp: FastMCP) -> tuple[uvicorn.Server, asyncio.Task[None]]:
+    app = mcp.streamable_http_app()
+    config = uvicorn.Config(
+        app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    server = uvicorn.Server(config)
+    task: asyncio.Task[None] = asyncio.create_task(server.serve())
+    return server, task
+
+
+async def _stop_fastmcp_http_server(
+    server: uvicorn.Server | None,
+    task: asyncio.Task[None] | None,
+) -> None:
+    if server is not None:
+        server.should_exit = True
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    except asyncio.TimeoutError:
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
 
 
 def _build_fastmcp_tool(spec: ToolSpec):
@@ -305,7 +354,8 @@ async def run_turn(request: RuntimeRequest, on_event: EventSink) -> RuntimeResul
 
     ws_port = _find_free_port()
     mcp_port = _find_free_port() if request.tool_specs else None
-    mcp_task: asyncio.Task | None = None
+    mcp_server: uvicorn.Server | None = None
+    mcp_task: asyncio.Task[None] | None = None
     proc: asyncio.subprocess.Process | None = None
 
     if request.tool_specs:
@@ -321,8 +371,8 @@ async def run_turn(request: RuntimeRequest, on_event: EventSink) -> RuntimeResul
                 name=spec.name,
                 description=spec.description,
             )
-        mcp_task = asyncio.create_task(daemon_mcp.run_streamable_http_async())
-        await _wait_for_http_ready(f"http://127.0.0.1:{mcp_port}/mcp")
+        mcp_server, mcp_task = await _start_fastmcp_http_server(daemon_mcp)
+        await _wait_for_tcp_ready("127.0.0.1", mcp_port)
 
     daemon_mcp_name = "worker_tools" if request.source == "worker" else "daemon"
     daemon_mcp_url = f"http://127.0.0.1:{mcp_port}/mcp" if mcp_port is not None else None
@@ -349,73 +399,82 @@ async def run_turn(request: RuntimeRequest, on_event: EventSink) -> RuntimeResul
         await _wait_for_http_ready(f"http://127.0.0.1:{ws_port}/readyz")
 
         tracker = _CodexTurnTracker(source=request.source, on_event=on_event)
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(f"http://127.0.0.1:{ws_port}") as ws:
-                init_resp = await _request_response(
+        session: aiohttp.ClientSession | None = None
+        ws: aiohttp.ClientWebSocketResponse | None = None
+        try:
+            session = aiohttp.ClientSession()
+            ws = await session.ws_connect(f"http://127.0.0.1:{ws_port}")
+            init_resp = await _request_response(
+                ws,
+                request_id=1,
+                method="initialize",
+                params={"clientInfo": {"name": "distributed-cc", "version": "0.1"}},
+            )
+            if "result" not in init_resp:
+                raise RuntimeError(f"Codex initialize failed: {init_resp}")
+
+            active_model = request.session_model if request.session_id and request.session_model else request.model
+            thread_params: dict[str, Any] = {
+                "threadId": request.session_id,
+                "cwd": request.project_dir,
+                "approvalPolicy": request.approval_policy,
+                "sandbox": request.sandbox_mode,
+            }
+            if request.system_prompt:
+                thread_params["developerInstructions"] = request.system_prompt
+            if request.base_instructions:
+                thread_params["baseInstructions"] = request.base_instructions
+            if active_model:
+                thread_params["model"] = active_model
+
+            if request.session_id:
+                thread_resp = await _request_response(
                     ws,
-                    request_id=1,
-                    method="initialize",
-                    params={"clientInfo": {"name": "distributed-cc", "version": "0.1"}},
-                )
-                if "result" not in init_resp:
-                    raise RuntimeError(f"Codex initialize failed: {init_resp}")
-
-                active_model = request.session_model if request.session_id and request.session_model else request.model
-                thread_params: dict[str, Any] = {
-                    "threadId": request.session_id,
-                    "cwd": request.project_dir,
-                    "approvalPolicy": request.approval_policy,
-                    "sandbox": request.sandbox_mode,
-                }
-                if request.system_prompt:
-                    thread_params["developerInstructions"] = request.system_prompt
-                if request.base_instructions:
-                    thread_params["baseInstructions"] = request.base_instructions
-                if active_model:
-                    thread_params["model"] = active_model
-
-                if request.session_id:
-                    thread_resp = await _request_response(
-                        ws,
-                        request_id=2,
-                        method="thread/resume",
-                        params=thread_params,
-                        tracker=tracker,
-                    )
-                else:
-                    thread_params.pop("threadId", None)
-                    thread_resp = await _request_response(
-                        ws,
-                        request_id=2,
-                        method="thread/start",
-                        params=thread_params,
-                        tracker=tracker,
-                    )
-
-                try:
-                    thread_id = str(thread_resp["result"]["thread"]["id"])
-                except Exception as exc:
-                    raise RuntimeError(f"Codex thread start failed: {thread_resp}") from exc
-
-                turn_resp = await _request_response(
-                    ws,
-                    request_id=3,
-                    method="turn/start",
-                    params={
-                        "threadId": thread_id,
-                        "input": [{"type": "text", "text": request.prompt}],
-                    },
+                    request_id=2,
+                    method="thread/resume",
+                    params=thread_params,
                     tracker=tracker,
                 )
-                if "result" not in turn_resp:
-                    raise RuntimeError(f"Codex turn start failed: {turn_resp}")
+            else:
+                thread_params.pop("threadId", None)
+                thread_resp = await _request_response(
+                    ws,
+                    request_id=2,
+                    method="thread/start",
+                    params=thread_params,
+                    tracker=tracker,
+                )
 
-                while True:
-                    message = await _recv_json(ws)
-                    if "method" in message:
-                        await tracker.handle(message)
-                    if message.get("method") == "turn/completed":
-                        break
+            try:
+                thread_id = str(thread_resp["result"]["thread"]["id"])
+            except Exception as exc:
+                raise RuntimeError(f"Codex thread start failed: {thread_resp}") from exc
+
+            turn_resp = await _request_response(
+                ws,
+                request_id=3,
+                method="turn/start",
+                params={
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": request.prompt}],
+                },
+                tracker=tracker,
+            )
+            if "result" not in turn_resp:
+                raise RuntimeError(f"Codex turn start failed: {turn_resp}")
+
+            while True:
+                message = await _recv_json(ws)
+                if "method" in message:
+                    await tracker.handle(message)
+                if message.get("method") == "turn/completed":
+                    break
+        finally:
+            if ws is not None and not ws.closed:
+                with contextlib.suppress(Exception):
+                    await ws.close()
+            if session is not None and not session.closed:
+                await session.close()
 
         if tracker.turn_status and tracker.turn_status != "completed":
             raise RuntimeError(tracker.turn_error or f"Codex turn failed with status={tracker.turn_status}")
