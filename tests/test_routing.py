@@ -1456,6 +1456,70 @@ async def test_load_config_servers_schema_with_orchestrator_defaults(tmp_path):
     assert orch_b.approval_policy == "never"
 
 
+async def test_load_config_projects_schema_merges_provider_aware_runtime_settings(tmp_path):
+    config = {
+        "orchestrator": {
+            "provider": "claude",
+            "model": "claude-opus-4-6",
+            "session_model": "claude-sonnet-4-6",
+            "permission_mode": "acceptEdits",
+            "runtime": {
+                "providers": {
+                    "codex": {
+                        "sandbox_mode": "workspace-write",
+                        "approval_policy": "never",
+                    }
+                }
+            },
+        },
+        "machines": [
+            {"name": "della-gpu", "host": "user@della", "broker_port": 8203},
+        ],
+        "projects": [
+            {
+                "project_id": "codex-proj",
+                "machine": "della-gpu",
+                "work_dir": "/work/codex",
+                "runtime": {
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "providers": {
+                        "codex": {
+                            "session_model": "gpt-5.4",
+                            "sandbox_mode": "danger-full-access",
+                        }
+                    },
+                },
+            },
+            {
+                "project_id": "claude-proj",
+                "machine": "della-gpu",
+                "work_dir": "/work/claude",
+            },
+        ],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    router = Router(cwd=str(tmp_path))
+    router._load_config()
+
+    codex = router._orchestrators["codex-proj"]
+    assert codex.provider == "codex"
+    assert codex.model == "gpt-5.4"
+    assert codex.session_model == "gpt-5.4"
+    assert codex.permission_mode == "acceptEdits"
+    assert codex.sandbox_mode == "danger-full-access"
+    assert codex.approval_policy == "never"
+
+    claude = router._orchestrators["claude-proj"]
+    assert claude.provider == "claude"
+    assert claude.model == "claude-opus-4-6"
+    assert claude.session_model == "claude-sonnet-4-6"
+    assert claude.permission_mode == "acceptEdits"
+    assert claude.sandbox_mode == ""
+    assert claude.approval_policy == ""
+
+
 async def test_load_config_orchestrators_schema(tmp_path):
     """_load_config reads new 'orchestrators' schema."""
     config = {

@@ -501,15 +501,28 @@ def _shared_codex_instructions(project_dir: str) -> str:
     )
 
 
+def _runtime_base_instructions(project_dir: str, provider: str) -> str:
+    if _normalize_provider(provider) != "codex":
+        return ""
+    return _shared_codex_instructions(project_dir)
+
+
 def _compose_runtime_prompt(project_dir: str, role: str, provider: str) -> tuple[str, str]:
     prompt, prompt_hash = _compose_role_prompt(project_dir, role)
     if _normalize_provider(provider) != "codex":
         return prompt, prompt_hash
-    shared = _shared_codex_instructions(project_dir)
+    shared = _runtime_base_instructions(project_dir, provider)
     if not shared:
         return prompt, prompt_hash
-    combined = f"{prompt.rstrip()}\n\n{shared}"
-    return combined, _hash_text(combined)
+    return prompt, _hash_text(f"{prompt.rstrip()}\n\n{shared}")
+
+
+def _runtime_home_dir(project_id: str, source: str, provider: str) -> str:
+    if _normalize_provider(provider) != "codex":
+        return ""
+    safe_project = re.sub(r"[^A-Za-z0-9._-]+", "-", project_id).strip("-") or "project"
+    safe_source = re.sub(r"[^A-Za-z0-9._-]+", "-", source).strip("-") or "session"
+    return str(STATE_DIR.parent / "codex" / safe_project / safe_source)
 
 
 def _hash_text(content: str) -> str:
@@ -1189,12 +1202,14 @@ async def _run_worker_turn(
         project_dir=project.project_dir,
         source="worker",
         system_prompt=worker_prompt,
+        base_instructions=_runtime_base_instructions(project.project_dir, provider),
         session_id=worker_session_id,
         model=model,
         session_model=model,
         permission_mode=permission_mode,
         sandbox_mode=sandbox_mode,
         approval_policy=approval_policy,
+        runtime_home_dir=_runtime_home_dir(project_id, "worker", provider),
         plugin_mcp_servers=worker_plugin_servers,
         tool_specs=tool_specs,
         max_turns=50,
@@ -1722,12 +1737,14 @@ async def run_task(
                 project_dir=project.project_dir,
                 source="orchestrator",
                 system_prompt=orchestrator_prompt,
+                base_instructions=_runtime_base_instructions(project.project_dir, state.provider),
                 session_id=orchestrator_session_id,
                 model=state.model,
                 session_model=state.session_model,
                 permission_mode=state.permission_mode,
                 sandbox_mode=state.sandbox_mode,
                 approval_policy=state.approval_policy,
+                runtime_home_dir=_runtime_home_dir(project_id, "orchestrator", state.provider),
                 plugin_mcp_servers=orchestrator_plugin_servers,
                 tool_specs=tool_specs,
                 max_turns=_orchestrator_max_turns(max_iterations),

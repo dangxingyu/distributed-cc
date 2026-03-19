@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from .router_session import RouterSession
+from .runtime_config import normalized_runtime_fragment, resolve_runtime_settings
 
 log = logging.getLogger(__name__)
 
@@ -57,8 +58,8 @@ def _normalized_machines(cfg: dict) -> list[tuple[str, str, str]]:
     return rows
 
 
-def _normalized_projects(cfg: dict) -> list[tuple[str, str, str, str, str, str, str, str]]:
-    rows: list[tuple[str, str, str, str, str, str, str, str]] = []
+def _normalized_projects(cfg: dict) -> list[tuple[str, str, str, str, str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str, str, str, str, str]] = []
     for item in cfg.get("projects", []):
         if not isinstance(item, dict):
             continue
@@ -72,14 +73,15 @@ def _normalized_projects(cfg: dict) -> list[tuple[str, str, str, str, str, str, 
                 _norm_text(item.get("broker_port")),
                 _norm_text(item.get("work_dir")),
                 _norm_text(item.get("project_dir")),
+                normalized_runtime_fragment(item),
             )
         )
     rows.sort()
     return rows
 
 
-def _normalized_orchestrators(cfg: dict) -> list[tuple[str, str, str, str, str, str]]:
-    rows: list[tuple[str, str, str, str, str, str]] = []
+def _normalized_orchestrators(cfg: dict) -> list[tuple[str, str, str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     for item in cfg.get("orchestrators", []):
         if not isinstance(item, dict):
             continue
@@ -91,14 +93,15 @@ def _normalized_orchestrators(cfg: dict) -> list[tuple[str, str, str, str, str, 
                 _norm_text(item.get("broker_port")),
                 _norm_text(item.get("project_dir")),
                 _norm_text(item.get("work_dir")),
+                normalized_runtime_fragment(item),
             )
         )
     rows.sort()
     return rows
 
 
-def _normalized_servers_project_fields(cfg: dict) -> list[tuple[str, str, str, str, str, str]]:
-    rows: list[tuple[str, str, str, str, str, str]] = []
+def _normalized_servers_project_fields(cfg: dict) -> list[tuple[str, str, str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     for item in cfg.get("servers", []):
         if not isinstance(item, dict):
             continue
@@ -110,14 +113,15 @@ def _normalized_servers_project_fields(cfg: dict) -> list[tuple[str, str, str, s
                 _norm_text(item.get("project_dir")),
                 _norm_text(item.get("machine")),
                 _norm_text(item.get("server")),
+                normalized_runtime_fragment(item),
             )
         )
     rows.sort()
     return rows
 
 
-def _normalized_servers_machine_fields(cfg: dict) -> list[tuple[str, str, str]]:
-    rows: list[tuple[str, str, str]] = []
+def _normalized_servers_machine_fields(cfg: dict) -> list[tuple[str, str, str, str]]:
+    rows: list[tuple[str, str, str, str]] = []
     for item in cfg.get("servers", []):
         if not isinstance(item, dict):
             continue
@@ -126,20 +130,26 @@ def _normalized_servers_machine_fields(cfg: dict) -> list[tuple[str, str, str]]:
                 _norm_text(item.get("name")),
                 _norm_text(item.get("host")),
                 _norm_text(item.get("broker_port")),
+                normalized_runtime_fragment(item),
             )
         )
     rows.sort()
     return rows
 
 
-def _normalized_orchestrator_defaults(cfg: dict) -> tuple[str, str, str]:
+def _normalized_orchestrator_defaults(cfg: dict) -> tuple[str, str, str, str, str, str, str]:
     defaults = cfg.get("orchestrator")
     if not isinstance(defaults, dict):
-        return ("", "", "")
+        return ("", "", "", "", "", "", "")
+    settings = resolve_runtime_settings(defaults)
     return (
-        _norm_text(defaults.get("model")),
-        _norm_text(defaults.get("session_model")),
-        _norm_text(defaults.get("permission_mode")),
+        settings.provider,
+        settings.model,
+        settings.session_model,
+        settings.permission_mode,
+        settings.sandbox_mode,
+        settings.approval_policy,
+        normalized_runtime_fragment(defaults),
     )
 
 
@@ -245,14 +255,6 @@ class Router:
             cfg = json.load(f)
         log.info("Loaded config.json from %s", self._cwd)
 
-        orch_cfg = cfg.get("orchestrator", {})
-        default_provider = str(orch_cfg.get("provider", "claude")).strip() or "claude"
-        default_model = str(orch_cfg.get("model", "")).strip()
-        default_session_model = str(orch_cfg.get("session_model", "")).strip()
-        default_permission_mode = str(orch_cfg.get("permission_mode", "")).strip()
-        default_sandbox_mode = str(orch_cfg.get("sandbox_mode", "")).strip()
-        default_approval_policy = str(orch_cfg.get("approval_policy", "")).strip()
-
         def _as_int(value, fallback: int) -> int:
             try:
                 return int(value)
@@ -265,6 +267,7 @@ class Router:
                 project_id = o.get("project_id")
                 if not project_id:
                     continue
+                runtime = resolve_runtime_settings(cfg.get("orchestrator"), o)
                 orch = RemoteOrchestrator(
                     project_id=project_id,
                     name=o.get("name", project_id),
@@ -272,12 +275,12 @@ class Router:
                     broker_port=_as_int(o.get("broker_port", 8200), 8200),
                     project_dir=o.get("project_dir", ""),
                     max_iterations=_as_int(o.get("max_iterations", 0), 0),
-                    provider=str(o.get("provider", default_provider)).strip() or default_provider,
-                    model=str(o.get("model", default_model)).strip(),
-                    session_model=str(o.get("session_model", default_session_model)).strip(),
-                    permission_mode=str(o.get("permission_mode", default_permission_mode)).strip(),
-                    sandbox_mode=str(o.get("sandbox_mode", default_sandbox_mode)).strip(),
-                    approval_policy=str(o.get("approval_policy", default_approval_policy)).strip(),
+                    provider=runtime.provider,
+                    model=runtime.model,
+                    session_model=runtime.session_model,
+                    permission_mode=runtime.permission_mode,
+                    sandbox_mode=runtime.sandbox_mode,
+                    approval_policy=runtime.approval_policy,
                 )
                 self._orchestrators[project_id] = orch
             return
@@ -320,20 +323,7 @@ class Router:
                     )
                 )
                 max_iterations = _as_int(p.get("max_iterations", base.get("max_iterations", 0)), 0)
-                provider = str(p.get("provider", base.get("provider", default_provider))).strip() or default_provider
-                model = str(p.get("model", base.get("model", default_model))).strip()
-                session_model = str(
-                    p.get("session_model", base.get("session_model", default_session_model))
-                ).strip()
-                permission_mode = str(
-                    p.get("permission_mode", base.get("permission_mode", default_permission_mode))
-                ).strip()
-                sandbox_mode = str(
-                    p.get("sandbox_mode", base.get("sandbox_mode", default_sandbox_mode))
-                ).strip()
-                approval_policy = str(
-                    p.get("approval_policy", base.get("approval_policy", default_approval_policy))
-                ).strip()
+                runtime = resolve_runtime_settings(cfg.get("orchestrator"), base, p)
 
                 orch = RemoteOrchestrator(
                     project_id=project_id,
@@ -342,12 +332,12 @@ class Router:
                     broker_port=broker_port,
                     project_dir=project_dir,
                     max_iterations=max_iterations,
-                    provider=provider,
-                    model=model,
-                    session_model=session_model,
-                    permission_mode=permission_mode,
-                    sandbox_mode=sandbox_mode,
-                    approval_policy=approval_policy,
+                    provider=runtime.provider,
+                    model=runtime.model,
+                    session_model=runtime.session_model,
+                    permission_mode=runtime.permission_mode,
+                    sandbox_mode=runtime.sandbox_mode,
+                    approval_policy=runtime.approval_policy,
                 )
                 self._orchestrators[project_id] = orch
 
@@ -359,6 +349,7 @@ class Router:
                 project_id = str(s.get("project_id", name))
                 if project_id in self._orchestrators:
                     continue
+                runtime = resolve_runtime_settings(cfg.get("orchestrator"), s)
                 orch = RemoteOrchestrator(
                     project_id=project_id,
                     name=str(s.get("name", project_id)),
@@ -366,12 +357,12 @@ class Router:
                     broker_port=_as_int(s.get("broker_port", 8200), 8200),
                     project_dir=str(s.get("work_dir", s.get("project_dir", ""))),
                     max_iterations=_as_int(s.get("max_iterations", 0), 0),
-                    provider=str(s.get("provider", default_provider)).strip() or default_provider,
-                    model=str(s.get("model", default_model)).strip(),
-                    session_model=str(s.get("session_model", default_session_model)).strip(),
-                    permission_mode=str(s.get("permission_mode", default_permission_mode)).strip(),
-                    sandbox_mode=str(s.get("sandbox_mode", default_sandbox_mode)).strip(),
-                    approval_policy=str(s.get("approval_policy", default_approval_policy)).strip(),
+                    provider=runtime.provider,
+                    model=runtime.model,
+                    session_model=runtime.session_model,
+                    permission_mode=runtime.permission_mode,
+                    sandbox_mode=runtime.sandbox_mode,
+                    approval_policy=runtime.approval_policy,
                 )
                 self._orchestrators[project_id] = orch
             return
@@ -381,6 +372,7 @@ class Router:
             if not name:
                 continue
             project_id = s.get("project_id", name)
+            runtime = resolve_runtime_settings(cfg.get("orchestrator"), s)
             orch = RemoteOrchestrator(
                 project_id=project_id,
                 name=s.get("name", project_id),
@@ -388,12 +380,12 @@ class Router:
                 broker_port=_as_int(s.get("broker_port", 8200), 8200),
                 project_dir=s.get("work_dir", s.get("project_dir", "")),
                 max_iterations=_as_int(s.get("max_iterations", 0), 0),
-                provider=str(s.get("provider", default_provider)).strip() or default_provider,
-                model=str(s.get("model", default_model)).strip(),
-                session_model=str(s.get("session_model", default_session_model)).strip(),
-                permission_mode=str(s.get("permission_mode", default_permission_mode)).strip(),
-                sandbox_mode=str(s.get("sandbox_mode", default_sandbox_mode)).strip(),
-                approval_policy=str(s.get("approval_policy", default_approval_policy)).strip(),
+                provider=runtime.provider,
+                model=runtime.model,
+                session_model=runtime.session_model,
+                permission_mode=runtime.permission_mode,
+                sandbox_mode=runtime.sandbox_mode,
+                approval_policy=runtime.approval_policy,
             )
             self._orchestrators[project_id] = orch
 
