@@ -1,7 +1,7 @@
 [project]
 name = "distributed-cc"
 version = "0.1.0"
-description = "Distribute Claude Code sessions across multiple servers"
+description = "Distribute Claude Code or Codex sessions across multiple servers"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

@@ -1,23 +1,48 @@
 {
-  "servers": [
+  "machines": [
     {
-      "name": "h100",
+      "name": "gpu-box",
       "host": "ubuntu@your-server-ip",
-      "work_dir": "/home/ubuntu",
-      "broker_port": 8201,
-      "max_iterations": 0
+      "broker_port": 8201
     },
     {
       "name": "local",
       "host": null,
+      "broker_port": 8200
+    }
+  ],
+  "projects": [
+    {
+      "project_id": "default-claude-project",
+      "machine": "gpu-box",
+      "work_dir": "/home/ubuntu/project-a"
+    },
+    {
+      "project_id": "codex-lab",
+      "machine": "local",
       "work_dir": "/path/to/project",
-      "broker_port": 8200,
-      "max_iterations": 0
+      "runtime": {
+        "provider": "codex",
+        "providers": {
+          "codex": {
+            "sandbox_mode": "workspace-write"
+          }
+        }
+      }
     }
   ],
   "orchestrator": {
+    "provider": "claude",
     "model": "claude-opus-4-6",
-    "session_model": "claude-opus-4-6",
-    "permission_mode": "bypassPermissions"
+    "session_model": "claude-sonnet-4-6",
+    "permission_mode": "bypassPermissions",
+    "providers": {
+      "codex": {
+        "model": "gpt-5.4",
+        "session_model": "gpt-5.4",
+        "sandbox_mode": "danger-full-access",
+        "approval_policy": "never"
+      }
+    }
   }
 }

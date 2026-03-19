@@ -4,7 +4,7 @@
   <img src="docs/assets/logo.jpeg" alt="Distributed Claude Code logo" width="720" />
 </p>
 
-*Work as an advisor!* Run Claude Code across multiple servers from one local chat interface (Web UI or Telegram), with a persistent **PhDLoop** runtime (Orchestrator + Worker).
+*Work as an advisor!* Run Claude Code **or Codex** across multiple servers from one local chat interface (Web UI or Telegram), with a persistent **PhDLoop** runtime (Orchestrator + Worker).
 
 <p align="center">
   <img src="docs/assets/illustration.jpeg" alt="System structure, binding model, and runtime flow" width="920" />
@@ -12,7 +12,7 @@
 
 ## Why This Exists
 
-Distributed Claude Code is optimized for this workflow:
+Distributed Claude Code is optimized for this workflow (with dual-provider execution support for Claude and Codex):
 
 1. Humans should not manually track many concurrent sessions.
 2. The orchestrator should keep progress moving autonomously, while the user gives high-level advice and course corrections.
@@ -82,7 +82,7 @@ Investigate why training loss plateaus and propose a fix.
 - **Server (machine)**: connectivity/runtime endpoint (`host` + `broker_port`) where a daemon runs.
 - **Project**: one concrete workdir on a server, identified by `project_id`.
 - **Channel**: one conversation thread in UI; a channel is connected to at most one project at a time.
-- **Orchestrator/Worker sessions**: persistent Claude sessions owned by a project (not by a channel).
+- **Orchestrator/Worker sessions**: persistent provider sessions owned by a project (not by a channel). Claude uses SDK session IDs; Codex uses app-server thread IDs.
 
 Binding rules:
 
@@ -199,12 +199,34 @@ Canonical config shape (project-centric):
       "project_id": "proj-a",
       "machine": "della-gpu",
       "work_dir": "/home/ubuntu/project-a"
+    },
+    {
+      "project_id": "proj-b",
+      "machine": "della-gpu",
+      "work_dir": "/home/ubuntu/project-b",
+      "runtime": {
+        "provider": "codex",
+        "providers": {
+          "codex": {
+            "sandbox_mode": "workspace-write"
+          }
+        }
+      }
     }
   ],
   "orchestrator": {
+    "provider": "claude",
     "model": "claude-opus-4-6",
-    "session_model": "claude-opus-4-6",
-    "permission_mode": "bypassPermissions"
+    "session_model": "claude-sonnet-4-6",
+    "permission_mode": "bypassPermissions",
+    "providers": {
+      "codex": {
+        "model": "gpt-5.4",
+        "session_model": "gpt-5.4",
+        "sandbox_mode": "danger-full-access",
+        "approval_policy": "never"
+      }
+    }
   }
 }
 ```
@@ -216,7 +238,12 @@ Field notes:
 - `machines[].broker_port`: local forwarded port to daemon `:8200`
 - `projects[].project_id`: id used by `/connect`
 - `projects[].work_dir`: project root on target machine
-- `orchestrator.*`: default daemon runtime model/policy
+- `orchestrator.provider`: `claude` or `codex`
+- `orchestrator.model` / `orchestrator.session_model`: default runtime models
+- `orchestrator.permission_mode`: Claude runtime permission policy (also used as a fallback when deriving Codex defaults)
+- `orchestrator.sandbox_mode`: Codex sandbox mode (`read-only`, `workspace-write`, `danger-full-access`)
+- `orchestrator.approval_policy`: Codex approval policy (`never` is recommended for unattended daemon runs)
+- Any machine/project/orchestrator object can also carry `providers.<name>` or `runtime.providers.<name>` blocks for provider-specific overrides without breaking the legacy flat schema.
 
 Compatibility:
 
@@ -225,6 +252,11 @@ Compatibility:
 - Treat `servers[]`/`orchestrators[]` as migration compatibility, not the primary workflow.
 
 `config.json` is local-only. Never commit real hosts/tokens.
+
+Provider scope today:
+
+- Project execution (`/task`, orchestrator, worker) supports both `claude` and `codex`.
+- Router setup/sysadmin flows in `src/router_session.py` remain Claude-backed for now.
 
 ## Telegram Mode
 
@@ -253,9 +285,13 @@ Remote server:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-mkdir -p ~/.distributed-cc
+mkdir -p ~/.distributed-cc/dcc_runtime
 scp tools/orchestrator_daemon.py user@server:~/.distributed-cc/orchestrator_daemon.py
-ssh user@server "cd ~/.distributed-cc && uv venv .venv && uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp"
+scp tools/dcc_runtime/*.py user@server:~/.distributed-cc/dcc_runtime/
+ssh user@server "cd ~/.distributed-cc && uv venv .venv && uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp mcp"
+# Also install/auth the runtime you plan to use on that machine:
+# - Claude backend: Claude Code CLI
+# - Codex backend: Codex CLI (`codex app-server` must be available on PATH)
 ssh user@server "tmux new-session -d -s daemon '~/.distributed-cc/.venv/bin/python3 ~/.distributed-cc/orchestrator_daemon.py --port 8200 --name server-a --callback-url http://127.0.0.1:9120'"
 ```
 
@@ -292,7 +328,7 @@ curl http://127.0.0.1:8201/health
 
 ## Testing
 
-`make test-e2e` uses real Claude calls. Ensure credentials are available and expect usage cost.
+`make test-e2e` uses the real Claude-backed router session flow. Ensure credentials are available and expect usage cost.
 
 ```bash
 make test
@@ -314,6 +350,7 @@ src/
 
 tools/
   orchestrator_daemon.py  remote daemon runtime
+  dcc_runtime/            provider runtime adapters and shared transport helpers
   deploy.sh               deploy helper
   start_tunnels.sh        tunnel helper
 
@@ -334,5 +371,6 @@ Local machine:
 
 Remote machine:
 
-- Claude Code CLI
+- Claude Code CLI or Codex CLI (depending on the configured provider)
+- For Codex provider, `codex app-server` must be available on `PATH`
 - Python 3.10+ (and ability to run long-lived daemon via `tmux` or `systemd`)

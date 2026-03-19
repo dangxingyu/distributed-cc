@@ -9,7 +9,7 @@ the orchestrator daemon (`tools/orchestrator_daemon.py`) on each server.
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) (auto-installed by deploy scripts if missing)
-- Claude Code CLI installed and authenticated (the Agent SDK uses its auth)
+- Claude Code CLI and/or Codex CLI installed and authenticated, depending on the configured provider
 - SSH access from the local router machine
 
 ## 2. Deploy Daemon Script
@@ -17,8 +17,9 @@ the orchestrator daemon (`tools/orchestrator_daemon.py`) on each server.
 Copy the daemon to the remote. Default location: `~/.distributed-cc/`.
 
 ```bash
-ssh {host} "mkdir -p {daemon_dir}"
+ssh {host} "mkdir -p {daemon_dir}/dcc_runtime"
 scp tools/orchestrator_daemon.py {host}:{daemon_dir}/orchestrator_daemon.py
+scp tools/dcc_runtime/*.py {host}:{daemon_dir}/dcc_runtime/
 ```
 
 Or use the deploy script from your laptop:
@@ -32,7 +33,7 @@ The daemon uses `uv` for fast, reliable dependency management.
 
 ```bash
 ssh {host} "command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh"
-ssh {host} "uv venv {daemon_dir}/.venv && uv pip install --python {daemon_dir}/.venv/bin/python3 claude-agent-sdk aiohttp"
+ssh {host} "uv venv {daemon_dir}/.venv && uv pip install --python {daemon_dir}/.venv/bin/python3 claude-agent-sdk aiohttp mcp"
 ```
 
 Always use `{daemon_dir}/.venv/bin/python3` to run the daemon.
@@ -44,10 +45,18 @@ Before launching the daemon, the following environment variables may need to be 
 | Variable | Purpose | Example |
 |---|---|---|
 | `CLAUDE_CONFIG_DIR` | Claude Code config/auth location | `/nfs/shared/.claude` |
-| `CLAUDE_CACHE_DIR` | Cache directory (models, etc.) | `/nfs/shared/.claude/cache` |
+| `CLAUDE_CACHE_DIR` | Claude cache directory (models, etc.) | `/nfs/shared/.claude/cache` |
+| `DCC_PROVIDER` | Default provider when `/task` payload omits it | `claude` or `codex` |
+| `DCC_CODEX_SANDBOX_MODE` | Default Codex sandbox mode | `workspace-write` |
+| `DCC_CODEX_APPROVAL_POLICY` | Default Codex approval policy | `never` |
 | `DAEMON_NAME` | This daemon's name (also set via `--name`) | `server-a` |
 | `CALLBACK_URL` | Router callback URL (also set via `--callback-url`) | `http://127.0.0.1:9120` |
 | `PATH` | Ensure correct Python/Node/etc. | Prepend NFS tool paths |
+
+Provider notes:
+- Claude runtime uses `claude-agent-sdk` and the host Claude CLI auth/config.
+- Codex runtime launches `codex app-server --listen ws://127.0.0.1:<port>` and bridges daemon tools through a local FastMCP HTTP endpoint.
+- By default the daemon generates a stable `CODEX_HOME` under `~/.distributed-cc/codex/{project_id}/{orchestrator|worker}` containing `config.toml`, `instructions/`, and a linked or copied `auth.json`.
 
 ## 5. Launch Daemon
 
@@ -65,6 +74,18 @@ The daemon runs a split-channel architecture when tasks are submitted:
   Uses MCP tools: `assign_worker`, `task_complete`, `ask_user`, `update_task_list`, `append_log`, `update_worker_config`.
 - **Worker**: executes assignments with full tool access (Read, Write, Bash, Grep, etc.).
   Submits results via `submit_report` MCP tool.
+
+Execution backends:
+- `provider=claude`: uses `claude-agent-sdk` with persisted SDK session IDs.
+- `provider=codex`: uses Codex app-server with persisted thread IDs plus a local FastMCP bridge for daemon tools.
+
+When calling `/task`, the payload may include provider-aware runtime fields:
+- `provider`
+- `model`
+- `session_model`
+- `permission_mode`
+- `sandbox_mode`
+- `approval_policy`
 
 The orchestrator maintains two persistent files per project:
 - `task_list.md` — research plan (overwritten on each update)
@@ -96,7 +117,7 @@ Option B — **systemd** (robust, auto-restart):
 ```ini
 # /etc/systemd/system/cc-daemon.service
 [Unit]
-Description=Claude Code Orchestrator Daemon ({server_name})
+Description=Distributed CC Orchestrator Daemon ({server_name})
 
 [Service]
 ExecStart={daemon_dir}/.venv/bin/python3 {daemon_dir}/orchestrator_daemon.py --port 8200 --name {server_name} --callback-url http://127.0.0.1:9120
@@ -171,8 +192,10 @@ iteration boundary. This includes task ID, iteration count, orchestrator/worker
 session IDs, status, and summary. On daemon restart, the state file is available
 for inspection but tasks are not auto-resumed (the user decides via the web UI).
 
-SDK sessions are persisted by Claude Code itself and can be resumed across
-daemon restarts via `--resume {session_id}`.
+Runtime sessions are persisted by the underlying provider and can be resumed across
+daemon restarts:
+- Claude resumes via SDK session IDs.
+- Codex resumes via app-server thread IDs.
 
 ## 10. Troubleshooting
 
@@ -180,9 +203,10 @@ daemon restarts via `--resume {session_id}`.
 |---|---|
 | Daemon unreachable | Is SSH tunnel up? `curl localhost:{local_port}/health` |
 | Permission callback fails | Is reverse tunnel up? From remote: `curl localhost:9120/health` |
-| Agent SDK auth error | Is Claude Code authenticated on remote? Run `claude --version` |
+| Claude auth error | Is Claude Code authenticated on remote? Run `claude --version` |
+| Codex launch/auth error | Is Codex CLI installed and authenticated? Run `codex --version` and verify `codex app-server` works on remote |
 | Wrong Python/packages | Is the daemon running via `{daemon_dir}/.venv/bin/python3`? |
-| Task stuck at iteration 1 | Check daemon logs — SDK may have crashed or auth expired |
+| Task stuck at iteration 1 | Check daemon logs — the provider runtime may have crashed or auth may have expired |
 
 ## Template Variables
 
@@ -191,9 +215,9 @@ with values from `config.json`:
 
 | Placeholder | Source |
 |---|---|
-| `{host}` | `config.json` → `servers[].host` |
-| `{server_name}` | `config.json` → `servers[].name` |
-| `{local_port}` | `config.json` → `servers[].broker_port` |
+| `{host}` | `config.json` → `machines[].host` or legacy `servers[].host` |
+| `{server_name}` | `config.json` → `machines[].name` or legacy `servers[].name` |
+| `{local_port}` | `config.json` → `machines[].broker_port` or legacy `servers[].broker_port` |
 | `{daemon_dir}` | Default: `~/.distributed-cc` |
 | `{env_file}` | Per-server env/bashrc to source |
 | `{log_dir}` | Log directory |
