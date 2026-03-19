@@ -29,6 +29,26 @@ def _env_flag(name: str) -> bool:
 
 
 class WebChat:
+    def _project_runtime_payload(self, project_id: str | None) -> dict:
+        if not project_id:
+            return {}
+        orch = self._router._orchestrators.get(project_id)
+        if not orch:
+            return {}
+        return {
+            "project_id": orch.project_id,
+            "name": orch.name,
+            "host": orch.host,
+            "status": orch.status,
+            "project_dir": orch.project_dir,
+            "provider": orch.provider,
+            "model": orch.model,
+            "session_model": orch.session_model,
+            "permission_mode": orch.permission_mode,
+            "sandbox_mode": orch.sandbox_mode,
+            "approval_policy": orch.approval_policy,
+        }
+
     def __init__(
         self,
         router: Router,
@@ -238,15 +258,7 @@ class WebChat:
     async def _handle_projects_list(self, request: web.Request) -> web.Response:
         result = []
         for orch in self._router.list_orchestrators():
-            result.append(
-                {
-                    "project_id": orch.project_id,
-                    "name": orch.name,
-                    "host": orch.host,
-                    "status": orch.status,
-                    "project_dir": orch.project_dir,
-                }
-            )
+            result.append(self._project_runtime_payload(orch.project_id))
         return web.json_response(result)
 
     async def _handle_setup_notes(self, request: web.Request) -> web.Response:
@@ -321,6 +333,7 @@ class WebChat:
                     "channel_id": channel_id,
                     "project_id": project_id,
                     "project_status": status,
+                    "project": self._project_runtime_payload(project_id),
                 },
             )
 
@@ -530,6 +543,7 @@ class WebChat:
                 "channel_id": channel_id,
                 "project_id": project_id,
                 "project_status": status,
+                "project": self._project_runtime_payload(project_id),
                 "iteration": 0,
                 "data": "",
             },

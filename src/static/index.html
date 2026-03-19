@@ -312,6 +312,21 @@ body::after {
   box-shadow: 0 4px 12px rgba(74, 56, 24, 0.08);
 }
 
+#runtime-badge {
+  display: none;
+  max-width: 420px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 127, 90, 0.32);
+  background: rgba(255, 252, 246, 0.82);
+  color: #4d534d;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 #project-badge.running {
   border-color: rgba(166, 227, 161, 0.3);
   color: var(--green);
@@ -1683,6 +1698,7 @@ body::after {
     <h1 id="channel-title">distributed-cc</h1>
     <div id="header-right">
       <div id="project-badge"></div>
+      <div id="runtime-badge"></div>
       <button id="monitor-btn" onclick="toggleMonitor()" title="Toggle monitor (Ctrl+M)">Monitor</button>
       <button id="members-btn" style="display:none">
         0 members
@@ -1812,6 +1828,7 @@ const monitorAutoscrollBtn = document.getElementById('monitor-autoscroll-btn');
 const monitorClearBtn = document.getElementById('monitor-clear-btn');
 const typingIndicator = document.getElementById('typing-indicator');
 const projectBadge = document.getElementById('project-badge');
+const runtimeBadge = document.getElementById('runtime-badge');
 const setupProgressEl = document.getElementById('setup-progress');
 const setupStepMachineEl = document.getElementById('setup-step-machine');
 const setupStepProjectEl = document.getElementById('setup-step-project');
@@ -1825,6 +1842,7 @@ let channelMembers = [];
 let currentProjectId = null;
 let currentProjectStatus = 'unknown';
 let currentIteration = 0;
+let currentProjectMeta = null;
 let setupNotes = '';
 let routerTypingActive = false;
 const routerTypingTokens = new Set();
@@ -2075,9 +2093,60 @@ function loadSetupNotes() {
 
 // ── Status display ──────────────────────────────────────────────────
 
+function humanProjectStatus(status, iteration) {
+  if (status === 'running' || status === 'busy') {
+    return iteration ? `Working (${iteration})` : 'Working';
+  }
+  if (status === 'stuck') return 'Needs your input';
+  if (status === 'done') return 'Finished';
+  if (status === 'stopped') return 'Stopped';
+  if (status === 'error') return 'Failed';
+  if (status === 'idle') return 'Ready';
+  if (status === 'disconnected') return 'Daemon unreachable';
+  if (status === 'unconnected') return 'No project connected';
+  return currentProjectId || 'Unknown';
+}
+
+function runtimeSummary(meta) {
+  if (!meta || !meta.project_id) return '';
+  const bits = [];
+  const provider = String(meta.provider || '').trim();
+  if (provider) bits.push(provider === 'codex' ? 'Codex' : 'Claude');
+  const sandbox = String(meta.sandbox_mode || '').trim();
+  const approval = String(meta.approval_policy || '').trim();
+  const permissionMode = String(meta.permission_mode || '').trim();
+  if (sandbox) bits.push(sandbox);
+  if (approval) bits.push(`approval:${approval}`);
+  else if (permissionMode) bits.push(permissionMode);
+  return bits.join(' · ');
+}
+
+function updateRuntimeBadge() {
+  if (!currentProjectId || !currentProjectMeta) {
+    runtimeBadge.style.display = 'none';
+    runtimeBadge.textContent = '';
+    runtimeBadge.removeAttribute('title');
+    return;
+  }
+  const summary = runtimeSummary(currentProjectMeta);
+  if (!summary) {
+    runtimeBadge.style.display = 'none';
+    runtimeBadge.textContent = '';
+    runtimeBadge.removeAttribute('title');
+    return;
+  }
+  runtimeBadge.style.display = '';
+  runtimeBadge.textContent = summary;
+  const detailBits = [currentProjectMeta.project_id];
+  if (currentProjectMeta.host) detailBits.push(currentProjectMeta.host);
+  if (currentProjectMeta.project_dir) detailBits.push(currentProjectMeta.project_dir);
+  runtimeBadge.title = detailBits.join(' · ');
+}
+
 function updateProjectBadge(status, iteration, data) {
   if (activeChannel === null) {
     projectBadge.style.display = 'none';
+    runtimeBadge.style.display = 'none';
     hideTypingIndicator();
     return;
   }
@@ -2085,6 +2154,7 @@ function updateProjectBadge(status, iteration, data) {
     projectBadge.style.display = '';
     projectBadge.className = 'router-mode';
     projectBadge.textContent = 'Router mode';
+    runtimeBadge.style.display = 'none';
     if (routerTypingActive) {
       showTypingIndicator('router');
     } else {
@@ -2094,52 +2164,15 @@ function updateProjectBadge(status, iteration, data) {
   }
   projectBadge.style.display = '';
   projectBadge.className = status || '';
+  projectBadge.textContent = humanProjectStatus(status, iteration);
+  updateRuntimeBadge();
 
   if (status === 'running' || status === 'busy') {
-    projectBadge.textContent = iteration ? `Working (${iteration})` : 'Working...';
     showTypingIndicator('orchestrator');
-  } else if (status === 'stuck') {
-    projectBadge.textContent = 'Needs input';
-    if (routerTypingActive) {
-      showTypingIndicator('router');
-    } else {
-      hideTypingIndicator();
-    }
-  } else if (status === 'done') {
-    projectBadge.textContent = 'Done';
-    if (routerTypingActive) {
-      showTypingIndicator('router');
-    } else {
-      hideTypingIndicator();
-    }
-  } else if (status === 'stopped') {
-    projectBadge.textContent = 'Stopped';
-    if (routerTypingActive) {
-      showTypingIndicator('router');
-    } else {
-      hideTypingIndicator();
-    }
-  } else if (status === 'error') {
-    projectBadge.textContent = 'Error';
-    if (routerTypingActive) {
-      showTypingIndicator('router');
-    } else {
-      hideTypingIndicator();
-    }
-  } else if (status === 'idle') {
-    projectBadge.textContent = currentProjectId;
-    if (routerTypingActive) {
-      showTypingIndicator('router');
-    } else {
-      hideTypingIndicator();
-    }
+  } else if (routerTypingActive) {
+    showTypingIndicator('router');
   } else {
-    projectBadge.textContent = currentProjectId;
-    if (routerTypingActive) {
-      showTypingIndicator('router');
-    } else {
-      hideTypingIndicator();
-    }
+    hideTypingIndicator();
   }
 }
 
@@ -2562,6 +2595,7 @@ function deleteChannel(channelId, name) {
         currentProjectId = null;
         currentProjectStatus = 'unknown';
         currentIteration = 0;
+        currentProjectMeta = null;
         routerTypingActive = false;
         routerTypingTokens.clear();
         channelTitle.textContent = 'distributed-cc';
@@ -2619,6 +2653,7 @@ function onChannelSwitched(data) {
   activeChannel = nextChannelId;
   currentProjectId = data.project_id || null;
   currentProjectStatus = data.project_status || 'unknown';
+  currentProjectMeta = data.project && typeof data.project === 'object' ? data.project : null;
   currentIteration = 0;
   if (!sameChannelResync) {
     routerTypingActive = false;
@@ -3667,6 +3702,9 @@ function connect() {
         currentProjectId = data.project_id || currentProjectId;
         currentProjectStatus = data.project_status || currentProjectStatus;
         currentIteration = normalizeIteration(data.iteration, currentIteration);
+        if (data.project && typeof data.project === 'object') {
+          currentProjectMeta = data.project;
+        }
         if (currentProjectId) {
           patchSetupStage(activeChannel, { machine: 'done', project: 'done', connect: 'done' });
         }

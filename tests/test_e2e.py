@@ -216,6 +216,29 @@ def _patch_daemon_globals(name: str, callback_url: str):
     return restore
 
 
+async def _cleanup_test_daemon(runner: web.AppRunner, restore) -> None:
+    import tools.orchestrator_daemon as daemon_mod
+
+    await runner.cleanup()
+    pending = list(daemon_mod.running_tasks.values())
+    for task in pending:
+        if task and not task.done():
+            task.cancel()
+    for task in pending:
+        if not task:
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if daemon_mod.callback_http_session and not daemon_mod.callback_http_session.closed:
+        await daemon_mod.callback_http_session.close()
+    daemon_mod.callback_http_session = None
+    restore()
+
+
 # ── T1: Agent SDK basic query ────────────────────────────────────────
 
 
@@ -300,8 +323,7 @@ async def test_e2e_daemon_health():
                 assert data["status"] == "ok"
                 assert data["daemon"] == "test"
     finally:
-        restore()
-        await runner.cleanup()
+        await _cleanup_test_daemon(runner, restore)
 
 
 # ── T4: Daemon register + task round trip ────────────────────────────
@@ -375,8 +397,7 @@ async def test_e2e_daemon_task():
             assert status["status"] == "done", f"Expected done, got {status['status']}: {status.get('error', '')}"
 
     finally:
-        restore()
-        await runner.cleanup()
+        await _cleanup_test_daemon(runner, restore)
 
 
 # ── T5: Daemon interrupt flow ────────────────────────────────────────
@@ -467,8 +488,7 @@ async def test_e2e_daemon_interrupt():
             assert status["status"] in ("done", "stuck")
 
     finally:
-        restore()
-        await runner.cleanup()
+        await _cleanup_test_daemon(runner, restore)
 
 
 # ── T6: SDK with can_use_tool ────────────────────────────────────────
@@ -581,8 +601,7 @@ async def _run_daemon_task(
                         return status
             pytest.fail(f"Task did not complete within {timeout_secs}s")
     finally:
-        restore()
-        await runner.cleanup()
+        await _cleanup_test_daemon(runner, restore)
 
 
 async def _start_task_and_wait(
@@ -823,8 +842,7 @@ async def test_e2e_mcp_ask_user_with_interrupt():
                 )
 
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T9: Full stack — WebSocket → Router → Daemon → Claude → WS back ──
@@ -1156,8 +1174,7 @@ async def test_e2e_role_memory_hot_reload_resets_sessions():
                 assert "ROLE_WORKER_SENTINEL_B: meow~" in report2, report2
                 assert (Path(sandbox) / "role_probe_b.txt").exists(), "Worker should create role_probe_b.txt"
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T11: MCP update_worker_config hot reload ───────────────────────────
@@ -1280,8 +1297,7 @@ async def test_e2e_update_worker_config_tool_hot_reload():
                 )
                 print(f"evaluator(worker_cfg_hot_reload): {eval_result}")
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T12: Shared CLAUDE.md native load (both roles) ────────────────────
@@ -1367,8 +1383,7 @@ async def test_e2e_shared_claude_md_applies_to_orchestrator_and_worker():
                 )
                 print(f"evaluator(shared_claude_md): {eval_result}")
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T13: Role isolation between orchestrator and worker ────────────────
@@ -1454,8 +1469,7 @@ async def test_e2e_role_isolation_orchestrator_vs_worker():
                 )
                 print(f"evaluator(role_isolation): {eval_result}")
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T14: ask_user + urgent queue visibility in pull_user_messages ─────
@@ -1560,8 +1574,7 @@ async def test_e2e_ask_user_then_pull_messages_keeps_urgent_interrupt():
                 )
                 print(f"evaluator(ask_user_pull_urgent): {eval_result}")
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T15: State file persists role prompt hashes ────────────────────────
@@ -1622,8 +1635,7 @@ async def test_e2e_state_persists_prompt_hashes():
                 assert len(worker_hash) == 64, state
                 assert (Path(sandbox) / "state_hash_probe.txt").exists()
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T16: Orchestrator MCP plugin call is visible in event stream ─────
@@ -1701,8 +1713,7 @@ async def test_e2e_orchestrator_plugin_tool_use_event():
                     for msg in tool_events
                 ), tool_events[-30:]
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
 
 
 # ── T17: Worker MCP plugin tools are visible in event stream ─────────
@@ -1791,5 +1802,4 @@ async def test_e2e_worker_plugin_tool_use_events():
                     "[worker]" in msg and "read_graph" in msg for msg in tool_events
                 ), tool_events[-40:]
         finally:
-            restore()
-            await runner.cleanup()
+            await _cleanup_test_daemon(runner, restore)
