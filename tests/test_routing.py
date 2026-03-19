@@ -68,9 +68,12 @@ async def test_route_idle_starts_task_with_model_overrides():
             project_id="myproj",
             name="srv",
             status="idle",
-            model="claude-opus-4-6",
-            session_model="claude-sonnet-4-6",
-            permission_mode="default",
+            provider="codex",
+            model="gpt-5.4",
+            session_model="gpt-5.4",
+            permission_mode="bypassPermissions",
+            sandbox_mode="danger-full-access",
+            approval_policy="never",
         )
     ])
     router._channel_project[1] = "myproj"
@@ -91,9 +94,12 @@ async def test_route_idle_starts_task_with_model_overrides():
     payload = mock_http.post.call_args[1]["json"]
     assert payload["project_id"] == "myproj"
     assert payload["task"] == "fix the bug"
-    assert payload["model"] == "claude-opus-4-6"
-    assert payload["session_model"] == "claude-sonnet-4-6"
-    assert payload["permission_mode"] == "default"
+    assert payload["provider"] == "codex"
+    assert payload["model"] == "gpt-5.4"
+    assert payload["session_model"] == "gpt-5.4"
+    assert payload["permission_mode"] == "bypassPermissions"
+    assert payload["sandbox_mode"] == "danger-full-access"
+    assert payload["approval_policy"] == "never"
 
 
 async def test_route_running_non_mention_is_deferred():
@@ -1416,13 +1422,16 @@ async def test_load_config_servers_schema(tmp_path):
 async def test_load_config_servers_schema_with_orchestrator_defaults(tmp_path):
     config = {
         "orchestrator": {
-            "model": "claude-opus-4-6",
-            "session_model": "claude-sonnet-4-6",
-            "permission_mode": "acceptEdits",
+            "provider": "codex",
+            "model": "gpt-5.4",
+            "session_model": "gpt-5.4",
+            "permission_mode": "bypassPermissions",
+            "sandbox_mode": "danger-full-access",
+            "approval_policy": "never",
         },
         "servers": [
             {"name": "srv-a", "work_dir": "/tmp/a"},
-            {"name": "srv-b", "work_dir": "/tmp/b", "model": "claude-haiku-4-5"},
+            {"name": "srv-b", "work_dir": "/tmp/b", "model": "gpt-5-mini"},
         ],
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -1431,21 +1440,34 @@ async def test_load_config_servers_schema_with_orchestrator_defaults(tmp_path):
     router._load_config()
 
     orch_a = router._orchestrators["srv-a"]
-    assert orch_a.model == "claude-opus-4-6"
-    assert orch_a.session_model == "claude-sonnet-4-6"
-    assert orch_a.permission_mode == "acceptEdits"
+    assert orch_a.provider == "codex"
+    assert orch_a.model == "gpt-5.4"
+    assert orch_a.session_model == "gpt-5.4"
+    assert orch_a.permission_mode == "bypassPermissions"
+    assert orch_a.sandbox_mode == "danger-full-access"
+    assert orch_a.approval_policy == "never"
 
     orch_b = router._orchestrators["srv-b"]
-    assert orch_b.model == "claude-haiku-4-5"
-    assert orch_b.session_model == "claude-sonnet-4-6"
-    assert orch_b.permission_mode == "acceptEdits"
+    assert orch_b.provider == "codex"
+    assert orch_b.model == "gpt-5-mini"
+    assert orch_b.session_model == "gpt-5.4"
+    assert orch_b.permission_mode == "bypassPermissions"
+    assert orch_b.sandbox_mode == "danger-full-access"
+    assert orch_b.approval_policy == "never"
 
 
 async def test_load_config_orchestrators_schema(tmp_path):
     """_load_config reads new 'orchestrators' schema."""
     config = {
         "orchestrators": [
-            {"project_id": "my-proj", "name": "my-name", "project_dir": "/work"},
+            {
+                "project_id": "my-proj",
+                "name": "my-name",
+                "project_dir": "/work",
+                "provider": "codex",
+                "sandbox_mode": "workspace-write",
+                "approval_policy": "never",
+            },
         ]
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -1457,6 +1479,9 @@ async def test_load_config_orchestrators_schema(tmp_path):
     orch = router._orchestrators["my-proj"]
     assert orch.name == "my-name"
     assert orch.project_dir == "/work"
+    assert orch.provider == "codex"
+    assert orch.sandbox_mode == "workspace-write"
+    assert orch.approval_policy == "never"
 
 
 async def test_load_config_orchestrators_takes_precedence(tmp_path):

@@ -167,9 +167,12 @@ class RemoteOrchestrator:
     broker_port: int = 8200
     project_dir: str = ""
     max_iterations: int = 0
+    provider: str = "claude"
     model: str = ""
     session_model: str = ""
     permission_mode: str = ""
+    sandbox_mode: str = ""
+    approval_policy: str = ""
     status: str = "unknown"  # idle/running/done/stuck/error/disconnected
 
 
@@ -243,9 +246,12 @@ class Router:
         log.info("Loaded config.json from %s", self._cwd)
 
         orch_cfg = cfg.get("orchestrator", {})
+        default_provider = str(orch_cfg.get("provider", "claude")).strip() or "claude"
         default_model = str(orch_cfg.get("model", "")).strip()
         default_session_model = str(orch_cfg.get("session_model", "")).strip()
         default_permission_mode = str(orch_cfg.get("permission_mode", "")).strip()
+        default_sandbox_mode = str(orch_cfg.get("sandbox_mode", "")).strip()
+        default_approval_policy = str(orch_cfg.get("approval_policy", "")).strip()
 
         def _as_int(value, fallback: int) -> int:
             try:
@@ -266,9 +272,12 @@ class Router:
                     broker_port=_as_int(o.get("broker_port", 8200), 8200),
                     project_dir=o.get("project_dir", ""),
                     max_iterations=_as_int(o.get("max_iterations", 0), 0),
+                    provider=str(o.get("provider", default_provider)).strip() or default_provider,
                     model=str(o.get("model", default_model)).strip(),
                     session_model=str(o.get("session_model", default_session_model)).strip(),
                     permission_mode=str(o.get("permission_mode", default_permission_mode)).strip(),
+                    sandbox_mode=str(o.get("sandbox_mode", default_sandbox_mode)).strip(),
+                    approval_policy=str(o.get("approval_policy", default_approval_policy)).strip(),
                 )
                 self._orchestrators[project_id] = orch
             return
@@ -311,12 +320,19 @@ class Router:
                     )
                 )
                 max_iterations = _as_int(p.get("max_iterations", base.get("max_iterations", 0)), 0)
+                provider = str(p.get("provider", base.get("provider", default_provider))).strip() or default_provider
                 model = str(p.get("model", base.get("model", default_model))).strip()
                 session_model = str(
                     p.get("session_model", base.get("session_model", default_session_model))
                 ).strip()
                 permission_mode = str(
                     p.get("permission_mode", base.get("permission_mode", default_permission_mode))
+                ).strip()
+                sandbox_mode = str(
+                    p.get("sandbox_mode", base.get("sandbox_mode", default_sandbox_mode))
+                ).strip()
+                approval_policy = str(
+                    p.get("approval_policy", base.get("approval_policy", default_approval_policy))
                 ).strip()
 
                 orch = RemoteOrchestrator(
@@ -326,9 +342,12 @@ class Router:
                     broker_port=broker_port,
                     project_dir=project_dir,
                     max_iterations=max_iterations,
+                    provider=provider,
                     model=model,
                     session_model=session_model,
                     permission_mode=permission_mode,
+                    sandbox_mode=sandbox_mode,
+                    approval_policy=approval_policy,
                 )
                 self._orchestrators[project_id] = orch
 
@@ -347,9 +366,12 @@ class Router:
                     broker_port=_as_int(s.get("broker_port", 8200), 8200),
                     project_dir=str(s.get("work_dir", s.get("project_dir", ""))),
                     max_iterations=_as_int(s.get("max_iterations", 0), 0),
+                    provider=str(s.get("provider", default_provider)).strip() or default_provider,
                     model=str(s.get("model", default_model)).strip(),
                     session_model=str(s.get("session_model", default_session_model)).strip(),
                     permission_mode=str(s.get("permission_mode", default_permission_mode)).strip(),
+                    sandbox_mode=str(s.get("sandbox_mode", default_sandbox_mode)).strip(),
+                    approval_policy=str(s.get("approval_policy", default_approval_policy)).strip(),
                 )
                 self._orchestrators[project_id] = orch
             return
@@ -366,9 +388,12 @@ class Router:
                 broker_port=_as_int(s.get("broker_port", 8200), 8200),
                 project_dir=s.get("work_dir", s.get("project_dir", "")),
                 max_iterations=_as_int(s.get("max_iterations", 0), 0),
+                provider=str(s.get("provider", default_provider)).strip() or default_provider,
                 model=str(s.get("model", default_model)).strip(),
                 session_model=str(s.get("session_model", default_session_model)).strip(),
                 permission_mode=str(s.get("permission_mode", default_permission_mode)).strip(),
+                sandbox_mode=str(s.get("sandbox_mode", default_sandbox_mode)).strip(),
+                approval_policy=str(s.get("approval_policy", default_approval_policy)).strip(),
             )
             self._orchestrators[project_id] = orch
 
@@ -1484,6 +1509,7 @@ class Router:
             "project_id": project_id,
             "task": task_text,
             "max_iterations": orch.max_iterations,
+            "provider": orch.provider or "claude",
         }
         if orch.model:
             payload["model"] = orch.model
@@ -1491,6 +1517,10 @@ class Router:
             payload["session_model"] = orch.session_model
         if orch.permission_mode:
             payload["permission_mode"] = orch.permission_mode
+        if orch.sandbox_mode:
+            payload["sandbox_mode"] = orch.sandbox_mode
+        if orch.approval_policy:
+            payload["approval_policy"] = orch.approval_policy
         try:
             async with self._http.post(
                 url,

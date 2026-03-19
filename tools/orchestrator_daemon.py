@@ -31,13 +31,6 @@ from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ResultMessage,
-    create_sdk_mcp_server,
-    query,
-    tool,
-)
 from claude_agent_sdk.types import (
     AssistantMessage,
     SystemMessage,
@@ -45,6 +38,10 @@ from claude_agent_sdk.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+
+from dcc_runtime import RuntimeEvent, RuntimeRequest, ToolSpec
+from dcc_runtime.claude_backend import build_sdk_server
+from dcc_runtime.factory import run_turn as run_runtime_turn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,12 +104,19 @@ def _normalize_permission_mode(value: str | None, default: str = "bypassPermissi
 
 DAEMON_NAME = os.environ.get("DAEMON_NAME", "unknown")
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "http://127.0.0.1:9120")
+DEFAULT_PROVIDER = str(os.environ.get("DCC_PROVIDER", "claude") or "claude").strip().lower() or "claude"
 DEFAULT_ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "claude-opus-4-6")
 DEFAULT_SESSION_MODEL = os.environ.get("ORCHESTRATOR_SESSION_MODEL", DEFAULT_ORCHESTRATOR_MODEL)
 DEFAULT_PERMISSION_MODE = _normalize_permission_mode(
     os.environ.get("DCC_PERMISSION_MODE", "bypassPermissions"),
     default="bypassPermissions",
 )
+DEFAULT_CODEX_SANDBOX_MODE = str(
+    os.environ.get("DCC_CODEX_SANDBOX_MODE", "workspace-write") or "workspace-write"
+).strip() or "workspace-write"
+DEFAULT_CODEX_APPROVAL_POLICY = str(
+    os.environ.get("DCC_CODEX_APPROVAL_POLICY", "never") or "never"
+).strip() or "never"
 DEBUG_FLOW = _env_flag("DCC_DEBUG_FLOW")
 EVENT_HISTORY_MAX = _env_int("EVENT_HISTORY_MAX", 2000, minimum=1)
 MAX_ITERATIONS = 0
@@ -383,9 +387,12 @@ class TaskState:
     status: str = "running"  # running, done, stuck, error, stopped
     iteration: int = 0
     max_iterations: int = MAX_ITERATIONS
+    provider: str = DEFAULT_PROVIDER
     model: str = DEFAULT_ORCHESTRATOR_MODEL
     session_model: str = DEFAULT_SESSION_MODEL
     permission_mode: str = DEFAULT_PERMISSION_MODE
+    sandbox_mode: str = DEFAULT_CODEX_SANDBOX_MODE
+    approval_policy: str = DEFAULT_CODEX_APPROVAL_POLICY
     continuous_mode: bool = CONTINUOUS_MODE_DEFAULT
     sdk_session_id: str = ""  # backward-compat alias of orchestrator_session_id
     orchestrator_session_id: str = ""
@@ -457,8 +464,71 @@ def _parse_bool(value, default: bool) -> bool:
     return default
 
 
+def _normalize_provider(raw: str | None, default: str = DEFAULT_PROVIDER) -> str:
+    value = str(raw or default or "claude").strip().lower()
+    return value if value in ("claude", "codex") else default
+
+
+def _normalize_codex_sandbox_mode(raw: str | None, permission_mode: str = "") -> str:
+    value = str(raw or "").strip()
+    if value in ("read-only", "workspace-write", "danger-full-access"):
+        return value
+    permission = _normalize_permission_mode(permission_mode, default=DEFAULT_PERMISSION_MODE)
+    if permission == "bypassPermissions":
+        return "danger-full-access"
+    return DEFAULT_CODEX_SANDBOX_MODE
+
+
+def _normalize_codex_approval_policy(raw: str | None) -> str:
+    value = str(raw or "").strip()
+    return value if value in ("untrusted", "on-failure", "on-request", "never") else DEFAULT_CODEX_APPROVAL_POLICY
+
+
+def _shared_codex_instructions(project_dir: str) -> str:
+    path = Path(project_dir) / "CLAUDE.md"
+    if not path.exists():
+        return ""
+    try:
+        content = path.read_text().strip()
+    except Exception as e:
+        log.warning("Failed reading shared project instructions %s: %s", path, e)
+        return ""
+    if not content:
+        return ""
+    return (
+        f"## Shared Project Instructions ({path.name})\n\n"
+        f"{content}\n"
+    )
+
+
+def _compose_runtime_prompt(project_dir: str, role: str, provider: str) -> tuple[str, str]:
+    prompt, prompt_hash = _compose_role_prompt(project_dir, role)
+    if _normalize_provider(provider) != "codex":
+        return prompt, prompt_hash
+    shared = _shared_codex_instructions(project_dir)
+    if not shared:
+        return prompt, prompt_hash
+    combined = f"{prompt.rstrip()}\n\n{shared}"
+    return combined, _hash_text(combined)
+
+
 def _hash_text(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _is_standby_resting_text(text: str) -> bool:
+    lowered = " ".join(text.lower().split())
+    markers = (
+        "decision: stay resting",
+        "staying resting",
+        "stay resting",
+        "nothing to act on",
+        "nothing to do",
+        "no pending work",
+        "all deliverables shipped",
+        "project is complete",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _compose_role_prompt(project_dir: str, role: str) -> tuple[str, str]:
@@ -947,9 +1017,12 @@ async def _maybe_start_standby_wakeup(project_id: str) -> bool:
             task_text=wake_prompt,
             max_iterations=STANDBY_WAKE_MAX_ITERATIONS,
             continuous_mode=False,
+            provider=state.provider or DEFAULT_PROVIDER,
             model=state.model or DEFAULT_ORCHESTRATOR_MODEL,
             session_model=state.session_model or state.model or DEFAULT_SESSION_MODEL,
             permission_mode=state.permission_mode or DEFAULT_PERMISSION_MODE,
+            sandbox_mode=state.sandbox_mode or DEFAULT_CODEX_SANDBOX_MODE,
+            approval_policy=state.approval_policy or DEFAULT_CODEX_APPROVAL_POLICY,
         )
     )
     running_tasks[project_id] = task
@@ -999,45 +1072,81 @@ async def _prompt_stream(text: str, done: asyncio.Event | None = None):
 # -- worker execution --------------------------------------------------
 
 
-def _create_worker_tools(project_id: str, iteration: int, captured_report: list):
-    """Create MCP server with the worker's submit_report tool.
-
-    The submit_report tool writes a structured report to .reports/iteration-N.md
-    and captures the content via the `captured_report` list so the daemon can
-    return it to the orchestrator as the assign_worker result.
-    """
+def _build_worker_tool_specs(project_id: str, iteration: int, captured_report: list) -> list[ToolSpec]:
+    """Build worker tool specifications for runtime adapters."""
     project = projects.get(project_id)
     reports_dir = Path(project.project_dir) / ".reports" if project else Path("/tmp/.reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    @tool(
-        "submit_report",
-        "Submit your work report when you've completed the assignment. "
-        "This report goes directly to the orchestrator for verification.\n\n"
-        "**Required 5-section structure:**\n"
-        "1. **Assignment restatement**: One-line summary of what you were asked to do.\n"
-        "2. **What was done**: Specific actions, files modified, commands run.\n"
-        "3. **Results & Evidence**: Paste actual test output, diffs, verification results. "
-        "Include file paths, line numbers, test counts, error messages.\n"
-        "4. **Acceptance criteria status**: For each goal, state DONE or NOT DONE with evidence.\n"
-        "5. **Open issues** (if any): Blockers, partial results, questions.\n\n"
-        "**Anti-patterns:**\n"
-        "- Don't say 'tests pass' without pasting actual test output.\n"
-        "- Don't say 'file updated' without stating the path and what changed.\n"
-        "- Don't omit error details — paste the traceback.",
-        {"report": str},
-    )
     async def submit_report(args):
         report_text = args["report"]
         report_path = reports_dir / f"iteration-{iteration}.md"
         report_path.write_text(report_text)
         captured_report.append(report_text)
-        return {"content": [{"type": "text", "text":
-            f"Report submitted and saved to .reports/iteration-{iteration}.md"}]}
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Report submitted and saved to .reports/iteration-{iteration}.md",
+                }
+            ]
+        }
 
-    return create_sdk_mcp_server(
+    return [
+        ToolSpec(
+            name="submit_report",
+            description="""Submit your work report when you've completed the assignment. This report goes directly to the orchestrator for verification.
+
+**Required 5-section structure:**
+1. **Assignment restatement**: One-line summary of what you were asked to do.
+2. **What was done**: Specific actions, files modified, commands run.
+3. **Results & Evidence**: Paste actual test output, diffs, verification results. Include file paths, line numbers, test counts, error messages.
+4. **Acceptance criteria status**: For each goal, state DONE or NOT DONE with evidence.
+5. **Open issues** (if any): Blockers, partial results, questions.
+
+**Anti-patterns:**
+- Don't say 'tests pass' without pasting actual test output.
+- Don't say 'file updated' without stating the path and what changed.
+- Don't omit error details — paste the traceback.""",
+            input_schema={"report": str},
+            handler=submit_report,
+        )
+    ]
+
+
+def _create_worker_tools(project_id: str, iteration: int, captured_report: list):
+    """Backward-compatible Claude SDK MCP wrapper used in tests."""
+    return build_sdk_server(
         "worker_tools",
-        tools=[submit_report],
+        _build_worker_tool_specs(project_id, iteration, captured_report),
+    )
+
+
+async def _forward_runtime_event(
+    project_id: str,
+    event: RuntimeEvent,
+    iteration: int,
+    source: str,
+    standby_wakeup: bool = False,
+) -> None:
+    if event.type == "text":
+        text = str(event.data or "").strip()
+        source_prefix = f"[{source}]"
+        clean_text = text[len(source_prefix) :].strip() if text.startswith(source_prefix) else text
+        if standby_wakeup and _is_standby_resting_text(clean_text):
+            resting_hash = _hash_text(" ".join(clean_text.lower().split()))
+            if project_last_standby_resting_hash.get(project_id) == resting_hash:
+                return
+            project_last_standby_resting_hash[project_id] = resting_hash
+            await emit_progress(
+                project_id,
+                ProgressEvent(type="log_update", data=text, iteration=iteration),
+            )
+            return
+
+    await emit_progress(
+        project_id,
+        ProgressEvent(type=event.type, data=event.data, iteration=iteration),
     )
 
 
@@ -1046,142 +1155,99 @@ async def _run_worker_turn(
     assignment: str,
     iteration: int,
     worker_session_id: str = "",
+    provider: str = DEFAULT_PROVIDER,
     model: str = DEFAULT_SESSION_MODEL,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
+    sandbox_mode: str = DEFAULT_CODEX_SANDBOX_MODE,
+    approval_policy: str = DEFAULT_CODEX_APPROVAL_POLICY,
 ) -> tuple[str, str]:
     """Execute one worker assignment in an independent worker session."""
     project = projects.get(project_id)
     if not project:
         return "Worker failed: unknown project.", worker_session_id
 
-    # Capture report content via closure
     captured_report: list[str] = []
-    worker_mcp = _create_worker_tools(project_id, iteration, captured_report)
-    worker_prompt, worker_prompt_hash = _compose_role_prompt(project.project_dir, "worker")
+    tool_specs = _build_worker_tool_specs(project_id, iteration, captured_report)
+    worker_prompt, worker_prompt_hash = _compose_runtime_prompt(project.project_dir, "worker", provider)
     worker_plugin_servers, worker_plugin_hash = _load_role_mcp_servers(project.project_dir, "worker")
     previous_hash = worker_prompt_hashes.get(project_id)
     previous_plugin_hash = worker_plugin_hashes.get(project_id)
 
-    # Role memory changed; start a fresh worker session so new instructions load.
     if previous_hash and previous_hash != worker_prompt_hash and worker_session_id:
-        log.info(
-            "Worker role memory changed for %s; resetting worker session",
-            project_id,
-        )
+        log.info("Worker role memory changed for %s; resetting worker session", project_id)
         worker_session_id = ""
         worker_sessions.pop(project_id, None)
     if previous_plugin_hash and previous_plugin_hash != worker_plugin_hash and worker_session_id:
-        log.info(
-            "Worker MCP plugin config changed for %s; resetting worker session",
-            project_id,
-        )
+        log.info("Worker MCP plugin config changed for %s; resetting worker session", project_id)
         worker_session_id = ""
         worker_sessions.pop(project_id, None)
     worker_prompt_hashes[project_id] = worker_prompt_hash
     worker_plugin_hashes[project_id] = worker_plugin_hash
 
-    mcp_servers = _merge_mcp_servers(
-        base_servers={"worker_tools": worker_mcp},
-        extra_servers=worker_plugin_servers,
-        reserved_names={"worker_tools"},
-    )
-
-    options = ClaudeAgentOptions(
-        permission_mode=permission_mode,
+    request = RuntimeRequest(
+        prompt=assignment,
+        project_dir=project.project_dir,
+        source="worker",
+        system_prompt=worker_prompt,
+        session_id=worker_session_id,
         model=model,
-        cwd=project.project_dir,
+        session_model=model,
+        permission_mode=permission_mode,
+        sandbox_mode=sandbox_mode,
+        approval_policy=approval_policy,
+        plugin_mcp_servers=worker_plugin_servers,
+        tool_specs=tool_specs,
         max_turns=50,
-        setting_sources=["project"],  # loads CLAUDE.md from project dir natively
-        mcp_servers=mcp_servers,
     )
-
-    if worker_session_id:
-        options.resume = worker_session_id
-    else:
-        options.system_prompt = worker_prompt
-
-    result_text = ""
-    done_event = asyncio.Event()
 
     try:
-        async for message in query(prompt=_prompt_stream(assignment, done_event), options=options):
-            if isinstance(message, AssistantMessage):
-                await _forward_assistant_message(
-                    project_id, message, iteration, source="worker"
-                )
-            elif isinstance(message, SystemMessage):
-                await emit_progress(
-                    project_id,
-                    ProgressEvent(
-                        type="log_update",
-                        data=f"[worker system] {message.subtype}",
-                        iteration=iteration,
-                    ),
-                )
-            elif isinstance(message, ResultMessage):
-                result_text = message.result or ""
-                worker_session_id = message.session_id
-                done_event.set()
+        result = await run_runtime_turn(
+            provider,
+            request,
+            lambda event: _forward_runtime_event(project_id, event, iteration, "worker"),
+        )
     except Exception as e:
-        done_event.set()
-        log.exception("Worker SDK error on iteration %s: %s", iteration, e)
+        log.exception("Worker runtime error on iteration %s: %s", iteration, e)
         tb = traceback.format_exc()
         await emit_progress(
             project_id,
             ProgressEvent(
                 type="tool_error",
-                data=f"[worker] SDK error: {e}",
+                data=f"[worker] runtime error: {e}",
                 iteration=iteration,
             ),
         )
         details = f"\nTraceback:\n{tb}" if tb else ""
         return f"Worker failed: {e}{details}", worker_session_id
 
-    # Use the report submitted via MCP tool; fall back to session result
+    worker_session_id = result.session_id or worker_session_id
     if captured_report:
         report = captured_report[-1]
     else:
-        report = result_text.strip() or "Worker returned without submitting a report."
-
+        report = result.final_text.strip() or "Worker returned without submitting a report."
     return report, worker_session_id
 
 
 # -- orchestrator MCP tools -------------------------------------------
 
 
-def _create_orchestrator_tools(project_id: str, state: TaskState):
-    """Create in-process MCP server with orchestrator control tools.
+def _build_orchestrator_tool_specs(project_id: str, state: TaskState) -> list[ToolSpec]:
+    """Build provider-neutral orchestrator control tools."""
 
-    These tools replace the old text-marker protocol ([ASSIGN_WORKER], etc).
-    The orchestrator calls them naturally as tool-use, and the daemon handles
-    the side effects (running workers, emitting events, writing files).
-    """
-
-    @tool(
-        "assign_worker",
-        "Send a concrete task to your worker agent for execution. "
-        "The worker has full tool access (Edit, Write, Bash, etc). "
-        "Returns the worker's report when done. "
-        "Each call counts toward the iteration limit.\n\n"
-        "**When to use:** ANY task involving file edits, running commands, multi-step "
-        "implementation, or investigation that requires tool access. This is your "
-        "default execution path.\n\n"
-        "**When NOT to use:** Don't assign work you already did yourself. Don't assign "
-        "vague tasks like 'look into this'.\n\n"
-        "**Required assignment structure:**\n"
-        "- Objective: what the worker must accomplish\n"
-        "- Acceptance criteria: how to verify success (tests to pass, output to produce)\n"
-        "- Context: relevant file paths, prior findings, constraints",
-        {"task": str},
-    )
     async def assign_worker(args):
         state.iteration += 1
 
         if state.max_iterations > 0 and state.iteration > state.max_iterations:
             return {
-                "content": [{"type": "text", "text":
-                    f"Worker assignment limit ({state.max_iterations}) reached. "
-                    "Call task_complete to summarize progress, or ask_user for guidance."}],
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Worker assignment limit ({state.max_iterations}) reached. "
+                            "Call task_complete to summarize progress, or ask_user for guidance."
+                        ),
+                    }
+                ],
                 "is_error": True,
             }
 
@@ -1192,8 +1258,6 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             }
 
         task_desc = args["task"]
-
-        # Drain any pending user interrupts
         interrupts = _drain_interrupt_payloads(project_id)
 
         await emit_progress(
@@ -1233,8 +1297,11 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
                     assignment=task_desc,
                     iteration=state.iteration,
                     worker_session_id=worker_sid,
+                    provider=state.provider,
                     model=state.session_model or state.model,
                     permission_mode=state.permission_mode,
+                    sandbox_mode=state.sandbox_mode,
+                    approval_policy=state.approval_policy,
                 )
             )
             current_worker_tasks[project_id] = worker_task
@@ -1266,7 +1333,6 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             worker_session_id=new_sid,
         )
 
-        # Append any pending user interrupts to the report
         result_text = report
         if interrupts:
             result_text += "\n\n[QUEUED MESSAGES]\n"
@@ -1280,21 +1346,8 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             "\n\n[VERIFICATION REMINDER] The above is a worker CLAIM. "
             "Verify at least one key claim before marking progress."
         )
-
         return {"content": [{"type": "text", "text": result_text}]}
 
-    @tool(
-        "stay_idle",
-        "Enter standby when triage finds no meaningful action right now. "
-        "This cleanly ends the current run and waits for future wake signals "
-        "(user guidance or heartbeat signals). Use this instead of repeatedly "
-        "narrating that you're resting.\n\n"
-        "**When to use:** After checking task_list, queued user messages, and "
-        "resource state, if there is no high-value next action now.\n\n"
-        "**Required input:** A concise reason so the advisor can understand why "
-        "you chose standby.",
-        {"reason": str},
-    )
     async def stay_idle(args):
         reason = str(args.get("reason", "")).strip() or "No meaningful next action right now."
         state.status = "done"
@@ -1319,7 +1372,6 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
             worker_session_id=worker_sessions.get(project_id, ""),
         )
-
         return {
             "content": [
                 {
@@ -1332,44 +1384,21 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             ]
         }
 
-    @tool(
-        "task_complete",
-        "Mark the overall user task as complete. "
-        "Call this when all goals are achieved.\n\n"
-        "**When NOT to use:** Don't call if the last worker report is unverified. "
-        "Don't call prematurely — ensure all acceptance criteria are met with evidence.\n\n"
-        "**Before calling:** Pull user messages first (call pull_user_messages) to check "
-        "for any last-minute guidance or course corrections. "
-        "If user messages are queued, integrate them before completion.",
-        {"summary": str},
-    )
     async def task_complete(args):
         state.status = "done"
         state.summary = args["summary"]
         state.finished_at = time.time()
-
         await emit_progress(
             project_id,
             ProgressEvent(type="done", data=state.summary, iteration=state.iteration),
         )
-
         _save_state(
             state,
             orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
             worker_session_id=worker_sessions.get(project_id, ""),
         )
-
         return {"content": [{"type": "text", "text": f"Task marked complete: {args['summary']}"}]}
 
-    @tool(
-        "pull_user_messages",
-        "Fetch queued user messages with urgency metadata. "
-        "Use this periodically to integrate non-urgent guidance and urgent interruptions.\n\n"
-        "**When to use:** Before planning your next step, before calling task_complete, "
-        "after receiving a worker report, and whenever you suspect the user may have "
-        "sent guidance.",
-        {},
-    )
     async def pull_user_messages(_args):
         pending = _drain_interrupt_payloads(project_id)
         if not pending:
@@ -1380,45 +1409,15 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             kind = str(item.get("kind", "user_message"))
             urgency = str(item.get("urgency", "normal"))
             text = str(item.get("text", ""))
-            if kind == "user_message":
-                # Keep user-facing urgency tags compact and easy to parse in summaries.
-                tag = urgency
-            else:
-                tag = f"{kind}:{urgency}"
+            tag = urgency if kind == "user_message" else f"{kind}:{urgency}"
             lines.append(f"{idx}. [{tag}] {text}")
 
         return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Queued user messages:\n" + "\n".join(lines),
-                }
-            ]
+            "content": [{"type": "text", "text": "Queued user messages:\n" + "\n".join(lines)}]
         }
 
-    @tool(
-        "ask_user",
-        "Ask the advisor a blocking question. This PAUSES your work until they respond "
-        "(up to 10 minutes). The advisor is busy across many projects — respect their "
-        "attention. If you can make a reasonable decision yourself, do it and log it.\n\n"
-        "**When to use:** Only for genuine blocking decisions where you lack the "
-        "information or authority to choose (e.g., conflicting requirements, "
-        "resource allocation preferences, ambiguous goals).\n\n"
-        "**Anti-patterns — do NOT ask these:**\n"
-        "- 'Should I proceed?' — just proceed.\n"
-        "- 'Can you confirm the status?' — check it yourself.\n"
-        "- 'Is this correct?' — verify it with evidence.\n"
-        "- 'I've completed X, what's next?' — check your task_list.\n"
-        "- Multiple questions in one call — ask ONE precise question.\n\n"
-        "**Good format:** State the decision point, the options you see, and why "
-        "you can't decide without input. Example: 'The training config supports both "
-        "fp16 and bf16. The GPU is A100 (supports both). Which precision do you prefer "
-        "for this experiment?'",
-        {"question": str},
-    )
     async def ask_user(args):
         question = args["question"]
-
         state.status = "stuck"
         state.summary = f"Needs input: {question}"
         _save_state(
@@ -1426,12 +1425,10 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
             orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
             worker_session_id=worker_sessions.get(project_id, ""),
         )
-
         await emit_progress(
             project_id,
             ProgressEvent(type="stuck", data=question, iteration=state.iteration),
         )
-
         try:
             answer = await _wait_for_interrupt_text(project_id, timeout=600)
             state.status = "running"
@@ -1450,67 +1447,34 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
                 orchestrator_session_id=orchestrator_sessions.get(project_id, ""),
                 worker_session_id=worker_sessions.get(project_id, ""),
             )
-            return {"content": [{"type": "text", "text":
-                "No user response after 10 minutes. "
-                "Proceed with your best judgment or call task_complete with current progress."}]}
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "No user response after 10 minutes. "
+                            "Proceed with your best judgment or call task_complete with current progress."
+                        ),
+                    }
+                ]
+            }
 
-    @tool(
-        "update_task_list",
-        "Update your research plan (task_list.md). "
-        "Use markdown checkboxes. PhD-level granularity: "
-        "experiments, investigations, milestones — not micro-implementation steps.\n\n"
-        "**Anti-pattern:** Don't create a new task list every iteration. Read the existing "
-        "one, update check marks and add/remove items as needed.",
-        {"content": str},
-    )
     async def update_task_list(args):
         _save_task_list(project_id, args["content"])
-
         await emit_progress(
             project_id,
-            ProgressEvent(
-                type="task_list",
-                data=args["content"],
-                iteration=state.iteration,
-            ),
+            ProgressEvent(type="task_list", data=args["content"], iteration=state.iteration),
         )
-
         return {"content": [{"type": "text", "text": "Task list updated."}]}
 
-    @tool(
-        "append_log",
-        "Append an entry to your research log (LOG.md). "
-        "Your lab notebook — record hypotheses, findings, decisions, and pivots. "
-        "Write at turning points, not on every action.\n\n"
-        "**Anti-pattern:** Don't log routine actions ('assigned worker', 'read file'). "
-        "Log insights, evidence, decisions, and pivots.",
-        {"entry": str},
-    )
     async def append_log(args):
         log_path = _append_log(project_id, args["entry"])
-
         await emit_progress(
             project_id,
-            ProgressEvent(
-                type="log_update",
-                data=args["entry"],
-                iteration=state.iteration,
-            ),
+            ProgressEvent(type="log_update", data=args["entry"], iteration=state.iteration),
         )
-
         return {"content": [{"type": "text", "text": f"Log entry appended to {log_path}"}]}
 
-    @tool(
-        "update_worker_config",
-        "Update standing instructions for your worker (.claude/roles/worker.md). "
-        "The worker loads this role memory at the start of every assignment. "
-        "This is separate from the project's root CLAUDE.md (which you should not overwrite). "
-        "Use for: learned conventions, file locations, environment quirks, "
-        "tool preferences. Only update when something genuinely changes.\n\n"
-        "**Anti-pattern:** Don't update on every iteration. Only update when you discover "
-        "a convention or constraint the worker should know for ALL future assignments.",
-        {"content": str},
-    )
     async def update_worker_config(args):
         project = projects.get(project_id)
         if not project:
@@ -1523,7 +1487,6 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
         role_path.parent.mkdir(parents=True, exist_ok=True)
         role_path.write_text(args["content"])
 
-        # Force fresh worker session so new role memory is loaded immediately.
         worker_prompt_hashes.pop(project_id, None)
         if worker_sessions.pop(project_id, None):
             state.worker_session_id = ""
@@ -1533,63 +1496,116 @@ def _create_orchestrator_tools(project_id: str, state: TaskState):
                 worker_session_id="",
             )
 
-        return {"content": [{"type": "text", "text":
-            "Worker instructions (.claude/roles/worker.md) updated."}]}
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Worker instructions (.claude/roles/worker.md) updated.",
+                }
+            ]
+        }
 
-    return create_sdk_mcp_server(
-        "daemon",
-        tools=[
-            assign_worker,
-            stay_idle,
-            task_complete,
-            pull_user_messages,
-            ask_user,
-            update_task_list,
-            append_log,
-            update_worker_config,
-        ],
-    )
+    return [
+        ToolSpec(
+            name="assign_worker",
+            description="""Send a concrete task to your worker agent for execution. The worker has full tool access (Edit, Write, Bash, etc). Returns the worker's report when done. Each call counts toward the iteration limit.
+
+**When to use:** ANY task involving file edits, running commands, multi-step implementation, or investigation that requires tool access. This is your default execution path.
+
+**When NOT to use:** Don't assign work you already did yourself. Don't assign vague tasks like 'look into this'.
+
+**Required assignment structure:**
+- Objective: what the worker must accomplish
+- Acceptance criteria: how to verify success (tests to pass, output to produce)
+- Context: relevant file paths, prior findings, constraints""",
+            input_schema={"task": str},
+            handler=assign_worker,
+        ),
+        ToolSpec(
+            name="stay_idle",
+            description="""Enter standby when triage finds no meaningful action right now. This cleanly ends the current run and waits for future wake signals (user guidance or heartbeat signals). Use this instead of repeatedly narrating that you're resting.
+
+**When to use:** After checking task_list, queued user messages, and resource state, if there is no high-value next action now.
+
+**Required input:** A concise reason so the advisor can understand why you chose standby.""",
+            input_schema={"reason": str},
+            handler=stay_idle,
+        ),
+        ToolSpec(
+            name="task_complete",
+            description="""Mark the overall user task as complete. Call this when all goals are achieved.
+
+**When NOT to use:** Don't call if the last worker report is unverified. Don't call prematurely — ensure all acceptance criteria are met with evidence.
+
+**Before calling:** Pull user messages first (call pull_user_messages) to check for any last-minute guidance or course corrections. If user messages are queued, integrate them before completion.""",
+            input_schema={"summary": str},
+            handler=task_complete,
+        ),
+        ToolSpec(
+            name="pull_user_messages",
+            description="""Fetch queued user messages with urgency metadata. Use this periodically to integrate non-urgent guidance and urgent interruptions.
+
+**When to use:** Before planning your next step, before calling task_complete, after receiving a worker report, and whenever you suspect the user may have sent guidance.""",
+            input_schema={},
+            handler=pull_user_messages,
+        ),
+        ToolSpec(
+            name="ask_user",
+            description="""Ask the advisor a blocking question. This PAUSES your work until they respond (up to 10 minutes). The advisor is busy across many projects — respect their attention. If you can make a reasonable decision yourself, do it and log it.
+
+**When to use:** Only for genuine blocking decisions where you lack the information or authority to choose (e.g., conflicting requirements, resource allocation preferences, ambiguous goals).
+
+**Anti-patterns — do NOT ask these:**
+- 'Should I proceed?' — just proceed.
+- 'Can you confirm the status?' — check it yourself.
+- 'Is this correct?' — verify it with evidence.
+- 'I've completed X, what's next?' — check your task_list.
+- Multiple questions in one call — ask ONE precise question.
+
+**Good format:** State the decision point, the options you see, and why you can't decide without input. Example: 'The training config supports both fp16 and bf16. The GPU is A100 (supports both). Which precision do you prefer for this experiment?'""",
+            input_schema={"question": str},
+            handler=ask_user,
+        ),
+        ToolSpec(
+            name="update_task_list",
+            description="""Update your research plan (task_list.md). Use markdown checkboxes. PhD-level granularity: experiments, investigations, milestones — not micro-implementation steps.
+
+**Anti-pattern:** Don't create a new task list every iteration. Read the existing one, update check marks and add/remove items as needed.""",
+            input_schema={"content": str},
+            handler=update_task_list,
+        ),
+        ToolSpec(
+            name="append_log",
+            description="""Append an entry to your research log (LOG.md). Your lab notebook — record hypotheses, findings, decisions, and pivots. Write at turning points, not on every action.
+
+**Anti-pattern:** Don't log routine actions ('assigned worker', 'read file'). Log insights, evidence, decisions, and pivots.""",
+            input_schema={"entry": str},
+            handler=append_log,
+        ),
+        ToolSpec(
+            name="update_worker_config",
+            description="""Update standing instructions for your worker (.claude/roles/worker.md). The worker loads this role memory at the start of every assignment. This is separate from the project's root CLAUDE.md (which you should not overwrite). Use for: learned conventions, file locations, environment quirks, tool preferences. Only update when something genuinely changes.
+
+**Anti-pattern:** Don't update on every iteration. Only update when you discover a convention or constraint the worker should know for ALL future assignments.""",
+            input_schema={"content": str},
+            handler=update_worker_config,
+        ),
+    ]
+
+
+
+def _create_orchestrator_tools(project_id: str, state: TaskState):
+    """Backward-compatible Claude SDK MCP wrapper used in tests."""
+    return build_sdk_server("daemon", _build_orchestrator_tool_specs(project_id, state))
 
 
 # -- main task runner --------------------------------------------------
 
 
-def _build_orchestrator_options(
-    project_dir: str,
-    mcp_server,
-    plugin_mcp_servers: dict,
-    max_iterations: int,
-    session_id: str,
-    system_prompt: str,
-    model: str,
-    session_model: str,
-    permission_mode: str,
-) -> ClaudeAgentOptions:
+def _orchestrator_max_turns(max_iterations: int) -> int:
     if max_iterations > 0:
-        max_turns = max(8, max_iterations * 8)
-    else:
-        # Unlimited worker assignments still need a practical per-query turn cap.
-        max_turns = 160
-
-    active_model = session_model if session_id and session_model else model
-    merged_mcp_servers = _merge_mcp_servers(
-        base_servers={"daemon": mcp_server},
-        extra_servers=plugin_mcp_servers,
-        reserved_names={"daemon"},
-    )
-    options = ClaudeAgentOptions(
-        permission_mode=permission_mode,
-        model=active_model,
-        cwd=project_dir,
-        setting_sources=["project"],  # load shared CLAUDE.md natively
-        mcp_servers=merged_mcp_servers,
-        max_turns=max_turns,
-    )
-    if session_id:
-        options.resume = session_id
-    else:
-        options.system_prompt = system_prompt
-    return options
+        return max(8, max_iterations * 8)
+    return 160
 
 
 async def run_task(
@@ -1597,17 +1613,31 @@ async def run_task(
     task_text: str,
     max_iterations: int = MAX_ITERATIONS,
     continuous_mode: bool = CONTINUOUS_MODE_DEFAULT,
+    provider: str = DEFAULT_PROVIDER,
     model: str = DEFAULT_ORCHESTRATOR_MODEL,
     session_model: str = DEFAULT_SESSION_MODEL,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
+    sandbox_mode: str = DEFAULT_CODEX_SANDBOX_MODE,
+    approval_policy: str = DEFAULT_CODEX_APPROVAL_POLICY,
 ):
-    """Run autonomous task with MCP tool-driven orchestrator."""
+    """Run autonomous task with tool-driven orchestrator."""
     os.environ.pop("CLAUDECODE", None)
 
     project = projects.get(project_id)
     if not project:
         log.error("Unknown project: %s", project_id)
         return
+
+    normalized_provider = _normalize_provider(provider)
+    normalized_permission_mode = _normalize_permission_mode(
+        permission_mode,
+        default=DEFAULT_PERMISSION_MODE,
+    )
+    normalized_sandbox_mode = _normalize_codex_sandbox_mode(
+        sandbox_mode,
+        permission_mode=normalized_permission_mode,
+    )
+    normalized_approval_policy = _normalize_codex_approval_policy(approval_policy)
 
     task_id = uuid.uuid4().hex
     state = TaskState(
@@ -1616,9 +1646,12 @@ async def run_task(
         task_text=task_text,
         max_iterations=max_iterations,
         continuous_mode=continuous_mode,
+        provider=normalized_provider,
         model=model,
         session_model=session_model or model,
-        permission_mode=_normalize_permission_mode(permission_mode, default=DEFAULT_PERMISSION_MODE),
+        permission_mode=normalized_permission_mode,
+        sandbox_mode=normalized_sandbox_mode,
+        approval_policy=normalized_approval_policy,
     )
     task_states[project_id] = state
 
@@ -1628,9 +1661,7 @@ async def run_task(
     cancel_events[project_id].clear()
 
     orchestrator_session_id = orchestrator_sessions.get(project_id, "")
-
-    # Create MCP tools bound to this project/task state
-    mcp_server = _create_orchestrator_tools(project_id, state)
+    tool_specs = _build_orchestrator_tool_specs(project_id, state)
 
     await emit_progress(
         project_id,
@@ -1643,9 +1674,10 @@ async def run_task(
     try:
         next_prompt = prompt
         while True:
-            orchestrator_prompt, orchestrator_prompt_hash = _compose_role_prompt(
+            orchestrator_prompt, orchestrator_prompt_hash = _compose_runtime_prompt(
                 project.project_dir,
                 "orchestrator",
+                state.provider,
             )
             orchestrator_plugin_servers, orchestrator_plugin_hash = _load_role_mcp_servers(
                 project.project_dir,
@@ -1678,19 +1710,6 @@ async def run_task(
             orchestrator_prompt_hashes[project_id] = orchestrator_prompt_hash
             orchestrator_plugin_hashes[project_id] = orchestrator_plugin_hash
 
-            done_event = asyncio.Event()
-            options = _build_orchestrator_options(
-                project_dir=project.project_dir,
-                mcp_server=mcp_server,
-                plugin_mcp_servers=orchestrator_plugin_servers,
-                max_iterations=max_iterations,
-                session_id=orchestrator_session_id,
-                system_prompt=orchestrator_prompt,
-                model=state.model,
-                session_model=state.session_model,
-                permission_mode=state.permission_mode,
-            )
-            saw_result = False
             prompt_for_turn = next_prompt
             pending_messages = _drain_interrupt_payloads(project_id)
             if pending_messages:
@@ -1698,35 +1717,39 @@ async def run_task(
                     f"{next_prompt}\n\n{_format_queued_messages_for_prompt(pending_messages)}"
                 )
 
-            async for message in query(
-                prompt=_prompt_stream(prompt_for_turn, done_event), options=options
-            ):
-                if isinstance(message, AssistantMessage):
-                    await _forward_assistant_message(
-                        project_id,
-                        message,
-                        state.iteration,
-                        source="orchestrator",
-                        standby_wakeup=is_standby_wakeup,
-                    )
-                elif isinstance(message, SystemMessage):
-                    await emit_progress(
-                        project_id,
-                        ProgressEvent(
-                            type="log_update",
-                            data=f"[orchestrator system] {message.subtype}",
-                            iteration=state.iteration,
-                        ),
-                    )
-                elif isinstance(message, ResultMessage):
-                    sid = (message.session_id or "").strip()
-                    if sid:
-                        orchestrator_session_id = sid
-                        orchestrator_sessions[project_id] = sid
-                        state.orchestrator_session_id = sid
-                        state.sdk_session_id = sid
-                    saw_result = True
-                    done_event.set()
+            request = RuntimeRequest(
+                prompt=prompt_for_turn,
+                project_dir=project.project_dir,
+                source="orchestrator",
+                system_prompt=orchestrator_prompt,
+                session_id=orchestrator_session_id,
+                model=state.model,
+                session_model=state.session_model,
+                permission_mode=state.permission_mode,
+                sandbox_mode=state.sandbox_mode,
+                approval_policy=state.approval_policy,
+                plugin_mcp_servers=orchestrator_plugin_servers,
+                tool_specs=tool_specs,
+                max_turns=_orchestrator_max_turns(max_iterations),
+            )
+
+            result = await run_runtime_turn(
+                state.provider,
+                request,
+                lambda event: _forward_runtime_event(
+                    project_id,
+                    event,
+                    state.iteration,
+                    "orchestrator",
+                    standby_wakeup=is_standby_wakeup,
+                ),
+            )
+            sid = (result.session_id or "").strip()
+            if sid:
+                orchestrator_session_id = sid
+                orchestrator_sessions[project_id] = sid
+                state.orchestrator_session_id = sid
+                state.sdk_session_id = sid
 
             if state.status != "running":
                 break
@@ -1735,17 +1758,15 @@ async def run_task(
                 state.status = "done"
                 state.summary = "Orchestrator session ended naturally"
                 state.finished_at = time.time()
-                # Empty data so web layer only shows progress status, not a chat message
-                # (only explicit task_complete summaries should appear in chat)
                 await emit_progress(
                     project_id,
                     ProgressEvent(type="done", data="", iteration=state.iteration),
                 )
                 break
 
-            if not saw_result:
+            if not result.saw_result:
                 log.warning(
-                    "Orchestrator query ended without ResultMessage for %s; continuing in continuous mode",
+                    "Orchestrator turn ended without terminal result for %s; continuing in continuous mode",
                     project_id,
                 )
 
@@ -1857,20 +1878,6 @@ async def _forward_assistant_message(
 ):
     """Forward intermediate assistant output as progress events."""
 
-    def _is_standby_resting_text(text: str) -> bool:
-        lowered = " ".join(text.lower().split())
-        markers = (
-            "decision: stay resting",
-            "staying resting",
-            "stay resting",
-            "nothing to act on",
-            "nothing to do",
-            "no pending work",
-            "all deliverables shipped",
-            "project is complete",
-        )
-        return any(marker in lowered for marker in markers)
-
     for block in message.content:
         if isinstance(block, TextBlock):
             text = block.text.strip()
@@ -1941,9 +1948,12 @@ def _save_state(
         "status": state.status,
         "iteration": state.iteration,
         "max_iterations": state.max_iterations,
+        "provider": state.provider,
         "model": state.model,
         "session_model": state.session_model,
         "permission_mode": state.permission_mode,
+        "sandbox_mode": state.sandbox_mode,
+        "approval_policy": state.approval_policy,
         "continuous_mode": state.continuous_mode,
         "sdk_session_id": orchestrator_session_id,
         "orchestrator_session_id": orchestrator_session_id,
@@ -2031,12 +2041,18 @@ async def handle_task(request: web.Request) -> web.Response:
     task_text = data.get("task")
     max_iter_raw = data.get("max_iterations", MAX_ITERATIONS)
     continuous_mode = _parse_bool(data.get("continuous_mode"), CONTINUOUS_MODE_DEFAULT)
+    provider = _normalize_provider(data.get("provider"), default=DEFAULT_PROVIDER)
     model = str(data.get("model") or DEFAULT_ORCHESTRATOR_MODEL).strip() or DEFAULT_ORCHESTRATOR_MODEL
     session_model = str(data.get("session_model") or model).strip() or model
     permission_mode = _normalize_permission_mode(
         data.get("permission_mode"),
         default=DEFAULT_PERMISSION_MODE,
     )
+    sandbox_mode = _normalize_codex_sandbox_mode(
+        data.get("sandbox_mode"),
+        permission_mode=permission_mode,
+    )
+    approval_policy = _normalize_codex_approval_policy(data.get("approval_policy"))
 
     if not project_id or not task_text:
         return web.json_response({"error": "project_id and task required"}, status=400)
@@ -2070,9 +2086,12 @@ async def handle_task(request: web.Request) -> web.Response:
             task_text,
             max_iter,
             continuous_mode=continuous_mode,
+            provider=provider,
             model=model,
             session_model=session_model,
             permission_mode=permission_mode,
+            sandbox_mode=sandbox_mode,
+            approval_policy=approval_policy,
         )
     )
     running_tasks[project_id] = task
@@ -2083,9 +2102,12 @@ async def handle_task(request: web.Request) -> web.Response:
             "project_id": project_id,
             "status": "started",
             "continuous_mode": continuous_mode,
+            "provider": provider,
             "model": model,
             "session_model": session_model,
             "permission_mode": permission_mode,
+            "sandbox_mode": sandbox_mode,
+            "approval_policy": approval_policy,
         }
     )
 
@@ -2129,9 +2151,12 @@ async def handle_status(request: web.Request) -> web.Response:
                 "status": state.status if state else "idle",
                 "iteration": state.iteration if state else 0,
                 "max_iterations": state.max_iterations if state else MAX_ITERATIONS,
+                "provider": state.provider if state else DEFAULT_PROVIDER,
                 "model": state.model if state else DEFAULT_ORCHESTRATOR_MODEL,
                 "session_model": state.session_model if state else DEFAULT_SESSION_MODEL,
                 "permission_mode": state.permission_mode if state else DEFAULT_PERMISSION_MODE,
+                "sandbox_mode": state.sandbox_mode if state else DEFAULT_CODEX_SANDBOX_MODE,
+                "approval_policy": state.approval_policy if state else DEFAULT_CODEX_APPROVAL_POLICY,
                 "continuous_mode": state.continuous_mode if state else CONTINUOUS_MODE_DEFAULT,
                 "summary": state.summary if state else "",
             }
@@ -2150,9 +2175,12 @@ async def handle_status(request: web.Request) -> web.Response:
             "status": state.status,
             "iteration": state.iteration,
             "max_iterations": state.max_iterations,
+            "provider": state.provider,
             "model": state.model,
             "session_model": state.session_model,
             "permission_mode": state.permission_mode,
+            "sandbox_mode": state.sandbox_mode,
+            "approval_policy": state.approval_policy,
             "continuous_mode": state.continuous_mode,
             "task_text": state.task_text,
             "summary": state.summary,

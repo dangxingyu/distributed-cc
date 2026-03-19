@@ -616,17 +616,23 @@ async def test_maybe_start_standby_wakeup_starts_when_unchecked_items_exist(
         task_text: str,
         max_iterations: int = 0,
         continuous_mode: bool = True,
+        provider: str = "",
         model: str = "",
         session_model: str = "",
         permission_mode: str = "",
+        sandbox_mode: str = "",
+        approval_policy: str = "",
     ):
         called["project_id"] = project_id
         called["task_text"] = task_text
         called["max_iterations"] = max_iterations
         called["continuous_mode"] = continuous_mode
+        called["provider"] = provider
         called["model"] = model
         called["session_model"] = session_model
         called["permission_mode"] = permission_mode
+        called["sandbox_mode"] = sandbox_mode
+        called["approval_policy"] = approval_policy
 
     async def fake_emit_progress(*_args, **_kwargs):
         return None
@@ -649,9 +655,12 @@ async def test_maybe_start_standby_wakeup_starts_when_unchecked_items_exist(
         assert called["project_id"] == project_id
         assert called["max_iterations"] == STANDBY_WAKE_MAX_ITERATIONS
         assert called["continuous_mode"] is False
+        assert called["provider"] == "claude"
         assert called["model"] == "model-a"
         assert called["session_model"] == "model-b"
         assert called["permission_mode"] == "default"
+        assert called["sandbox_mode"]
+        assert called["approval_policy"]
         assert "[STANDBY HEARTBEAT WAKEUP]" in called["task_text"]
     finally:
         projects.pop(project_id, None)
