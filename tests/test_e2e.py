@@ -1068,10 +1068,9 @@ async def test_e2e_full_stack_web_to_worker():
                     print(f"  History: {len(user_msgs)} user, {len(assistant_msgs)} assistant")
 
         finally:
-            restore()
             await web_runner.cleanup()
             await callback_runner.cleanup()
-            await daemon_runner.cleanup()
+            await _cleanup_test_daemon(daemon_runner, restore)
             await router.close()
             await store.close()
 
