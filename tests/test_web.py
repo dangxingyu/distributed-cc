@@ -242,8 +242,9 @@ async def test_ws_multiple_clients_can_connect(aiohttp_client):
 
 
 async def test_ws_switch_channel(aiohttp_client):
-    client, _, _, store = await _make_web(aiohttp_client)
+    client, _, router, store = await _make_web(aiohttp_client)
     ch_id = await store.create_channel("test-ch")
+    await router.connect_channel(ch_id, "test-proj")
 
     ws = await client.ws_connect("/ws")
     await ws.send_json({"type": "switch_channel", "channel_id": ch_id})
@@ -251,6 +252,10 @@ async def test_ws_switch_channel(aiohttp_client):
     msg = await ws.receive_json()
     assert msg["type"] == "channel_switched"
     assert msg["channel_id"] == ch_id
+    assert msg["project_id"] == "test-proj"
+    assert msg["project"]["provider"] == "codex"
+    assert msg["project"]["sandbox_mode"] == "workspace-write"
+    assert msg["project"]["approval_policy"] == "never"
 
     await ws.close()
     await store.close()
