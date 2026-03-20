@@ -2314,6 +2314,26 @@ function updateStatusDetail(status, data) {
   }
 }
 
+function updateConnectionStatus() {
+  const connected = !!(ws && ws.readyState === WebSocket.OPEN);
+  statusDot.className = connected ? 'connected' : 'disconnected';
+  let text = connected ? 'connected' : 'disconnected';
+  if (currentProjectId) {
+    const projectStatus = humanProjectStatus(currentProjectStatus, currentIteration).toLowerCase();
+    text += ' · ' + projectStatus;
+  }
+  statusText.textContent = text;
+  const titleBits = [];
+  if (currentProjectId) titleBits.push(currentProjectId);
+  if (currentStatusDetail) titleBits.push(currentStatusDetail);
+  else if (currentProjectMeta && currentProjectMeta.health_detail) titleBits.push(String(currentProjectMeta.health_detail));
+  if (titleBits.length > 0) {
+    statusText.title = titleBits.join(' · ');
+  } else {
+    statusText.removeAttribute('title');
+  }
+}
+
 function updateProjectBadge(status, iteration, data) {
   if (activeChannel === null) {
     projectBadge.style.display = 'none';
@@ -2321,6 +2341,7 @@ function updateProjectBadge(status, iteration, data) {
     statusDetailEl.className = '';
     statusDetailEl.textContent = '';
     statusDetailEl.removeAttribute('title');
+    updateConnectionStatus();
     hideTypingIndicator();
     return;
   }
@@ -2344,6 +2365,7 @@ function updateProjectBadge(status, iteration, data) {
   projectBadge.textContent = humanProjectStatus(status, iteration);
   updateRuntimeBadge();
   updateStatusDetail(status, data);
+  updateConnectionStatus();
 
   if (status === 'running' || status === 'busy') {
     showTypingIndicator('orchestrator');
@@ -2879,6 +2901,7 @@ function onChannelSwitched(data) {
     ? currentProjectMeta.health_detail
     : '';
   currentIteration = 0;
+  updateConnectionStatus();
   if (!sameChannelResync) {
     routerTypingActive = false;
     routerTypingTokens.clear();
@@ -3885,8 +3908,7 @@ function connect() {
 
   socket.onopen = function() {
     if (ws !== socket) return;
-    statusDot.className = 'connected';
-    statusText.textContent = 'connected';
+    updateConnectionStatus();
     lastWsMessageAt = Date.now();
     startWsWatchdog();
     loadSetupNotes();
@@ -3902,12 +3924,11 @@ function connect() {
   socket.onclose = function() {
     if (ws !== socket) return;
     ws = null;
-    statusDot.className = 'disconnected';
-    statusText.textContent = 'disconnected';
     if (currentProjectId && !currentStatusDetail) {
       currentStatusDetail = 'WebSocket connection to the local UI dropped.';
       updateStatusDetail('disconnected', currentStatusDetail);
     }
+    updateConnectionStatus();
     stopWsWatchdog();
     clearPendingSwitchAck();
     routerTypingActive = false;
