@@ -191,6 +191,18 @@ async def test_route_stop_command():
     assert "stopping" in send_reply.call_args[0][0].lower()
 
 
+async def test_route_stop_without_active_session_is_actionable():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="idle")])
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/stop", send_reply)
+
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0].lower()
+    assert "nothing to stop" in reply
+    assert "project task" in reply
+
+
 async def test_route_status_command():
     router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
     router._channel_project[1] = "myproj"

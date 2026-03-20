@@ -25,6 +25,7 @@ from .runtime_config import normalized_runtime_fragment, resolve_runtime_setting
 log = logging.getLogger(__name__)
 
 NO_PROJECT_CONNECTED_MESSAGE = "No project connected. Use /connect <project-id> or /setup-project <workdir>."
+NOTHING_TO_STOP_MESSAGE = "Nothing to stop. No router session or project task is active in this channel."
 
 
 def _env_flag(name: str) -> bool:
@@ -730,7 +731,7 @@ class Router:
             if project_id:
                 await self._stop_task(chat_id, project_id, send_reply)
             else:
-                await send_reply("Nothing to stop.", sender="system")
+                await send_reply(NOTHING_TO_STOP_MESSAGE, sender="system")
             return
 
         if command == "/status":
