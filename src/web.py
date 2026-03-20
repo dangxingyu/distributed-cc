@@ -204,6 +204,7 @@ class WebChat:
             ch["project_status"] = (
                 self._router.get_project_status(project_id) if project_id else "unconnected"
             )
+            ch["project"] = self._project_runtime_payload(project_id)
         return web.json_response(channels)
 
     async def _handle_channels_create(self, request: web.Request) -> web.Response:

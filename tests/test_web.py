@@ -66,6 +66,24 @@ async def test_channels_list_empty(aiohttp_client):
     await store.close()
 
 
+async def test_channels_list_includes_project_runtime_metadata(aiohttp_client):
+    client, _, router, store = await _make_web(aiohttp_client)
+    ch_id = await store.create_channel("runtime-ch", project_id="test-proj")
+    await router.connect_channel(ch_id, "test-proj")
+    router._deferred_tasks["test-proj"] = [{"text": "queued item"}]
+
+    resp = await client.get("/api/channels")
+    assert resp.status == 200
+    data = await resp.json()
+    assert len(data) == 1
+    assert data[0]["project_id"] == "test-proj"
+    assert data[0]["project_status"] == "idle"
+    assert data[0]["project"]["provider"] == "codex"
+    assert data[0]["project"]["queue_size"] == 1
+    assert data[0]["project"]["host"] == "user@test-host"
+    await store.close()
+
+
 async def test_create_channel(aiohttp_client):
     client, _, _, store = await _make_web(aiohttp_client)
     resp = await client.post("/api/channels", json={"name": "my-project"})

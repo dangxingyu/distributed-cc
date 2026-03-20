@@ -2813,6 +2813,18 @@ function renderChannelList() {
       + '<span class="ch-status ' + escapeHtml(status) + '"></span>';
     item.onclick = () => switchChannel(ch.id);
 
+    const tooltipBits = [(`#${ch.name}`)];
+    if (ch.project_id) tooltipBits.push(ch.project_id);
+    tooltipBits.push(humanProjectStatus(status, 0));
+    if (ch.project && typeof ch.project === 'object') {
+      const runtime = runtimeSummary(ch.project);
+      if (runtime) tooltipBits.push(runtime);
+      const queueSize = Number(ch.project.queue_size || 0);
+      if (queueSize > 0) tooltipBits.push(`queued:${queueSize}`);
+      if (ch.project.health_detail) tooltipBits.push(String(ch.project.health_detail));
+    }
+    item.title = tooltipBits.join(' · ');
+
     const del = document.createElement('button');
     del.className = 'ch-delete';
     del.textContent = '\u00d7';
