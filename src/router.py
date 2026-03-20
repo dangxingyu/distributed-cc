@@ -681,7 +681,7 @@ class Router:
         addressed_to_router, router_body = self._strip_prefix(stripped, "@router")
         if addressed_to_router:
             if not router_body:
-                await send_reply("Message is empty after `@router` prefix.", sender="system")
+                await send_reply("Message is empty after `@router`. Add a setup or diagnostic request after the prefix.", sender="system")
                 return
             await self._handle_router_message(chat_id, router_body, send_reply, send_log, send_typing)
             return
@@ -768,7 +768,7 @@ class Router:
 
             effective_text = orchestrator_body if addressed_to_orchestrator else stripped
             if not effective_text:
-                await send_reply("Message is empty after `@orchestrator` prefix.")
+                await send_reply("Message is empty after `@orchestrator`. Add the task or interrupt message after the prefix.")
                 return
 
             if orch.status == "stuck":

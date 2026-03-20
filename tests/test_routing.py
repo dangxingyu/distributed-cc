@@ -869,7 +869,21 @@ async def test_empty_at_orchestrator_message():
     await router.route_message(1, "@orchestrator", send_reply)
 
     send_reply.assert_called_once()
-    assert "empty" in send_reply.call_args[0][0].lower()
+    reply = send_reply.call_args[0][0].lower()
+    assert "empty" in reply
+    assert "task or interrupt" in reply
+
+
+async def test_empty_at_router_message():
+    router = _make_router([])
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "@router", send_reply)
+
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0].lower()
+    assert "empty" in reply
+    assert "setup or diagnostic" in reply
 
 
 # ── Setup mode routing ────────────────────────────────────────────────
