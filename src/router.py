@@ -24,6 +24,8 @@ from .runtime_config import normalized_runtime_fragment, resolve_runtime_setting
 
 log = logging.getLogger(__name__)
 
+NO_PROJECT_CONNECTED_MESSAGE = "No project connected. Use /connect <project-id> or /setup-project <workdir>."
+
 
 def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
@@ -735,14 +737,14 @@ class Router:
             if project_id:
                 await self._show_status(chat_id, project_id, send_reply)
             else:
-                await send_reply("No project connected.", sender="system")
+                await send_reply(NO_PROJECT_CONNECTED_MESSAGE, sender="system")
             return
 
         if command == "/queue":
             if project_id:
                 await self._handle_queue_command(project_id, command_arg, send_reply)
             else:
-                await send_reply("No project connected.", sender="system")
+                await send_reply(NO_PROJECT_CONNECTED_MESSAGE, sender="system")
             return
 
         # ── Plain messages — route based on channel state ──
@@ -1585,7 +1587,7 @@ class Router:
     async def _stop_task(self, chat_id: int, project_id: str, send_reply: callable):
         orch = self._orchestrators.get(project_id)
         if not orch:
-            await send_reply("No project connected.")
+            await send_reply(NO_PROJECT_CONNECTED_MESSAGE)
             return
 
         url = f"{self._daemon_url(orch)}/stop"
@@ -1608,7 +1610,7 @@ class Router:
     async def _show_status(self, chat_id: int, project_id: str, send_reply: callable):
         orch = self._orchestrators.get(project_id)
         if not orch:
-            await send_reply("No project connected.")
+            await send_reply(NO_PROJECT_CONNECTED_MESSAGE)
             return
 
         url = f"{self._daemon_url(orch)}/status?project_id={project_id}"

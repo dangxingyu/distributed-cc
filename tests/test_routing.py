@@ -229,7 +229,34 @@ async def test_route_queue_requires_connected_project():
     await router.route_message(1, "/queue", send_reply)
 
     send_reply.assert_called_once()
-    assert "no project connected" in send_reply.call_args[0][0].lower()
+    reply = send_reply.call_args[0][0].lower()
+    assert "no project connected" in reply
+    assert "/connect <project-id>" in reply
+    assert "/setup-project <workdir>" in reply
+
+
+async def test_route_status_requires_connected_project():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    send_reply = AsyncMock()
+
+    await router.route_message(1, "/status", send_reply)
+
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0].lower()
+    assert "no project connected" in reply
+    assert "/connect <project-id>" in reply
+
+
+async def test_route_stop_requires_connected_project():
+    router = _make_router([RemoteOrchestrator(project_id="myproj", name="srv", status="running")])
+    send_reply = AsyncMock()
+
+    await router._stop_task(1, "missing-proj", send_reply)
+
+    send_reply.assert_called_once()
+    reply = send_reply.call_args[0][0].lower()
+    assert "no project connected" in reply
+    assert "/setup-project <workdir>" in reply
 
 
 async def test_route_queue_list_shows_entries():
