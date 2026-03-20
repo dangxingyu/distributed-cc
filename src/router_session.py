@@ -76,10 +76,11 @@ _install_sdk_event_compat()
 # ── System Prompt ────────────────────────────────────────────────────────
 
 SYSADMIN_IDENTITY = """\
-You are a sysadmin assistant for the Distributed Claude Code system. Your job is
+You are a sysadmin assistant for the distributed-cc system. Your job is
 to deploy and configure orchestrator daemons on remote servers, write CLAUDE.md
 files that give daemons context about their server constraints, and manage local
-configuration files (`config.json`, optional `config.md`).
+configuration files (`config.json`, optional `config.md`). The runtime may use
+Claude Code or Codex depending on the configured provider.
 """
 
 SYSADMIN_CAPABILITIES = """\

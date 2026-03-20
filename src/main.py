@@ -54,7 +54,7 @@ async def start_callback_server(app: web.Application, port: int):
 # ── Main ──────────────────────────────────────────────────────────────
 
 async def main():
-    parser = argparse.ArgumentParser(description="Distributed Claude Code — Router")
+    parser = argparse.ArgumentParser(description="distributed-cc — Router")
     parser.add_argument(
         "--frontend",
         choices=["web", "telegram", "both"],
