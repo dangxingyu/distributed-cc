@@ -1843,7 +1843,7 @@ body::after {
 
   <div id="no-channel-msg">
     <div class="onboard-logo">dcc</div>
-    <div class="onboard-title" id="onboard-title">Get started with distributed Claude Code</div>
+    <div class="onboard-title" id="onboard-title">Get started with distributed code execution</div>
     <div class="onboard-steps">
       <div class="onboard-step">
         <div class="onboard-num">1</div>
@@ -2165,11 +2165,11 @@ function updateOnboardingContent() {
     onboardTitleEl.textContent = title + ' is ready';
     onboardStep1El.innerHTML = 'This channel is empty. If machine/project is not ready, let Router finish setup first.';
   } else {
-    onboardTitleEl.textContent = 'Get started with distributed Claude Code';
+    onboardTitleEl.textContent = 'Get started with distributed code execution';
     onboardStep1El.innerHTML = 'Create a channel with <strong>+ New Setup Channel</strong> in the sidebar';
   }
   onboardStep2El.innerHTML = 'Create channel with server info to auto-run <code>/setup user@host</code>, then run <code>/setup-project &lt;workdir or instruction&gt;</code>, or connect with <code>/connect project-id</code>';
-  onboardStep3El.innerHTML = 'Send a task — the orchestrator will plan, decompose, and assign workers autonomously';
+  onboardStep3El.innerHTML = 'Send a task — the orchestrator will plan, decompose, and assign workers using Claude Code or Codex';
 
   if (setupNotes && setupNotes.trim()) {
     setupNotesBodyEl.textContent = setupNotes;
