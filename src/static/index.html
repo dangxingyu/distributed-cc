@@ -300,6 +300,32 @@ body::after {
   gap: 12px;
 }
 
+#status-detail {
+  display: none;
+  margin: 0 22px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(158, 127, 76, 0.18);
+  background: rgba(255, 252, 244, 0.72);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+#status-detail.visible {
+  display: block;
+}
+
+#status-detail.stuck {
+  color: #8a6b12;
+  background: rgba(249, 226, 175, 0.12);
+}
+
+#status-detail.error,
+#status-detail.disconnected {
+  color: var(--red);
+  background: rgba(243, 139, 168, 0.08);
+}
+
 #project-badge {
   background: rgba(255, 251, 242, 0.85);
   border: 1px solid #cdb894;
@@ -1805,6 +1831,7 @@ body::after {
       </div>
     </div>
   </div>
+  <div id="status-detail"></div>
   <div id="setup-progress">
     <div class="setup-progress-title">Setup Progress</div>
     <div class="setup-progress-steps">
@@ -1924,6 +1951,7 @@ const monitorClearBtn = document.getElementById('monitor-clear-btn');
 const typingIndicator = document.getElementById('typing-indicator');
 const projectBadge = document.getElementById('project-badge');
 const runtimeBadge = document.getElementById('runtime-badge');
+const statusDetailEl = document.getElementById('status-detail');
 const setupProgressEl = document.getElementById('setup-progress');
 const setupStepMachineEl = document.getElementById('setup-step-machine');
 const setupStepProjectEl = document.getElementById('setup-step-project');
@@ -1938,6 +1966,7 @@ let currentProjectId = null;
 let currentProjectStatus = 'unknown';
 let currentIteration = 0;
 let currentProjectMeta = null;
+let currentStatusDetail = '';
 let setupNotes = '';
 let routerTypingActive = false;
 const routerTypingTokens = new Set();
@@ -2241,10 +2270,57 @@ function updateRuntimeBadge() {
   runtimeBadge.title = detailBits.join(' · ');
 }
 
+function statusDetailText(status, data) {
+  const rawFromEvent = typeof data === 'string' ? data.trim() : '';
+  const rawFromProject = currentProjectMeta && typeof currentProjectMeta.health_detail === 'string'
+    ? currentProjectMeta.health_detail.trim()
+    : '';
+  const raw = rawFromEvent || currentStatusDetail || rawFromProject;
+  if (raw) return raw;
+  if (status === 'stuck') return 'Task is waiting for input or an interrupt.';
+  if (status === 'disconnected') return 'Daemon is unreachable. Check tunnel health or run /doctor.';
+  if (status === 'error') return 'The current task failed. Check recent logs for the underlying error.';
+  return '';
+}
+
+function updateStatusDetail(status, data) {
+  if (activeChannel === null || !currentProjectId) {
+    statusDetailEl.className = '';
+    statusDetailEl.textContent = '';
+    statusDetailEl.removeAttribute('title');
+    return;
+  }
+  const showFor = new Set(['stuck', 'error', 'disconnected']);
+  if (!showFor.has(String(status || ''))) {
+    statusDetailEl.className = '';
+    statusDetailEl.textContent = '';
+    statusDetailEl.removeAttribute('title');
+    return;
+  }
+  const raw = statusDetailText(status, data);
+  if (!raw) {
+    statusDetailEl.className = '';
+    statusDetailEl.textContent = '';
+    statusDetailEl.removeAttribute('title');
+    return;
+  }
+  const humanized = humanizeOperationalText(raw);
+  statusDetailEl.className = `visible ${String(status || '').trim()}`;
+  statusDetailEl.textContent = humanized.text;
+  if (humanized.text !== raw) {
+    statusDetailEl.title = raw;
+  } else {
+    statusDetailEl.removeAttribute('title');
+  }
+}
+
 function updateProjectBadge(status, iteration, data) {
   if (activeChannel === null) {
     projectBadge.style.display = 'none';
     runtimeBadge.style.display = 'none';
+    statusDetailEl.className = '';
+    statusDetailEl.textContent = '';
+    statusDetailEl.removeAttribute('title');
     hideTypingIndicator();
     return;
   }
@@ -2253,6 +2329,9 @@ function updateProjectBadge(status, iteration, data) {
     projectBadge.className = 'router-mode';
     projectBadge.textContent = 'Router mode';
     runtimeBadge.style.display = 'none';
+    statusDetailEl.className = '';
+    statusDetailEl.textContent = '';
+    statusDetailEl.removeAttribute('title');
     if (routerTypingActive) {
       showTypingIndicator('router');
     } else {
@@ -2264,6 +2343,7 @@ function updateProjectBadge(status, iteration, data) {
   projectBadge.className = status || '';
   projectBadge.textContent = humanProjectStatus(status, iteration);
   updateRuntimeBadge();
+  updateStatusDetail(status, data);
 
   if (status === 'running' || status === 'busy') {
     showTypingIndicator('orchestrator');
@@ -2736,6 +2816,7 @@ function deleteChannel(channelId, name) {
         currentProjectStatus = 'unknown';
         currentIteration = 0;
         currentProjectMeta = null;
+        currentStatusDetail = '';
         routerTypingActive = false;
         routerTypingTokens.clear();
         channelTitle.textContent = 'distributed-cc';
@@ -2794,6 +2875,9 @@ function onChannelSwitched(data) {
   currentProjectId = data.project_id || null;
   currentProjectStatus = data.project_status || 'unknown';
   currentProjectMeta = data.project && typeof data.project === 'object' ? data.project : null;
+  currentStatusDetail = currentProjectMeta && typeof currentProjectMeta.health_detail === 'string'
+    ? currentProjectMeta.health_detail
+    : '';
   currentIteration = 0;
   if (!sameChannelResync) {
     routerTypingActive = false;
@@ -3820,6 +3904,10 @@ function connect() {
     ws = null;
     statusDot.className = 'disconnected';
     statusText.textContent = 'disconnected';
+    if (currentProjectId && !currentStatusDetail) {
+      currentStatusDetail = 'WebSocket connection to the local UI dropped.';
+      updateStatusDetail('disconnected', currentStatusDetail);
+    }
     stopWsWatchdog();
     clearPendingSwitchAck();
     routerTypingActive = false;
@@ -3861,6 +3949,11 @@ function connect() {
       } else {
         currentProjectStatus = 'running';
       }
+      if ((pStatus === 'stuck' || pStatus === 'error') && typeof data.data === 'string' && data.data.trim()) {
+        currentStatusDetail = data.data.trim();
+      } else if (pStatus === 'running' || pStatus === 'done' || pStatus === 'stopped') {
+        currentStatusDetail = '';
+      }
       updateProjectBadge(currentProjectStatus, currentIteration, data.data);
 
       // Stuck/ask_user UX
@@ -3890,6 +3983,11 @@ function connect() {
         currentIteration = normalizeIteration(data.iteration, currentIteration);
         if (data.project && typeof data.project === 'object') {
           currentProjectMeta = data.project;
+        }
+        if ((currentProjectStatus === 'error' || currentProjectStatus === 'disconnected') && currentProjectMeta && typeof currentProjectMeta.health_detail === 'string') {
+          currentStatusDetail = currentProjectMeta.health_detail;
+        } else if (currentProjectStatus !== 'stuck') {
+          currentStatusDetail = '';
         }
         if (currentProjectId) {
           patchSetupStage(activeChannel, { machine: 'done', project: 'done', connect: 'done' });
