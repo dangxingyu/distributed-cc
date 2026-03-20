@@ -2280,6 +2280,7 @@ function statusDetailText(status, data) {
   if (status === 'stuck') return 'Task is waiting for input or an interrupt.';
   if (status === 'disconnected') return 'Daemon is unreachable. Check tunnel health or run /doctor.';
   if (status === 'error') return 'The current task failed. Check recent logs for the underlying error.';
+  if (status === 'unconnected') return 'No project is connected to this channel yet. Use /connect or finish the setup flow first.';
   return '';
 }
 
@@ -2290,7 +2291,7 @@ function updateStatusDetail(status, data) {
     statusDetailEl.removeAttribute('title');
     return;
   }
-  const showFor = new Set(['stuck', 'error', 'disconnected']);
+  const showFor = new Set(['stuck', 'error', 'disconnected', 'unconnected']);
   if (!showFor.has(String(status || ''))) {
     statusDetailEl.className = '';
     statusDetailEl.textContent = '';
@@ -2321,6 +2322,8 @@ function updateConnectionStatus() {
   if (currentProjectId) {
     const projectStatus = humanProjectStatus(currentProjectStatus, currentIteration).toLowerCase();
     text += ' · ' + projectStatus;
+  } else if (activeChannel !== null) {
+    text += ' · unconnected';
   }
   statusText.textContent = text;
   const titleBits = [];
