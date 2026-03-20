@@ -2353,9 +2353,8 @@ function updateProjectBadge(status, iteration, data) {
     projectBadge.className = 'router-mode';
     projectBadge.textContent = 'Router mode';
     runtimeBadge.style.display = 'none';
-    statusDetailEl.className = '';
-    statusDetailEl.textContent = '';
-    statusDetailEl.removeAttribute('title');
+    updateStatusDetail('unconnected', data);
+    updateConnectionStatus();
     if (routerTypingActive) {
       showTypingIndicator('router');
     } else {
