@@ -117,19 +117,19 @@ When asked to set up a server (e.g., `/setup user@server`):
    - OS, architecture, available memory/disk
    - Python version, conda/venv availability
    - GPU availability (nvidia-smi), SLURM (squeue), etc.
-   - Existing Claude Code installation (`claude --version`)
+   - Existing Claude CLI installation (`claude --version`) and/or Codex CLI installation (`codex --version`)
    - Network constraints (can it reach the internet?)
 
 2. **Install prerequisites** if missing:
    - Ensure Python 3.10+ is available
    - Install `uv` if missing: `curl -LsSf https://astral.sh/uv/install.sh | sh`
-   - Install Claude Code CLI if missing (needs Node.js)
+   - Install the required runtime CLI if missing (Claude Code and/or Codex, depending on provider)
 
 3. **Deploy the daemon**:
    ```bash
    ssh user@host "mkdir -p ~/.distributed-cc"
    scp tools/orchestrator_daemon.py user@host:~/.distributed-cc/orchestrator_daemon.py
-   ssh user@host "cd ~/.distributed-cc && uv venv .venv && uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp"
+   ssh user@host "cd ~/.distributed-cc && uv venv .venv && uv pip install --python .venv/bin/python3 claude-agent-sdk aiohttp mcp"
    ```
 
 4. **Launch the daemon** (persistent process management):
